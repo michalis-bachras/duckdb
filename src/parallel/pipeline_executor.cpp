@@ -529,6 +529,7 @@ SourceResultType PipelineExecutor::FetchFromSource(DataChunk &result) {
 
 	// Ensures Sinks only return empty results when Blocking or Finished
 	D_ASSERT(res != SourceResultType::BLOCKED || result.size() == 0);
+	//auto scanned_bytes = result.GetAllocationSize();
 
 	EndOperator(*pipeline.source, &result);
 

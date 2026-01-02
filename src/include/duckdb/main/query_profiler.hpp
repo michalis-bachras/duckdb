@@ -23,6 +23,8 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/main/profiling_info.hpp"
 #include "duckdb/main/profiling_node.hpp"
+#include "duckdb/common/energy_monitor.hpp"
+
 
 #include <stack>
 
@@ -97,6 +99,7 @@ struct QueryInfo {
 	QueryInfo() : blocked_thread_time(0) {};
 	string query_name;
 	double blocked_thread_time;
+	unordered_map<string, double> per_domain_energy;
 };
 
 //! The QueryProfiler can be used to measure timings of queries
@@ -210,6 +213,8 @@ private:
 	using PhaseTimingItem = PhaseTimingStorage::value_type;
 	//! The stack of currently active phases
 	vector<MetricsType> phase_stack;
+
+	unique_ptr<EnergyMonitor> energy_monitor;
 
 private:
 	void MoveOptimizerPhasesToRoot();

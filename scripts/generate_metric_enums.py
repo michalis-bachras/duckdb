@@ -26,6 +26,7 @@ metrics = [
     "LATENCY",
     "ROWS_RETURNED",
     "OPERATOR_NAME",
+    "QUERY_ENERGY_CONSUMPTION"
 ]
 
 phase_timing_metrics = [

@@ -26,6 +26,7 @@ set(TEST_API_OBJECTS
     test_plan_serialization.cpp
     test_relation_api.cpp
     test_query_profiler.cpp
+    test_energy_monitoring.cpp
     test_dbdir.cpp
     test_pending_with_parameters.cpp
     test_progress_bar.cpp

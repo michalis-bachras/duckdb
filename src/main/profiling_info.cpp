@@ -55,7 +55,7 @@ profiler_settings_t ProfilingInfo::DefaultSettings() {
 
 profiler_settings_t ProfilingInfo::DefaultRootSettings() {
 	return {MetricsType::QUERY_NAME, MetricsType::BLOCKED_THREAD_TIME, MetricsType::LATENCY,
-	        MetricsType::ROWS_RETURNED};
+	        MetricsType::ROWS_RETURNED,MetricsType::QUERY_ENERGY_CONSUMPTION};
 }
 
 profiler_settings_t ProfilingInfo::DefaultOperatorSettings() {
@@ -96,6 +96,9 @@ void ProfilingInfo::ResetMetrics() {
 			metrics[metric] = Value::CreateValue<uint64_t>(0);
 			break;
 		case MetricsType::EXTRA_INFO:
+			break;
+		case MetricsType::QUERY_ENERGY_CONSUMPTION:
+			metrics[metric] = Value::MAP(unordered_map<string, string>());
 			break;
 		default:
 			throw InternalException("MetricsType" + EnumUtil::ToString(metric) + "not implemented");
@@ -219,6 +222,38 @@ void ProfilingInfo::WriteMetricsToJSON(yyjson_mut_doc *doc, yyjson_mut_val *dest
 		case MetricsType::CUMULATIVE_ROWS_SCANNED:
 		case MetricsType::OPERATOR_ROWS_SCANNED: {
 			yyjson_mut_obj_add_uint(doc, dest, key_ptr, metrics[metric].GetValue<uint64_t>());
+			break;
+		}
+		case MetricsType::QUERY_ENERGY_CONSUMPTION:{
+			// Get the energy values
+			auto &energy_value = metrics[metric];
+
+			if (energy_value.type().id() == LogicalTypeId::MAP) {
+				// Create a new JSON object for the nested energy data
+				auto energy_obj = yyjson_mut_obj(doc);
+
+				// DuckDB stores MAPs internally as a LIST of STRUCTs
+				// Each STRUCT has 2 fields: "key" and "value"
+				auto &children = MapValue::GetChildren(energy_value);
+				for (auto &child : children) {
+					auto &struct_children = StructValue::GetChildren(child);
+					D_ASSERT(struct_children.size() == 2);
+
+					auto domain = struct_children[0].GetValue<string>();
+					auto energy = struct_children[1].GetValue<string>();
+					auto domain_key = yyjson_mut_strncpy(doc, domain.c_str(), domain.size());
+					auto energy_val = yyjson_mut_strncpy(doc, energy.c_str(), energy.size());
+
+					// Add to the object
+					yyjson_mut_obj_add(energy_obj, domain_key, energy_val);
+
+				}
+				yyjson_mut_obj_add_val(doc, dest, key_ptr, energy_obj);
+			} else {
+				// Empty energy object (RAPL not available)
+				auto energy_obj = yyjson_mut_obj(doc);
+				yyjson_mut_obj_add_val(doc, dest, key_ptr, energy_obj);
+			}
 			break;
 		}
 		default:

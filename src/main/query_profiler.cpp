@@ -15,6 +15,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "yyjson.hpp"
+#include "duckdb/common/energy_monitor.hpp"
 
 #include <algorithm>
 #include <utility>
@@ -111,6 +112,16 @@ void QueryProfiler::StartQuery(string query, bool is_explain_analyze_p, bool sta
 	phase_timings.clear();
 	phase_stack.clear();
 	main_query.Start();
+
+	// Start energy monitoring for single queries if enabled
+	auto &settings = ClientConfig::GetConfig(context).profiler_settings;
+	if (ProfilingInfo::Enabled(settings, MetricsType::QUERY_ENERGY_CONSUMPTION)) {
+		if (EnergyMonitor::IsRAPLAvailable()) {
+			// Create and start energy monitor
+			energy_monitor = make_uniq<EnergyMonitor>();
+			energy_monitor->StartMonitoring();
+		}
+	}
 }
 
 bool QueryProfiler::OperatorRequiresProfiling(PhysicalOperatorType op_type) {
@@ -204,6 +215,14 @@ void QueryProfiler::EndQuery() {
 	}
 
 	main_query.End();
+
+	// Stop energy monitoring and store RESULTS in query_info
+	if (energy_monitor) {
+		query_info.per_domain_energy = energy_monitor->StopMonitoring();
+		// Clean up the monitor object
+		energy_monitor.reset();
+	}
+
 	if (root) {
 		auto &info = root->GetProfilingInfo();
 		if (info.Enabled(info.expanded_settings, MetricsType::OPERATOR_CARDINALITY)) {
@@ -246,6 +265,22 @@ void QueryProfiler::EndQuery() {
 			}
 			if (info.Enabled(settings, MetricsType::RESULT_SET_SIZE)) {
 				info.metrics[MetricsType::RESULT_SET_SIZE] = child_info.metrics[MetricsType::RESULT_SET_SIZE];
+			}
+
+			if (info.Enabled(settings, MetricsType::QUERY_ENERGY_CONSUMPTION)) {
+				if (!query_info.per_domain_energy.empty()) {
+					unordered_map<string, string> energy_map;
+
+					// Store per-domain breakdown in extra_info
+					// The WriteMetricsToJSON function will move these into the nested structure
+					for (const auto& domain : query_info.per_domain_energy) {
+						string key = "energy_" + domain.first;
+						string value = StringUtil::Format("%.6f J", domain.second);
+						energy_map[key] = value;
+					}
+					info.metrics[MetricsType::QUERY_ENERGY_CONSUMPTION] = Value::MAP(energy_map);
+
+				}
 			}
 
 			MoveOptimizerPhasesToRoot();

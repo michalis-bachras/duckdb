@@ -1,0 +1,94 @@
+# name: test/sql/profiling/test_energy_monitoring.test
+# description: Test query energy consumption monitoring
+# group: [profiling]
+
+# Test 1: Energy monitoring is disabled by default
+statement ok
+PRAGMA enable_profiling='json'
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/energy_test1.json'
+
+statement ok
+PRAGMA custom_profiling_settings='{"QUERY_NAME": "true", "LATENCY": "true"}'
+
+query I
+SELECT COUNT(*) FROM range(100000)
+----
+100000
+
+# Test 2: Enable energy consumption monitoring
+statement ok
+PRAGMA enable_profiling='json'
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/energy_test2.json'
+
+statement ok
+PRAGMA custom_profiling_settings='{"QUERY_ENERGY_CONSUMPTION": "true"}'
+
+query I
+SELECT COUNT(*) FROM range(100000)
+----
+100000
+
+# Test 3: Energy monitoring with other metrics
+statement ok
+PRAGMA enable_profiling='json'
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/energy_test3.json'
+
+statement ok
+PRAGMA custom_profiling_settings='{"QUERY_NAME": "true", "LATENCY": "true", "QUERY_ENERGY_CONSUMPTION": "true"}'
+
+query I
+SELECT COUNT(*) FROM range(1000000)
+----
+1000000
+
+# Test 4: Multiple queries - each should have energy data
+statement ok
+CREATE TABLE test_energy AS SELECT * FROM range(100000)
+
+statement ok
+PRAGMA enable_profiling='json'
+
+statement ok
+PRAGMA custom_profiling_settings='{"QUERY_ENERGY_CONSUMPTION": "true"}'
+
+query I
+SELECT COUNT(*) FROM test_energy
+----
+100000
+
+query I
+SELECT SUM(i) FROM test_energy tbl(i)
+----
+4999950000
+
+statement ok
+DROP TABLE test_energy
+
+# Test 5: Energy monitoring with complex queries
+statement ok
+CREATE TABLE t1(a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+PRAGMA enable_profiling='json'
+
+statement ok
+PRAGMA custom_profiling_settings='{"QUERY_ENERGY_CONSUMPTION": "true"}'
+
+query II
+SELECT a, SUM(b) FROM t1 GROUP BY a ORDER BY a
+----
+1	10
+2	20
+3	30
+
+statement ok
+DROP TABLE t1

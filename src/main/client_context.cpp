@@ -349,7 +349,7 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	auto &explain = statement->Cast<ExplainStatement>();
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
-
+//Start the query and create logical and physical plan
 shared_ptr<PreparedStatementData>
 ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock, const string &query,
                                                unique_ptr<SQLStatement> statement,
@@ -535,8 +535,10 @@ ClientContext::PendingPreparedStatementInternal(ClientContextLock &lock, shared_
 		get_method = client_config.result_collector;
 	}
 	statement.is_streaming = stream_result;
+	// Add PhysicalResultCollector operator at the end of the plan
 	auto collector = get_method(*this, statement);
 	D_ASSERT(collector->type == PhysicalOperatorType::RESULT_COLLECTOR);
+	// Create the pipelines and schedule the corresponding events
 	executor.Initialize(std::move(collector));
 
 	auto types = executor.GetTypes();
@@ -768,7 +770,7 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementInternal(ClientCon
 	if (parameters.parameters) {
 		PreparedStatement::VerifyParameters(*parameters.parameters, statement->named_param_map);
 	}
-
+	//Prepare the query statement for execution(create plan,etc)
 	auto prepared = CreatePreparedStatement(lock, query, std::move(statement), parameters.parameters,
 	                                        PreparedStatementMode::PREPARE_AND_EXECUTE);
 
@@ -781,7 +783,7 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementInternal(ClientCon
 	if (!prepared->properties.bound_all_parameters) {
 		return ErrorResult<PendingQueryResult>(InvalidInputException("Not all parameters were bound"), query);
 	}
-	// execute the prepared statement
+	// execute the prepared statement(sets up the execution of the query)
 	CheckIfPreparedStatementIsExecutable(*prepared);
 	return PendingPreparedStatementInternal(lock, std::move(prepared), parameters);
 }
@@ -970,13 +972,13 @@ unique_ptr<QueryResult> ClientContext::Query(const string &query, bool allow_str
 		bool is_last_statement = i + 1 == statements.size();
 		PendingQueryParameters parameters;
 		parameters.allow_stream_result = allow_stream_result && is_last_statement;
-		auto pending_query = PendingQueryInternal(*lock, std::move(statement), parameters);
+		auto pending_query = PendingQueryInternal(*lock, std::move(statement), parameters); //Prepare the query
 		auto has_result = pending_query->properties.return_type == StatementReturnType::QUERY_RESULT;
 		unique_ptr<QueryResult> current_result;
 		if (pending_query->HasError()) {
 			current_result = ErrorResult<MaterializedQueryResult>(pending_query->GetErrorObject());
 		} else {
-			current_result = ExecutePendingQueryInternal(*lock, *pending_query);
+			current_result = ExecutePendingQueryInternal(*lock, *pending_query); //Execute query
 		}
 		// now append the result to the list of results
 		if (!last_result || !last_had_result) {

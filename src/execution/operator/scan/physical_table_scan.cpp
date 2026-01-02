@@ -102,7 +102,7 @@ SourceResultType PhysicalTableScan::GetData(ExecutionContext &context, DataChunk
 	TableFunctionInput data(bind_data.get(), l_state.local_state.get(), g_state.global_state.get());
 
 	if (function.function) {
-		function.function(context.client, data, chunk);
+		function.function(context.client, data, chunk); //This is where the data are stored in the source chunk
 		return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 	}
 

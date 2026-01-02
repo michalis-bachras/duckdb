@@ -66,7 +66,8 @@ add_library_unity(
   tree_renderer.cpp
   types.cpp
   virtual_file_system.cpp
-  windows_util.cpp)
+  windows_util.cpp
+  energy_monitor.cpp)
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_common>
     PARENT_SCOPE)
