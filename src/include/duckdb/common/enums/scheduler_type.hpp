@@ -14,7 +14,7 @@ namespace duckdb {
 
 //! SchedulerType determines which scheduling policy to use for query execution
 enum class SchedulerType : uint8_t {
-	//! Default FIFO scheduler (current DuckDB behavior)
+	//! Default FIFO scheduler (default DuckDB behavior)
 	DEFAULT = 0,
 	//! Stride scheduler with priority decay (based on SIGMOD 2021 paper)
 	STRIDE = 1,
