@@ -124,6 +124,25 @@ public:
 		return completed_pipelines.load();
 	}
 
+	//===--------------------------------------------------------------------===//
+	// Scheduler Integration
+	//===--------------------------------------------------------------------===//
+
+	//! Get the scheduler slot index for this query
+	idx_t GetSchedulerSlotIndex() const {
+		return scheduler_slot_index;
+	}
+
+	//! Set the scheduler slot index for this query
+	void SetSchedulerSlotIndex(idx_t slot_index) {
+		scheduler_slot_index = slot_index;
+	}
+
+	//! Check if this query is registered with the scheduler
+	bool IsRegisteredWithScheduler() const {
+		return scheduler_slot_index != DConstants::INVALID_INDEX;
+	}
+
 private:
 	//! Check if the streaming query result is waiting to be fetched from, must hold the 'executor_lock'
 	bool ResultCollectorIsBlocked();
@@ -190,5 +209,13 @@ private:
 
 	//! Total time blocked while waiting on tasks. In ticks. One tick corresponds to WAIT_TIME.
 	atomic<idx_t> blocked_thread_time;
+
+	//===--------------------------------------------------------------------===//
+	// Scheduler Integration
+	//===--------------------------------------------------------------------===//
+
+	//! The slot index in the global scheduler slot array (for stride scheduling).
+	//! Set to INVALID_INDEX when not registered with the scheduler.
+	idx_t scheduler_slot_index;
 };
 } // namespace duckdb

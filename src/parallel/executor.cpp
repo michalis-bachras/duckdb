@@ -23,7 +23,8 @@
 
 namespace duckdb {
 
-Executor::Executor(ClientContext &context) : context(context), executor_tasks(0), blocked_thread_time(0) {
+Executor::Executor(ClientContext &context)
+    : context(context), executor_tasks(0), blocked_thread_time(0), scheduler_slot_index(DConstants::INVALID_INDEX) {
 }
 
 Executor::~Executor() {
