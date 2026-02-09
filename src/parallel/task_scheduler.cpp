@@ -6,6 +6,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/storage/block_allocator.hpp"
+#include "duckdb/parallel/default_scheduler_policy.hpp"
 #ifndef DUCKDB_NO_THREADS
 #include "concurrentqueue.h"
 #include "duckdb/common/thread.hpp"
@@ -227,7 +228,7 @@ TaskScheduler::TaskScheduler(DatabaseInstance &db)
     : db(db), queue(make_uniq<ConcurrentQueue>()),
       allocator_flush_threshold(db.config.options.allocator_flush_threshold),
       allocator_background_threads(db.config.options.allocator_background_threads), requested_thread_count(0),
-      current_thread_count(1) {
+      current_thread_count(1), policy(make_uniq<DefaultSchedulerPolicy>()) {
 	SetAllocatorBackgroundThreads(db.config.options.allocator_background_threads);
 }
 
@@ -570,4 +571,21 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n) {
 #endif
 }
 
+//===--------------------------------------------------------------------===//
+// Scheduler Policy Methods
+//===--------------------------------------------------------------------===//
+
+SchedulerPolicy &TaskScheduler::GetPolicy() {
+	return *policy;
+}
+
+SchedulerSlotArray &TaskScheduler::GetSlotArray() {
+	return slot_array;
+}
+
+void TaskScheduler::SetPolicy(unique_ptr<SchedulerPolicy> new_policy) {
+	policy = std::move(new_policy);
+}
+
 } // namespace duckdb
+

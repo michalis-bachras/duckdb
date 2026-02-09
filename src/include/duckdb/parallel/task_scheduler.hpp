@@ -13,6 +13,8 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parallel/task.hpp"
+#include "duckdb/parallel/scheduler_policy.hpp"
+#include "duckdb/parallel/scheduler_slot_array.hpp"
 
 namespace duckdb {
 
@@ -89,6 +91,19 @@ public:
 	//! Result do not need to be exact 'return 0' is a valid fallback strategy
 	static idx_t GetEstimatedCPUId();
 
+	//===--------------------------------------------------------------------===//
+	// Scheduler Policy
+	//===--------------------------------------------------------------------===//
+
+	//! Get the current scheduler policy
+	SchedulerPolicy &GetPolicy();
+
+	//! Get the global slot array (for stride scheduling)
+	SchedulerSlotArray &GetSlotArray();
+
+	//! Set the scheduler policy (takes ownership)
+	void SetPolicy(unique_ptr<SchedulerPolicy> new_policy);
+
 private:
 	void RelaunchThreadsInternal(int32_t n);
 
@@ -110,6 +125,16 @@ private:
 	atomic<int32_t> requested_thread_count;
 	//! The amount of threads currently running
 	atomic<int32_t> current_thread_count;
+
+	//===--------------------------------------------------------------------===//
+	// Scheduler Policy Members
+	//===--------------------------------------------------------------------===//
+
+	//! The current scheduler policy (determines task selection strategy)
+	unique_ptr<SchedulerPolicy> policy;
+	//! Global slot array for stride scheduling (shared across all threads)
+	SchedulerSlotArray slot_array;
 };
 
 } // namespace duckdb
+
