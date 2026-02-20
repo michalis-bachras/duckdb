@@ -1,5 +1,7 @@
 #include "duckdb/parallel/scheduler_slot_array.hpp"
+#include "duckdb/parallel/thread_local_scheduler_state.hpp"
 
+#include <algorithm>
 #include <limits>
 
 namespace duckdb {
@@ -8,18 +10,18 @@ SchedulerSlotArray::SchedulerSlotArray() : active_count(0), sequence_number(0), 
 	active_slots.reset();
 }
 
-idx_t SchedulerSlotArray::RegisterQuery(Executor &executor, double initial_priority) {
+idx_t SchedulerSlotArray::RegisterQuery(Executor &executor) {
 	lock_guard<mutex> lock(registration_lock);
 
 	// Find first free slot
 	for (idx_t i = 0; i < SCHEDULER_MAX_SLOTS; i++) {
 		if (!active_slots.test(i)) {
-			// Found a free slot
+			// Found a free slot - initialize with constants
 			auto &slot = slots[i];
 			slot.executor.store(&executor, std::memory_order_release);
 			slot.active_pipeline.store(nullptr, std::memory_order_release);
-			slot.priority.store(initial_priority, std::memory_order_release);
-			slot.stride.store(LARGE_CONSTANT / initial_priority, std::memory_order_release);
+			slot.priority.store(INITIAL_PRIORITY, std::memory_order_release);
+			slot.stride.store(LARGE_CONSTANT / INITIAL_PRIORITY, std::memory_order_release);
 			// Initialize pass to global pass (so new queries start fair)
 			slot.pass.store(global_pass.load(std::memory_order_acquire), std::memory_order_release);
 			slot.decay_count.store(0, std::memory_order_release);
@@ -28,6 +30,9 @@ idx_t SchedulerSlotArray::RegisterQuery(Executor &executor, double initial_prior
 			active_slots.set(i);
 			active_count.fetch_add(1, std::memory_order_release);
 			sequence_number.fetch_add(1, std::memory_order_release);
+
+			// Notify all workers that slot i has a new query
+			PushChangeToWorkers(i);
 
 			return i;
 		}
@@ -59,6 +64,9 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 	active_slots.reset(slot_index);
 	active_count.fetch_sub(1, std::memory_order_release);
 	sequence_number.fetch_add(1, std::memory_order_release);
+
+	// Notify all workers that slot was deactivated
+	PushReturnToWorkers(slot_index);
 }
 
 void SchedulerSlotArray::SetActivePipeline(idx_t slot_index, Pipeline *pipeline) {
@@ -93,16 +101,39 @@ void SchedulerSlotArray::UpdatePass(idx_t slot_index, double pass_increment) {
 	slot.pass.store(old_pass + pass_increment, std::memory_order_release);
 }
 
-void SchedulerSlotArray::IncrementDecayCount(idx_t slot_index) {
+void SchedulerSlotArray::IncrementDecayCountAndApply(idx_t slot_index) {
 	if (slot_index >= SCHEDULER_MAX_SLOTS) {
 		return;
 	}
-	slots[slot_index].decay_count.fetch_add(1, std::memory_order_release);
+
+	auto &slot = slots[slot_index];
+	int new_count = slot.decay_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+	// Apply decay formula from Section 2.3 of the paper (Formula 2):
+	// p_{i+1} = p_i,                    if i < d_start
+	// p_{i+1} = max(p_min, λ * p_i),    if i >= d_start
+	// Only apply decay after d_start quanta
+	if (new_count <= DECAY_START_QUANTA) {
+		return;
+	}
+
+	// Apply exponential decay: p_new = λ * p_current
+	double current_prio = slot.priority.load(std::memory_order_acquire);
+	double new_prio = DECAY_LAMBDA * current_prio;
+
+	// Enforce minimum priority bound (p_min from paper)
+	if (new_prio < MIN_PRIORITY) {
+		new_prio = MIN_PRIORITY;
+	}
+
+	// Update priority and stride
+	slot.priority.store(new_prio, std::memory_order_release);
+	slot.stride.store(LARGE_CONSTANT / new_prio, std::memory_order_release);
 }
 
 double SchedulerSlotArray::GetPriority(idx_t slot_index) const {
 	if (slot_index >= SCHEDULER_MAX_SLOTS) {
-		return 1.0;
+		return INITIAL_PRIORITY;
 	}
 	return slots[slot_index].priority.load(std::memory_order_acquire);
 }
@@ -177,6 +208,62 @@ double SchedulerSlotArray::ComputeTotalPriority() const {
 		}
 	}
 	return total;
+}
+
+//===--------------------------------------------------------------------===//
+// Worker Registration & Change/Return Masks
+//===--------------------------------------------------------------------===//
+
+void SchedulerSlotArray::RegisterWorker(ThreadLocalSchedulerState *worker_state) {
+	lock_guard<mutex> lock(worker_registry_lock);
+	registered_workers.push_back(worker_state);
+}
+
+void SchedulerSlotArray::DeregisterWorker(ThreadLocalSchedulerState *worker_state) {
+	lock_guard<mutex> lock(worker_registry_lock);
+	registered_workers.erase(std::remove(registered_workers.begin(), registered_workers.end(), worker_state),
+	                         registered_workers.end());
+}
+
+void SchedulerSlotArray::PushChangeToWorkers(idx_t slot_index) {
+
+	lock_guard<mutex> lock(worker_registry_lock);
+	if (slot_index < 64) {
+		uint64_t bit = 1ULL << slot_index;
+		for (auto *worker : registered_workers) {
+			worker->change_mask_low.fetch_or(bit, std::memory_order_release);
+		}
+	} else {
+		uint64_t bit = 1ULL << (slot_index - 64);
+		for (auto *worker : registered_workers) {
+			worker->change_mask_high.fetch_or(bit, std::memory_order_release);
+		}
+	}
+}
+
+void SchedulerSlotArray::PushReturnToWorkers(idx_t slot_index) {
+	lock_guard<mutex> lock(worker_registry_lock);
+	if (slot_index < 64) {
+		uint64_t bit = 1ULL << slot_index;
+		for (auto *worker : registered_workers) {
+			worker->return_mask_low.fetch_or(bit, std::memory_order_release);
+		}
+	} else {
+		uint64_t bit = 1ULL << (slot_index - 64);
+		for (auto *worker : registered_workers) {
+			worker->return_mask_high.fetch_or(bit, std::memory_order_release);
+		}
+	}
+}
+
+void SchedulerSlotArray::ResetPassAndNotify(idx_t slot_index) {
+	if (slot_index >= SCHEDULER_MAX_SLOTS) {
+		return;
+	}
+	// Reset pass to 0 so finalization tasks get immediate priority
+	slots[slot_index].pass.store(0.0, std::memory_order_release);
+	// Notify all workers that this slot changed (they'll refresh pass/priority)
+	PushChangeToWorkers(slot_index);
 }
 
 } // namespace duckdb

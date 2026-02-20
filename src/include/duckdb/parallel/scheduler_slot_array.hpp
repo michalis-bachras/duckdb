@@ -20,6 +20,7 @@ namespace duckdb {
 
 class Executor;
 class Pipeline;
+struct ThreadLocalSchedulerState;
 
 //! Maximum number of concurrent queries the scheduler can track
 static constexpr idx_t SCHEDULER_MAX_SLOTS = 128;
@@ -31,7 +32,8 @@ struct SchedulerSlot {
 	atomic<Executor *> executor;
 	//! The currently active pipeline for this query. nullptr if no active pipeline.
 	atomic<Pipeline *> active_pipeline;
-	//! Current priority (higher = more resources)
+	//! Current priority (higher = more resources, decays over time)
+	//! Initialized to INITIAL_PRIORITY when registered, decays via Formula 2
 	atomic<double> priority;
 	//! Stride value = LARGE_CONSTANT / priority
 	atomic<double> stride;
@@ -42,8 +44,11 @@ struct SchedulerSlot {
 	//! Query start time in nanoseconds (for latency tracking)
 	atomic<int64_t> start_time_ns;
 
-	SchedulerSlot() : executor(nullptr), active_pipeline(nullptr), priority(1.0), 
-	                  stride(1000.0), pass(0.0), decay_count(0), start_time_ns(0) {
+	//! Default constructor - slot is empty/unused
+	//! Actual values are set by RegisterQuery()
+	SchedulerSlot()
+	    : executor(nullptr), active_pipeline(nullptr), priority(0.0), stride(0.0), pass(0.0), decay_count(0),
+	      start_time_ns(0) {
 	}
 };
 
@@ -53,12 +58,26 @@ struct SchedulerSlot {
 //! Key properties:
 //! - Fixed size (128 slots max)
 //! - Lock-free reads for scheduling decisions
+//! - Change/return mask notifications to worker threads
 //! - Registration/deregistration requires mutex
 //! - Sequence number for thread-local cache invalidation
 class SchedulerSlotArray {
 public:
 	//! Stride scheduling constant (determines granularity)
 	static constexpr double LARGE_CONSTANT = 1000.0;
+
+	//! Initial priority for all queries (p0 from paper, Section 2.3)
+	static constexpr double INITIAL_PRIORITY = 10000.0;
+
+	//! Minimum priority bound (p_min from paper)
+	static constexpr double MIN_PRIORITY = 100.0;
+
+	//! Priority decay constants from Section 2.3 of the paper (Formula 2)
+	//! d_start: Number of quanta before decay starts
+	static constexpr int DECAY_START_QUANTA = 10;
+	//! λ (lambda): Decay factor applied each quantum after d_start
+	//! Formula 2: p_{i+1} = max(p_min, λ * p_i) for i >= d_start
+	static constexpr double DECAY_LAMBDA = 0.9;
 
 	SchedulerSlotArray();
 
@@ -67,13 +86,14 @@ public:
 	//===--------------------------------------------------------------------===//
 
 	//! Register a query and get a slot index.
-	//! Returns -1 if all slots are full (query must wait).
+	//! Returns INVALID_INDEX if all slots are full (query must wait).
+	//! Priority is initialized to INITIAL_PRIORITY.
 	//! @param executor The query's executor
-	//! @param initial_priority Initial priority for this query (default 1.0)
-	//! @return Slot index, or -1 if no slots available
-	idx_t RegisterQuery(Executor &executor, double initial_priority = 1.0);
+	//! @return Slot index, or INVALID_INDEX if no slots available
+	idx_t RegisterQuery(Executor &executor);
 
 	//! Deregister a query and free its slot.
+	//! Pushes a return mask update to all registered workers.
 	void DeregisterQuery(idx_t slot_index);
 
 	//===--------------------------------------------------------------------===//
@@ -98,8 +118,9 @@ public:
 	//! Update pass value after task execution.
 	void UpdatePass(idx_t slot_index, double pass_increment);
 
-	//! Increment decay count.
-	void IncrementDecayCount(idx_t slot_index);
+	//! Increment decay count and apply priority decay if threshold reached.
+	//! @param slot_index Slot to update
+	void IncrementDecayCountAndApply(idx_t slot_index);
 
 	//! Get current values (lock-free reads)
 	double GetPriority(idx_t slot_index) const;
@@ -126,6 +147,30 @@ public:
 	//! Returns -1 if no active slots.
 	idx_t FindMinPassSlot() const;
 
+	//===--------------------------------------------------------------------===//
+	// Worker Registration & Change/Return Masks
+	//===--------------------------------------------------------------------===//
+
+	//! Register a worker thread's local state.
+	//! Must be called at the start of ExecuteForever.
+	void RegisterWorker(ThreadLocalSchedulerState *worker_state);
+
+	//! Deregister a worker thread's local state.
+	//! Must be called at the end of ExecuteForever.
+	void DeregisterWorker(ThreadLocalSchedulerState *worker_state);
+
+	//! Push a change notification for a slot to all registered workers.
+	//! Called when an initial task set of a new query is registered to a slot
+	void PushChangeToWorkers(idx_t slot_index);
+
+	//! Push a return notification for a slot to all registered workers.
+	//! Called when a new task set of an active query is registered to a slot
+	void PushReturnToWorkers(idx_t slot_index);
+
+	//! Reset pass value to 0 and notify workers.
+	//! Used for finalization tasks to get immediate priority.
+	void ResetPassAndNotify(idx_t slot_index);
+
 	//! Compute total priority across all active slots.
 	double ComputeTotalPriority() const;
 
@@ -142,6 +187,11 @@ private:
 	mutex registration_lock;
 	//! Global pass value (for initializing new queries)
 	atomic<double> global_pass;
+
+	//! Registry of worker thread states for push-based mask updates.
+	//! Protected by worker_registry_lock.
+	vector<ThreadLocalSchedulerState *> registered_workers;
+	mutex worker_registry_lock;
 };
 
 } // namespace duckdb

@@ -7,6 +7,9 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/storage/block_allocator.hpp"
 #include "duckdb/parallel/default_scheduler_policy.hpp"
+#include "duckdb/parallel/executor_task.hpp"
+#include "duckdb/execution/executor.hpp"
+#include "duckdb/parallel/thread_local_scheduler_state.hpp"
 #ifndef DUCKDB_NO_THREADS
 #include "concurrentqueue.h"
 #include "duckdb/common/thread.hpp"
@@ -275,6 +278,15 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 	const auto &block_allocator = BlockAllocator::Get(db);
 	const auto &config = DBConfig::GetConfig(db);
 
+	// Thread-local scheduler state for stride scheduling
+	ThreadLocalSchedulerState thread_local_state;
+
+	// Register this worker's local state with the slot array for push-based updates.
+	// Paper Section 2.4: "each worker maintains two atomic bitmasks for updates to the active task sets"
+	if (policy->GetType() == SchedulerType::STRIDE) {
+		slot_array.RegisterWorker(&thread_local_state);
+	}
+
 	shared_ptr<Task> task;
 	// loop until the marker is set to false
 	while (*marker) {
@@ -299,10 +311,65 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				}
 			}
 		}
-		if (queue->Dequeue(task)) {
+
+		// Task dequeue: different behavior based on scheduler policy
+		bool got_task = false;
+		idx_t selected_slot = DConstants::INVALID_INDEX;
+
+		if (policy->GetType() == SchedulerType::STRIDE && slot_array.GetActiveSlotCount() > 0) {
+			// STRIDE SCHEDULING
+
+			// 1. Pull updates from change/return masks, before picking a task for execution.
+			thread_local_state.PullUpdates(slot_array);
+
+			// 2. Iterate slots in ascending pass order (sorted_slots[0] = min pass).
+			// Try each slot's producer until we find a task.
+			// This maintains stride fairness: if min-pass slot has no tasks,
+			// try the next-lowest pass slot rather than falling back to FIFO immediately.
+			for (idx_t attempt = 0; attempt < thread_local_state.GetActiveSlotCount() && !got_task; attempt++) {
+				idx_t slot = thread_local_state.FindNthMinPassSlot(attempt);
+				if (slot != DConstants::INVALID_INDEX) {
+					Executor *executor = slot_array.GetExecutor(slot);
+					if (executor) {
+						got_task = GetTaskFromProducer(executor->GetToken(), task);
+						if (got_task) {
+							selected_slot = slot;
+						}
+					}
+				}
+			}
+
+			// 3. Fallback to FIFO only if ALL active slots have no tasks
+			if (!got_task) {
+				got_task = queue->Dequeue(task);
+			}
+		} else if (policy->GetType() == SchedulerType::DEFAULT) {
+			// DEFAULT SCHEDULING: FIFO queue
+			got_task = queue->Dequeue(task);
+		} else if (policy->GetType() == SchedulerType::ML) {
+			// ML SCHEDULING: FIFO queue(for now)
+			got_task = queue->Dequeue(task);
+		}
+
+		if (got_task) {
 			auto process_mode = config.options.scheduler_process_partial ? TaskExecutionMode::PROCESS_PARTIAL
 			                                                             : TaskExecutionMode::PROCESS_ALL;
 			auto execute_result = task->Execute(process_mode);
+
+			// After task execution: update stride state
+			if (policy->GetType() == SchedulerType::STRIDE) {
+				auto *executor_task = dynamic_cast<ExecutorTask *>(task.get());
+				if (executor_task && executor_task->executor.IsRegisteredWithScheduler()) {
+					idx_t slot_idx = executor_task->executor.GetSchedulerSlotIndex();
+					// Update pass value: pass += stride
+					double stride = slot_array.GetStride(slot_idx);
+					slot_array.UpdatePass(slot_idx, stride);
+					// Update thread-local pass too
+					thread_local_state.UpdateLocalPass(slot_idx, 1.0);
+					// Apply priority decay
+					slot_array.IncrementDecayCountAndApply(slot_idx);
+				}
+			}
 
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
@@ -325,6 +392,12 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			queue->semaphore.signal(1);
 		}
 	}
+
+	// Deregister worker before exiting
+	if (policy->GetType() == SchedulerType::STRIDE) {
+		slot_array.DeregisterWorker(&thread_local_state);
+	}
+
 	// this thread will exit, flush all of its outstanding allocations
 	if (block_allocator.SupportsFlush()) {
 		block_allocator.ThreadFlush(allocator_background_threads, 0, NumericCast<idx_t>(requested_thread_count.load()));
@@ -588,4 +661,3 @@ void TaskScheduler::SetPolicy(unique_ptr<SchedulerPolicy> new_policy) {
 }
 
 } // namespace duckdb
-
