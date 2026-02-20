@@ -129,6 +129,13 @@ public:
 	int GetDecayCount(idx_t slot_index) const;
 	Executor *GetExecutor(idx_t slot_index) const;
 
+	//! Get the current global pass value
+	double GetGlobalPass() const;
+
+	//! Increment global pass by global stride.
+	//! Called from ExecuteForever after each stride task execution.
+	void IncrementGlobalPass();
+
 	//===--------------------------------------------------------------------===//
 	// Scheduling Queries (lock-free)
 	//===--------------------------------------------------------------------===//
@@ -185,8 +192,14 @@ private:
 	atomic<uint64_t> sequence_number;
 	//! Mutex for registration/deregistration
 	mutex registration_lock;
-	//! Global pass value (for initializing new queries)
+	//! Global pass value (for initializing new queries and new task sets)
 	atomic<double> global_pass;
+	//! Global stride = LARGE_CONSTANT / Σ(priorities)
+	//! Recomputed on register/deregister/decay
+	atomic<double> global_stride;
+
+	//! Recompute global stride from current active priorities
+	void RecomputeGlobalStride();
 
 	//! Registry of worker thread states for push-based mask updates.
 	//! Protected by worker_registry_lock.

@@ -6,7 +6,7 @@
 
 namespace duckdb {
 
-SchedulerSlotArray::SchedulerSlotArray() : active_count(0), sequence_number(0), global_pass(0.0) {
+SchedulerSlotArray::SchedulerSlotArray() : active_count(0), sequence_number(0), global_pass(0.0), global_stride(0.0) {
 	active_slots.reset();
 }
 
@@ -30,6 +30,9 @@ idx_t SchedulerSlotArray::RegisterQuery(Executor &executor) {
 			active_slots.set(i);
 			active_count.fetch_add(1, std::memory_order_release);
 			sequence_number.fetch_add(1, std::memory_order_release);
+
+			// Recompute global stride: LARGE_CONSTANT / Σ(priorities)
+			RecomputeGlobalStride();
 
 			// Notify all workers that slot i has a new query
 			PushChangeToWorkers(i);
@@ -64,6 +67,9 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 	active_slots.reset(slot_index);
 	active_count.fetch_sub(1, std::memory_order_release);
 	sequence_number.fetch_add(1, std::memory_order_release);
+
+	// Recompute global stride: LARGE_CONSTANT / Σ(priorities)
+	RecomputeGlobalStride();
 
 	// Notify all workers that slot was deactivated
 	PushReturnToWorkers(slot_index);
@@ -129,6 +135,9 @@ void SchedulerSlotArray::IncrementDecayCountAndApply(idx_t slot_index) {
 	// Update priority and stride
 	slot.priority.store(new_prio, std::memory_order_release);
 	slot.stride.store(LARGE_CONSTANT / new_prio, std::memory_order_release);
+
+	// Recompute global stride since a priority changed
+	RecomputeGlobalStride();
 }
 
 double SchedulerSlotArray::GetPriority(idx_t slot_index) const {
@@ -210,6 +219,30 @@ double SchedulerSlotArray::ComputeTotalPriority() const {
 	return total;
 }
 
+void SchedulerSlotArray::RecomputeGlobalStride() {
+	// global_stride = LARGE_CONSTANT / Σ(priorities)
+	// Must be called under registration_lock or when priorities change
+	double total_priority = ComputeTotalPriority();
+	if (total_priority > 0.0) {
+		global_stride.store(LARGE_CONSTANT / total_priority, std::memory_order_release);
+	} else {
+		global_stride.store(0.0, std::memory_order_release);
+	}
+}
+
+void SchedulerSlotArray::IncrementGlobalPass() {
+	// Paper: "After every scheduled time slice, the global pass gets incremented by the global stride."
+	double stride = global_stride.load(std::memory_order_acquire);
+	if (stride > 0.0) {
+		double old_pass = global_pass.load(std::memory_order_acquire);
+		global_pass.store(old_pass + stride, std::memory_order_release);
+	}
+}
+
+double SchedulerSlotArray::GetGlobalPass() const {
+	return global_pass.load(std::memory_order_acquire);
+}
+
 //===--------------------------------------------------------------------===//
 // Worker Registration & Change/Return Masks
 //===--------------------------------------------------------------------===//
@@ -226,7 +259,6 @@ void SchedulerSlotArray::DeregisterWorker(ThreadLocalSchedulerState *worker_stat
 }
 
 void SchedulerSlotArray::PushChangeToWorkers(idx_t slot_index) {
-
 	lock_guard<mutex> lock(worker_registry_lock);
 	if (slot_index < 64) {
 		uint64_t bit = 1ULL << slot_index;

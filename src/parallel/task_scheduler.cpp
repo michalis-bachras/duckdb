@@ -282,7 +282,6 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 	ThreadLocalSchedulerState thread_local_state;
 
 	// Register this worker's local state with the slot array for push-based updates.
-	// Paper Section 2.4: "each worker maintains two atomic bitmasks for updates to the active task sets"
 	if (policy->GetType() == SchedulerType::STRIDE) {
 		slot_array.RegisterWorker(&thread_local_state);
 	}
@@ -369,6 +368,8 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 					// Apply priority decay
 					slot_array.IncrementDecayCountAndApply(slot_idx);
 				}
+				// Increment global pass by global stride after each time slice
+				slot_array.IncrementGlobalPass();
 			}
 
 			switch (execute_result) {
