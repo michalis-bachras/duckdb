@@ -21,15 +21,19 @@ namespace duckdb {
 
 //! ThreadLocalSchedulerState holds per-thread scheduling state for stride scheduling.
 //!
-//! Change mask / return mask mechanism for efficient updates:
-//! - Other threads push updates via atomic fetch_or on this thread's bitmasks
-//! - This thread pulls updates by atomically exchanging masks with zero
-//! - Only changed slots are refreshed (no full scan needed)
+//! Three-mask update mechanism:
+//! - Change mask: new resource group registered in a slot
+//! - Finalization mask: pipeline entering finalization phase (local pass → 0)
+//! - Return mask: new pipeline/task set in existing slot (local pass → global_pass)
+//!
+//! Other threads push updates via atomic fetch_or on this thread's bitmasks.
+//! This thread pulls updates by atomically exchanging masks with zero.
+//! Only changed slots are refreshed (no full scan needed).
 //!
 //! Uses a pre-sorted slot array for O(1) slot selection by pass value.
 //!
 //! Workflow per thread:
-//! 1. PullUpdates() - check for slot changes 
+//! 1. PullUpdates() - check for slot changes
 //! 2. sorted_slots[0] gives min-pass slot
 //! 3. Iterate sorted_slots[0..n] if selected slot has no tasks
 //! 4. UpdateLocalPass() after task execution
@@ -38,12 +42,19 @@ struct ThreadLocalSchedulerState {
 	// Update Masks (written by other threads, read by this thread)
 	//===--------------------------------------------------------------------===//
 
-	//! Change mask: bits set when a slot receives a new/changed task set/pipeline
+	//! Change mask: bits set when a NEW resource group is registered in a slot
 	//! Split into two 64-bit words for 128 slots
 	std::atomic<uint64_t> change_mask_low {0};
 	std::atomic<uint64_t> change_mask_high {0};
 
-	//! Return mask: bits set when a slot is deactivated (query finished)
+	//! Finalization mask: bits set when a pipeline enters finalization phase(finish and complete events)
+	//! Workers set local pass = 0 for these slots to prioritize finalization tasks
+	std::atomic<uint64_t> finalization_mask_low {0};
+	std::atomic<uint64_t> finalization_mask_high {0};
+
+	//! Return mask: bits set when a new pipeline/task set is inserted into
+	//! an existing resource group's slot. Workers set local pass = global_pass
+	//! and retain the existing priority/stride.
 	std::atomic<uint64_t> return_mask_low {0};
 	std::atomic<uint64_t> return_mask_high {0};
 
@@ -105,6 +116,8 @@ struct ThreadLocalSchedulerState {
 		// Drain any pending masks (we just did a full refresh)
 		change_mask_low.exchange(0, std::memory_order_relaxed);
 		change_mask_high.exchange(0, std::memory_order_relaxed);
+		finalization_mask_low.exchange(0, std::memory_order_relaxed);
+		finalization_mask_high.exchange(0, std::memory_order_relaxed);
 		return_mask_low.exchange(0, std::memory_order_relaxed);
 		return_mask_high.exchange(0, std::memory_order_relaxed);
 
@@ -113,12 +126,12 @@ struct ThreadLocalSchedulerState {
 	}
 
 	//===--------------------------------------------------------------------===//
-	// Incremental Update via Change/Return Masks
+	// Incremental Update via Change/Finalization/Return Masks
 	//===--------------------------------------------------------------------===//
 
-	//! Pull updates from this thread's change/return masks.
-	//! Paper: "each worker can easily pull updates into its local scheduling state.
-	//! It first performs an atomic exchange of its update masks with zero."
+	//! Pull updates from this thread's update masks.
+	//! Atomically exchanges each mask with zero, then processes set bits.
+	//! If there are no outstanding changes, this update is cheap.
 	//!
 	//! Returns true if any updates were applied.
 	bool PullUpdates(const SchedulerSlotArray &global) {
@@ -127,28 +140,30 @@ struct ThreadLocalSchedulerState {
 			return true;
 		}
 
-		// Atomically exchange masks with zero - resets them for future updates
+		// Atomically exchange all masks with zero
 		uint64_t change_low = change_mask_low.exchange(0, std::memory_order_relaxed);
 		uint64_t change_high = change_mask_high.exchange(0, std::memory_order_relaxed);
-		uint64_t return_low = return_mask_low.exchange(0, std::memory_order_relaxed);
-		uint64_t return_high = return_mask_high.exchange(0, std::memory_order_relaxed);
+		uint64_t fin_low = finalization_mask_low.exchange(0, std::memory_order_relaxed);
+		uint64_t fin_high = finalization_mask_high.exchange(0, std::memory_order_relaxed);
+		uint64_t ret_low = return_mask_low.exchange(0, std::memory_order_relaxed);
+		uint64_t ret_high = return_mask_high.exchange(0, std::memory_order_relaxed);
 
-		// If nothing changed, this is very cheap - no cache invalidation
-		// Cache invalidations are avoided since there were no atomic writes
-		// to the local update masks since the last read."
-		if (change_low == 0 && change_high == 0 && return_low == 0 && return_high == 0) {
+		// If nothing changed, no work needed
+		if (change_low == 0 && change_high == 0 && fin_low == 0 && fin_high == 0 && ret_low == 0 && ret_high == 0) {
 			return false;
 		}
 
 		bool changed = false;
 
-		// Process return mask first (slots that became inactive)
-		// Paper: "the worker has to extract the indices of set bits in the old mask values"
-		// Using __builtin_ctzll for "counting the leading zeros" as the paper describes
-		changed |= ProcessReturnMask(return_low, 0);
-		changed |= ProcessReturnMask(return_high, 64);
+		// Process finalization mask first (set local pass = 0 for finalizing slots)
+		changed |= ProcessFinalizationMask(fin_low, 0);
+		changed |= ProcessFinalizationMask(fin_high, 64);
 
-		// Process change mask (slots that became active or were updated)
+		// Process return mask (new pipeline in existing slot → local pass = global_pass)
+		changed |= ProcessReturnMask(ret_low, 0, global);
+		changed |= ProcessReturnMask(ret_high, 64, global);
+
+		// Process change mask (new resource group → activate slot, read all from global)
 		changed |= ProcessChangeMask(change_low, 0, global);
 		changed |= ProcessChangeMask(change_high, 64, global);
 
@@ -194,7 +209,19 @@ struct ThreadLocalSchedulerState {
 		if (slot_idx < SCHEDULER_MAX_SLOTS && active_slots.test(slot_idx)) {
 			pass_values[slot_idx] += strides[slot_idx] * time_fraction;
 			// Re-sort to maintain ordering after pass change
-			// This is O(n log n) but n is typically very small (1-128 queries)
+			RebuildSortedSlots();
+		}
+	}
+
+	//===--------------------------------------------------------------------===//
+	// Lazy Slot Disable (for deregistration)
+	//===--------------------------------------------------------------------===//
+
+	//! Disable a slot locally when a worker discovers the global executor is nullptr.
+	//! This implements the paper's lazy deactivation approach.
+	void DisableSlotLocally(idx_t slot_idx) {
+		if (slot_idx < SCHEDULER_MAX_SLOTS && active_slots.test(slot_idx)) {
+			active_slots.reset(slot_idx);
 			RebuildSortedSlots();
 		}
 	}
@@ -204,22 +231,39 @@ private:
 	// Internal Helpers
 	//===--------------------------------------------------------------------===//
 
-	//! Process return mask bits - deactivate slots
-	bool ProcessReturnMask(uint64_t mask, idx_t offset) {
+	//! Process finalization mask bits — set local pass = 0 for finalizing slots
+	bool ProcessFinalizationMask(uint64_t mask, idx_t offset) {
 		bool changed = false;
 		while (mask != 0) {
-			// Find lowest set bit using hardware ctz instruction
 			int bit_pos = __builtin_ctzll(mask);
 			idx_t slot_idx = static_cast<idx_t>(bit_pos) + offset;
-			active_slots.reset(slot_idx);
-			changed = true;
-			// Clear the bit we just processed
+			if (active_slots.test(slot_idx)) {
+				pass_values[slot_idx] = 0.0;
+				changed = true;
+			}
 			mask &= mask - 1;
 		}
 		return changed;
 	}
 
-	//! Process change mask bits - activate/update slots from global state
+	//! Process return mask bits — new pipeline in existing slot
+	//! Set local pass = global_pass, retain existing priority/stride
+	bool ProcessReturnMask(uint64_t mask, idx_t offset, const SchedulerSlotArray &global) {
+		bool changed = false;
+		while (mask != 0) {
+			int bit_pos = __builtin_ctzll(mask);
+			idx_t slot_idx = static_cast<idx_t>(bit_pos) + offset;
+			if (active_slots.test(slot_idx)) {
+				pass_values[slot_idx] = global.GetGlobalPass();
+				// Priority and stride are retained (bound to resource group, not task set)
+				changed = true;
+			}
+			mask &= mask - 1;
+		}
+		return changed;
+	}
+
+	//! Process change mask bits — new resource group, activate and read all from global
 	bool ProcessChangeMask(uint64_t mask, idx_t offset, const SchedulerSlotArray &global) {
 		bool changed = false;
 		while (mask != 0) {
@@ -236,7 +280,6 @@ private:
 	}
 
 	//! Rebuild the sorted_slots array from active_slots.
-	//! Uses bitmask iteration for efficiency, then sorts by pass value.
 	void RebuildSortedSlots() {
 		sorted_count = 0;
 		for (idx_t i = 0; i < SCHEDULER_MAX_SLOTS; i++) {

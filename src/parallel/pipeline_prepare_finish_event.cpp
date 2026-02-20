@@ -1,4 +1,6 @@
 #include "duckdb/parallel/pipeline_prepare_finish_event.hpp"
+#include "duckdb/execution/executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 namespace duckdb {
 
@@ -27,6 +29,13 @@ public:
 };
 
 void PipelinePrepareFinishEvent::Schedule() {
+	// Push finalization mask so all workers set local pass = 0 for this slot
+	auto &exec = pipeline->executor;
+	if (exec.IsRegisteredWithScheduler()) {
+		auto &scheduler = TaskScheduler::GetScheduler(exec.context);
+		scheduler.GetSlotArray().PushFinalizationToWorkers(exec.GetSchedulerSlotIndex());
+	}
+
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelinePreFinishTask>(*pipeline, shared_from_this()));
 	SetTasks(std::move(tasks));

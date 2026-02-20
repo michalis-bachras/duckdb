@@ -167,16 +167,20 @@ public:
 	void DeregisterWorker(ThreadLocalSchedulerState *worker_state);
 
 	//! Push a change notification for a slot to all registered workers.
-	//! Called when an initial task set of a new query is registered to a slot
+	//! Called when an initial task set of a new query is registered to a slot.
+	//! Workers: activate slot locally, read priority/stride from global.
 	void PushChangeToWorkers(idx_t slot_index);
 
-	//! Push a return notification for a slot to all registered workers.
-	//! Called when a new task set of an active query is registered to a slot
-	void PushReturnToWorkers(idx_t slot_index);
+	//! Push a finalization notification for a slot to all registered workers.
+	//! Called when a pipeline enters its finalization phase.
+	//! Workers: set local pass[slot] = 0 to prioritize finalization tasks.
+	void PushFinalizationToWorkers(idx_t slot_index);
 
-	//! Reset pass value to 0 and notify workers.
-	//! Used for finalization tasks to get immediate priority.
-	void ResetPassAndNotify(idx_t slot_index);
+	//! Push a return notification for a slot to all registered workers.
+	//! Called when a new pipeline/task set is inserted into an existing
+	//! resource group's slot (i.e., the previous pipeline finished and a new one starts).
+	//! Workers: set local pass[slot] = global_pass, retain priority/stride.
+	void PushReturnToWorkers(idx_t slot_index);
 
 	//! Compute total priority across all active slots.
 	double ComputeTotalPriority() const;

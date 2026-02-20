@@ -273,6 +273,21 @@ void SchedulerSlotArray::PushChangeToWorkers(idx_t slot_index) {
 	}
 }
 
+void SchedulerSlotArray::PushFinalizationToWorkers(idx_t slot_index) {
+	lock_guard<mutex> lock(worker_registry_lock);
+	if (slot_index < 64) {
+		uint64_t bit = 1ULL << slot_index;
+		for (auto *worker : registered_workers) {
+			worker->finalization_mask_low.fetch_or(bit, std::memory_order_release);
+		}
+	} else {
+		uint64_t bit = 1ULL << (slot_index - 64);
+		for (auto *worker : registered_workers) {
+			worker->finalization_mask_high.fetch_or(bit, std::memory_order_release);
+		}
+	}
+}
+
 void SchedulerSlotArray::PushReturnToWorkers(idx_t slot_index) {
 	lock_guard<mutex> lock(worker_registry_lock);
 	if (slot_index < 64) {
@@ -286,16 +301,6 @@ void SchedulerSlotArray::PushReturnToWorkers(idx_t slot_index) {
 			worker->return_mask_high.fetch_or(bit, std::memory_order_release);
 		}
 	}
-}
-
-void SchedulerSlotArray::ResetPassAndNotify(idx_t slot_index) {
-	if (slot_index >= SCHEDULER_MAX_SLOTS) {
-		return;
-	}
-	// Reset pass to 0 so finalization tasks get immediate priority
-	slots[slot_index].pass.store(0.0, std::memory_order_release);
-	// Notify all workers that this slot changed (they'll refresh pass/priority)
-	PushChangeToWorkers(slot_index);
 }
 
 } // namespace duckdb
