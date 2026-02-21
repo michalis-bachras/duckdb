@@ -389,6 +389,12 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		profiler->Initialize(plan);
 		this->producer = scheduler.CreateProducer();
 
+		// Register with stride scheduler if active
+		if (scheduler.GetPolicy().GetType() == SchedulerType::STRIDE) {
+			idx_t slot = scheduler.GetSlotArray().RegisterQuery(*this);
+			SetSchedulerSlotIndex(slot);
+		}
+
 		// build and ready the pipelines
 		PipelineBuildState state;
 		auto root_pipeline = make_shared_ptr<MetaPipeline>(*this, state, nullptr);
@@ -425,6 +431,11 @@ void Executor::CancelTasks() {
 	task.reset();
 	{
 		lock_guard<mutex> elock(executor_lock);
+		// Safety: deregister from scheduler before destroying state
+		if (IsRegisteredWithScheduler()) {
+			auto &scheduler = TaskScheduler::GetScheduler(context);
+			scheduler.GetSlotArray().DeregisterQuery(scheduler_slot_index);
+		}
 		// mark the query as cancelled so tasks will early-out
 		cancelled = true;
 		// destroy all pipelines, events and states
@@ -624,6 +635,11 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 
 void Executor::Reset() {
 	lock_guard<mutex> elock(executor_lock);
+	// Safety: deregister from scheduler before destroying state
+	if (IsRegisteredWithScheduler()) {
+		auto &scheduler = TaskScheduler::GetScheduler(context);
+		scheduler.GetSlotArray().DeregisterQuery(scheduler_slot_index);
+	}
 	physical_plan = nullptr;
 	cancelled = false;
 	root_executor.reset();

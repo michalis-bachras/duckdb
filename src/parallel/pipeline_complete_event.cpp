@@ -15,11 +15,16 @@ void PipelineCompleteEvent::FinalizeFinish() {
 	if (complete_pipeline) {
 		executor.CompletePipeline();
 
-		// If the query still has more meta-pipelines, push return mask
-		// so workers set local pass = global_pass for fair scheduling of the next pipeline
-		if (executor.IsRegisteredWithScheduler() && !executor.ExecutionIsFinished()) {
-			auto &scheduler = TaskScheduler::GetScheduler(executor.context);
-			scheduler.GetSlotArray().PushReturnToWorkers(executor.GetSchedulerSlotIndex());
+		if (executor.IsRegisteredWithScheduler()) {
+			if (executor.ExecutionIsFinished()) {
+				// Query is done — deregister slot (lazy, no worker notification)
+				auto &scheduler = TaskScheduler::GetScheduler(executor.context);
+				scheduler.GetSlotArray().DeregisterQuery(executor.GetSchedulerSlotIndex());
+			} else {
+				// More pipelines remain — push return mask (local pass → global_pass)
+				auto &scheduler = TaskScheduler::GetScheduler(executor.context);
+				scheduler.GetSlotArray().PushReturnToWorkers(executor.GetSchedulerSlotIndex());
+			}
 		}
 	}
 }

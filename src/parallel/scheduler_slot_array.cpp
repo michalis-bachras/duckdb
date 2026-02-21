@@ -61,6 +61,13 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 		global_pass.store(slot_pass, std::memory_order_release);
 	}
 
+	// Reset the executor's slot index (bidirectional cleanup)
+	Executor *exec = slot.executor.load(std::memory_order_acquire);
+	if (exec) {
+		exec->SetSchedulerSlotIndex(DConstants::INVALID_INDEX);
+	}
+
+	// Mark slot as inactive — workers discover lazily via nullptr check
 	slot.executor.store(nullptr, std::memory_order_release);
 	slot.active_pipeline.store(nullptr, std::memory_order_release);
 
@@ -70,9 +77,6 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 
 	// Recompute global stride: LARGE_CONSTANT / Σ(priorities)
 	RecomputeGlobalStride();
-
-	// Notify all workers that slot was deactivated
-	PushReturnToWorkers(slot_index);
 }
 
 void SchedulerSlotArray::SetActivePipeline(idx_t slot_index, Pipeline *pipeline) {

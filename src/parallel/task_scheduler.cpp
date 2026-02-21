@@ -329,11 +329,14 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				idx_t slot = thread_local_state.FindNthMinPassSlot(attempt);
 				if (slot != DConstants::INVALID_INDEX) {
 					Executor *executor = slot_array.GetExecutor(slot);
-					if (executor) {
-						got_task = GetTaskFromProducer(executor->GetToken(), task);
-						if (got_task) {
-							selected_slot = slot;
-						}
+					if (!executor) {
+						// Lazy deactivation: query completed, slot is now inactive
+						thread_local_state.DisableSlotLocally(slot);
+						continue;
+					}
+					got_task = GetTaskFromProducer(executor->GetToken(), task);
+					if (got_task) {
+						selected_slot = slot;
 					}
 				}
 			}
