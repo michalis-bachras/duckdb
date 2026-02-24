@@ -20,6 +20,8 @@ void PipelineCompleteEvent::FinalizeFinish() {
 				// Query is done — deregister slot (lazy, no worker notification)
 				auto &scheduler = TaskScheduler::GetScheduler(executor.context);
 				scheduler.GetSlotArray().DeregisterQuery(executor.GetSchedulerSlotIndex());
+				// Wake client thread so it can collect results
+				executor.SignalStrideCompletion();
 			} else {
 				// More pipelines remain — push return mask (local pass → global_pass)
 				auto &scheduler = TaskScheduler::GetScheduler(executor.context);

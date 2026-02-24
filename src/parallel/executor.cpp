@@ -560,64 +560,86 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 	// check if there are any incomplete pipelines
 	auto &scheduler = TaskScheduler::GetScheduler(context);
 	if (completed_pipelines < total_pipelines) {
-		// there are! if we don't already have a task, fetch one
-		auto current_task = task.get();
-		if (dry_run) {
-			// Pretend we have no task, we don't want to execute anything
-			current_task = nullptr;
+		// STRIDE MODE: client thread does NOT execute tasks.
+		// Worker threads handle all execution via ExecuteForever.
+		// The client thread sleeps until workers signal completion.
+		if (IsRegisteredWithScheduler()) {
+			{
+				std::unique_lock<std::mutex> lk(stride_completion_lock);
+				stride_completion_cv.wait(
+				    lk, [this]() { return ExecutionIsFinished() || HasError() || context.interrupted; });
+			}
+			// Woken up — handle error/cancellation if needed
+			if (HasError()) {
+				execution_result = PendingExecutionResult::EXECUTION_ERROR;
+				CancelTasks();
+				ThrowException();
+			}
+			if (context.interrupted) {
+				throw InterruptException();
+			}
+			// Fall through to NextExecutor() below (execution finished normally)
 		} else {
-			if (!task) {
-				scheduler.GetTaskFromProducer(*producer, task);
+			// DEFAULT MODE: client thread executes tasks (existing behavior, untouched)
+			auto current_task = task.get();
+			if (dry_run) {
+				// Pretend we have no task, we don't want to execute anything
+				current_task = nullptr;
+			} else {
+				if (!task) {
+					scheduler.GetTaskFromProducer(*producer, task);
+				}
+				current_task = task.get();
 			}
-			current_task = task.get();
-		}
 
-		if (!current_task && !HasError()) {
-			// there are no tasks to be scheduled and there are tasks blocked
-			lock_guard<mutex> l(executor_lock);
-			if (to_be_rescheduled_tasks.empty()) {
-				return PendingExecutionResult::NO_TASKS_AVAILABLE;
+			if (!current_task && !HasError()) {
+				// there are no tasks to be scheduled and there are tasks blocked
+				lock_guard<mutex> l(executor_lock);
+				if (to_be_rescheduled_tasks.empty()) {
+					return PendingExecutionResult::NO_TASKS_AVAILABLE;
+				}
+				// At least one task is blocked
+				if (ResultCollectorIsBlocked()) {
+					return PendingExecutionResult::RESULT_READY;
+				}
+				return PendingExecutionResult::BLOCKED;
 			}
-			// At least one task is blocked
-			if (ResultCollectorIsBlocked()) {
-				return PendingExecutionResult::RESULT_READY;
-			}
-			return PendingExecutionResult::BLOCKED;
-		}
 
-		if (current_task) {
-			// if we have a task, partially process it
-			auto result = task->Execute(TaskExecutionMode::PROCESS_PARTIAL);
-			if (result == TaskExecutionResult::TASK_BLOCKED) {
-				task->Deschedule();
-				task.reset();
-			} else if (result == TaskExecutionResult::TASK_FINISHED) {
-				// if the task is finished, clean it up
-				task.reset();
-			} else if (result == TaskExecutionResult::TASK_ERROR) {
-				if (!HasError()) {
-					// This is very much unexpected, TASK_ERROR means this executor should have an Error
-					throw InternalException("A task executed within Executor::ExecuteTask, from own producer, returned "
-					                        "TASK_ERROR without setting error on the Executor");
+			if (current_task) {
+				// if we have a task, partially process it
+				auto result = task->Execute(TaskExecutionMode::PROCESS_PARTIAL);
+				if (result == TaskExecutionResult::TASK_BLOCKED) {
+					task->Deschedule();
+					task.reset();
+				} else if (result == TaskExecutionResult::TASK_FINISHED) {
+					// if the task is finished, clean it up
+					task.reset();
+				} else if (result == TaskExecutionResult::TASK_ERROR) {
+					if (!HasError()) {
+						// This is very much unexpected, TASK_ERROR means this executor should have an Error
+						throw InternalException(
+						    "A task executed within Executor::ExecuteTask, from own producer, returned "
+						    "TASK_ERROR without setting error on the Executor");
+					}
 				}
 			}
-		}
-		if (!HasError()) {
-			// we (partially) processed a task and no exceptions were thrown
-			// give back control to the caller
-			if (task && DBConfig::GetConfig(context).options.scheduler_process_partial) {
-				auto &token = *task->token;
-				TaskScheduler::GetScheduler(context).ScheduleTask(token, task);
-				task.reset();
+			if (!HasError()) {
+				// we (partially) processed a task and no exceptions were thrown
+				// give back control to the caller
+				if (task && DBConfig::GetConfig(context).options.scheduler_process_partial) {
+					auto &token = *task->token;
+					TaskScheduler::GetScheduler(context).ScheduleTask(token, task);
+					task.reset();
+				}
+				return PendingExecutionResult::RESULT_NOT_READY;
 			}
-			return PendingExecutionResult::RESULT_NOT_READY;
-		}
-		execution_result = PendingExecutionResult::EXECUTION_ERROR;
+			execution_result = PendingExecutionResult::EXECUTION_ERROR;
 
-		// an exception has occurred executing one of the pipelines
-		// we need to cancel all tasks associated with this executor
-		CancelTasks();
-		ThrowException();
+			// an exception has occurred executing one of the pipelines
+			// we need to cancel all tasks associated with this executor
+			CancelTasks();
+			ThrowException();
+		}
 	}
 	D_ASSERT(!task);
 
@@ -684,6 +706,10 @@ void Executor::PushError(ErrorData exception) {
 	error_manager.PushError(std::move(exception));
 	// interrupt execution of any other pipelines that belong to this executor
 	context.interrupted = true;
+	// Wake client thread if sleeping on stride completion CV
+	if (IsRegisteredWithScheduler()) {
+		SignalStrideCompletion();
+	}
 }
 
 bool Executor::HasError() {

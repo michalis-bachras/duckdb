@@ -217,5 +217,19 @@ private:
 	//! The slot index in the global scheduler slot array (for stride scheduling).
 	//! Set to INVALID_INDEX when not registered with the scheduler.
 	idx_t scheduler_slot_index;
+
+	//! Condition variable for stride mode — client thread sleeps here
+	//! while worker threads execute tasks via ExecuteForever.
+	std::condition_variable stride_completion_cv;
+	//! Mutex protecting the stride completion signal
+	std::mutex stride_completion_lock;
+
+public:
+	//! Wake the client thread sleeping on stride_completion_cv.
+	//! No-op if nobody is waiting (e.g., under DEFAULT scheduling).
+	void SignalStrideCompletion() {
+		std::lock_guard<std::mutex> lk(stride_completion_lock);
+		stride_completion_cv.notify_one();
+	}
 };
 } // namespace duckdb
