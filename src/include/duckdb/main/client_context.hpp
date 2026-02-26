@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <functional>
+#include <mutex>
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_set.hpp"
 #include "duckdb/common/atomic.hpp"
@@ -99,6 +101,11 @@ public:
 	DUCKDB_API void Interrupt();
 	DUCKDB_API bool IsInterrupted() const;
 	DUCKDB_API void ClearInterrupt();
+
+	//! Register/clear an interrupt callback (thread-safe).
+	//! Used by scheduling policies to wake sleeping client threads on interrupt.
+	DUCKDB_API void SetInterruptCallback(std::function<void()> callback);
+	DUCKDB_API void ClearInterruptCallback();
 	DUCKDB_API void CancelTransaction();
 
 	//! Enable query profiling
@@ -320,6 +327,11 @@ private:
 	QueryProgress query_progress;
 	//! The connection corresponding to this client context
 	connection_t connection_id;
+
+	//! Lock protecting interrupt_callback assignment and invocation
+	std::mutex interrupt_callback_lock;
+	//! Optional callback invoked on Interrupt() — set by scheduling policies
+	std::function<void()> interrupt_callback;
 };
 
 class ClientContextLock {

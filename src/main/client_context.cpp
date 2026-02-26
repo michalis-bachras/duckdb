@@ -1114,6 +1114,11 @@ unique_ptr<QueryResult> ClientContext::ExecutePendingQueryInternal(ClientContext
 
 void ClientContext::Interrupt() {
 	interrupted = true;
+	// If a scheduling policy registered a callback (e.g. stride mode CV signal), invoke it
+	std::lock_guard<std::mutex> lk(interrupt_callback_lock);
+	if (interrupt_callback) {
+		interrupt_callback();
+	}
 }
 
 bool ClientContext::IsInterrupted() const {
@@ -1122,6 +1127,16 @@ bool ClientContext::IsInterrupted() const {
 
 void ClientContext::ClearInterrupt() {
 	interrupted = false;
+}
+
+void ClientContext::SetInterruptCallback(std::function<void()> callback) {
+	std::lock_guard<std::mutex> lk(interrupt_callback_lock);
+	interrupt_callback = std::move(callback);
+}
+
+void ClientContext::ClearInterruptCallback() {
+	std::lock_guard<std::mutex> lk(interrupt_callback_lock);
+	interrupt_callback = nullptr;
 }
 
 void ClientContext::CancelTransaction() {

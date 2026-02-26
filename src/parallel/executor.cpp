@@ -23,6 +23,17 @@
 
 namespace duckdb {
 
+//===--------------------------------------------------------------------===//
+// InterruptCallbackGuard
+//===--------------------------------------------------------------------===//
+InterruptCallbackGuard::InterruptCallbackGuard(ClientContext &ctx, std::function<void()> callback) : context(ctx) {
+	context.SetInterruptCallback(std::move(callback));
+}
+
+InterruptCallbackGuard::~InterruptCallbackGuard() {
+	context.ClearInterruptCallback();
+}
+
 Executor::Executor(ClientContext &context)
     : context(context), executor_tasks(0), blocked_thread_time(0), scheduler_slot_index(DConstants::INVALID_INDEX) {
 }
@@ -393,6 +404,10 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		if (scheduler.GetPolicy().GetType() == SchedulerType::STRIDE) {
 			idx_t slot = scheduler.GetSlotArray().RegisterQuery(*this);
 			SetSchedulerSlotIndex(slot);
+			// Create stride state and register interrupt callback (RAII)
+			stride_state = make_uniq<StrideCompletionState>();
+			stride_state->interrupt_guard =
+			    make_uniq<InterruptCallbackGuard>(context, [this]() { SignalStrideCompletion(); });
 		}
 
 		// build and ready the pipelines
@@ -431,8 +446,9 @@ void Executor::CancelTasks() {
 	task.reset();
 	{
 		lock_guard<mutex> elock(executor_lock);
-		// Safety: deregister from scheduler before destroying state
+		// Safety: deregister from heuristic scheduler before destroying state
 		if (IsRegisteredWithScheduler()) {
+			stride_state.reset(); // Clears callback + CV (ordering handled internally)
 			auto &scheduler = TaskScheduler::GetScheduler(context);
 			scheduler.GetSlotArray().DeregisterQuery(scheduler_slot_index);
 		}
@@ -565,9 +581,9 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 		// The client thread sleeps until workers signal completion.
 		if (IsRegisteredWithScheduler()) {
 			{
-				std::unique_lock<std::mutex> lk(stride_completion_lock);
-				stride_completion_cv.wait(
-				    lk, [this]() { return ExecutionIsFinished() || HasError() || context.interrupted; });
+				std::unique_lock<std::mutex> lk(stride_state->lock);
+				stride_state->cv.wait(lk,
+				                      [this]() { return ExecutionIsFinished() || HasError() || context.interrupted; });
 			}
 			// Woken up — handle error/cancellation if needed
 			if (HasError()) {
@@ -657,8 +673,9 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 
 void Executor::Reset() {
 	lock_guard<mutex> elock(executor_lock);
-	// Safety: deregister from scheduler before destroying state
+	// Safety: deregister from heuristic scheduler before destroying state
 	if (IsRegisteredWithScheduler()) {
+		stride_state.reset(); // Clears callback + CV (ordering handled internally)
 		auto &scheduler = TaskScheduler::GetScheduler(context);
 		scheduler.GetSlotArray().DeregisterQuery(scheduler_slot_index);
 	}

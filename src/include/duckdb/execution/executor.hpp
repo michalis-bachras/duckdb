@@ -19,6 +19,7 @@
 #include "duckdb/parallel/pipeline.hpp"
 
 #include <condition_variable>
+#include <functional>
 
 namespace duckdb {
 class ClientContext;
@@ -33,6 +34,41 @@ class Task;
 struct PipelineEventStack;
 struct ProducerToken;
 struct ScheduleEventData;
+
+//! RAII guard that registers an interrupt callback with ClientContext.
+//! The callback is cleared automatically when the guard is destroyed,
+//! ensuring no dangling references.
+class InterruptCallbackGuard {
+public:
+	InterruptCallbackGuard(ClientContext &ctx, std::function<void()> callback);
+	~InterruptCallbackGuard();
+
+	// Non-copyable, non-movable
+	InterruptCallbackGuard(const InterruptCallbackGuard &) = delete;
+	InterruptCallbackGuard &operator=(const InterruptCallbackGuard &) = delete;
+
+private:
+	ClientContext &context;
+};
+
+//! Encapsulates stride-specific client thread synchronization state.
+//! Groups the CV, mutex, and interrupt callback guard so the struct's
+//! destructor handles ordering (guard cleared before CV destroyed).
+struct StrideCompletionState {
+	std::condition_variable cv;
+	std::mutex lock;
+	unique_ptr<InterruptCallbackGuard> interrupt_guard;
+
+	~StrideCompletionState() {
+		// Clear callback before CV is destroyed (order-independent safety)
+		interrupt_guard.reset();
+	}
+
+	void Signal() {
+		std::lock_guard<std::mutex> lk(lock);
+		cv.notify_one();
+	}
+};
 
 class Executor {
 	friend class Pipeline;
@@ -218,18 +254,17 @@ private:
 	//! Set to INVALID_INDEX when not registered with the scheduler.
 	idx_t scheduler_slot_index;
 
-	//! Condition variable for stride mode — client thread sleeps here
-	//! while worker threads execute tasks via ExecuteForever.
-	std::condition_variable stride_completion_cv;
-	//! Mutex protecting the stride completion signal
-	std::mutex stride_completion_lock;
+	//! Stride-mode client thread synchronization state.
+	//! nullptr under DEFAULT scheduling.
+	unique_ptr<StrideCompletionState> stride_state;
 
 public:
-	//! Wake the client thread sleeping on stride_completion_cv.
-	//! No-op if nobody is waiting (e.g., under DEFAULT scheduling).
+	//! Wake the client thread sleeping in stride mode.
+	//! No-op under DEFAULT scheduling (stride_state is nullptr).
 	void SignalStrideCompletion() {
-		std::lock_guard<std::mutex> lk(stride_completion_lock);
-		stride_completion_cv.notify_one();
+		if (stride_state) {
+			stride_state->Signal();
+		}
 	}
 };
 } // namespace duckdb
