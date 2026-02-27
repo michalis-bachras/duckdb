@@ -1,5 +1,6 @@
 #include "duckdb/parallel/scheduler_slot_array.hpp"
 #include "duckdb/parallel/thread_local_scheduler_state.hpp"
+#include "duckdb/main/client_context.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -12,6 +13,11 @@ SchedulerSlotArray::SchedulerSlotArray() : active_count(0), sequence_number(0), 
 
 idx_t SchedulerSlotArray::RegisterQuery(Executor &executor) {
 	lock_guard<mutex> lock(registration_lock);
+	return RegisterQueryInternal(executor);
+}
+
+idx_t SchedulerSlotArray::RegisterQueryInternal(Executor &executor) {
+	// Must be called under registration_lock
 
 	// Find first free slot
 	for (idx_t i = 0; i < SCHEDULER_MAX_SLOTS; i++) {
@@ -77,6 +83,11 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 
 	// Recompute global stride: LARGE_CONSTANT / Σ(priorities)
 	RecomputeGlobalStride();
+
+	// Wake the front waiter in the queue (if any) — a slot is now free
+	if (!wait_queue.empty()) {
+		wait_queue.front()->cv.notify_one();
+	}
 }
 
 void SchedulerSlotArray::SetActivePipeline(idx_t slot_index, Pipeline *pipeline) {
@@ -303,6 +314,64 @@ void SchedulerSlotArray::PushReturnToWorkers(idx_t slot_index) {
 		uint64_t bit = 1ULL << (slot_index - 64);
 		for (auto *worker : registered_workers) {
 			worker->return_mask_high.fetch_or(bit, std::memory_order_release);
+		}
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Global Wait Queue
+//===--------------------------------------------------------------------===//
+
+idx_t SchedulerSlotArray::WaitForSlot(Executor &executor, ClientContext &context) {
+	std::unique_lock<mutex> lock(registration_lock);
+
+	// Create per-waiter entry with its own CV (targeted wake-ups)
+	auto entry = make_uniq<WaitQueueEntry>();
+	entry->executor = &executor;
+	auto &my_cv = entry->cv;
+	wait_queue.push_back(std::move(entry));
+
+	// Sleep until: (front of queue AND slot available) OR interrupted
+	// Predicate guards against spurious wakeups — only the front waiter with a free slot proceeds
+	my_cv.wait(lock, [&]() {
+		return (!wait_queue.empty() && wait_queue.front()->executor == &executor && HasFreeSlot()) ||
+		       context.interrupted;
+	});
+
+	// Remove self from queue (works for both front and non-front positions)
+	RemoveFromQueue(executor);
+
+	// Handle interruption: clean up and pass the free slot to the next waiter
+	if (context.interrupted) {
+		if (!wait_queue.empty() && HasFreeSlot()) {
+			wait_queue.front()->cv.notify_one();
+		}
+		throw InterruptException();
+	}
+
+	// Normal: we are front, slot is free — claim it (already under registration_lock)
+	return RegisterQueryInternal(executor);
+}
+
+void SchedulerSlotArray::InterruptWaiting(Executor &executor) {
+	lock_guard<mutex> lock(registration_lock);
+	for (auto &entry : wait_queue) {
+		if (entry->executor == &executor) {
+			entry->cv.notify_one();
+			return;
+		}
+	}
+}
+
+bool SchedulerSlotArray::HasFreeSlot() const {
+	return active_count.load(std::memory_order_acquire) < SCHEDULER_MAX_SLOTS;
+}
+
+void SchedulerSlotArray::RemoveFromQueue(Executor &executor) {
+	for (auto it = wait_queue.begin(); it != wait_queue.end(); ++it) {
+		if ((*it)->executor == &executor) {
+			wait_queue.erase(it);
+			return;
 		}
 	}
 }

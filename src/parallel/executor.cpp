@@ -403,8 +403,22 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		// Register with stride scheduler if active
 		if (scheduler.GetPolicy().GetType() == SchedulerType::STRIDE) {
 			idx_t slot = scheduler.GetSlotArray().RegisterQuery(*this);
+
+			if (slot == DConstants::INVALID_INDEX) {
+				// All 128 slots full — wait in FIFO queue until a slot frees.
+				// Set temporary interrupt callback so Ctrl+C wakes us from the queue.
+				// (The permanent callback via InterruptCallbackGuard is set up below,
+				//  but we need interrupt handling during the wait itself.)
+				context.SetInterruptCallback(
+				    [this, &scheduler]() { scheduler.GetSlotArray().InterruptWaiting(*this); });
+				// Blocks until slot available. Throws InterruptException if interrupted.
+				slot = scheduler.GetSlotArray().WaitForSlot(*this, context);
+				// Clear temp callback — permanent callback is set up below
+				context.ClearInterruptCallback();
+			}
+
 			SetSchedulerSlotIndex(slot);
-			// Create stride state and register interrupt callback (RAII)
+			// Create stride state and register permanent interrupt callback (RAII)
 			stride_state = make_uniq<StrideCompletionState>();
 			stride_state->interrupt_guard =
 			    make_uniq<InterruptCallbackGuard>(context, [this]() { SignalStrideCompletion(); });

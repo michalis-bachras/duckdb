@@ -15,15 +15,25 @@
 
 #include <array>
 #include <bitset>
+#include <condition_variable>
+#include <deque>
 
 namespace duckdb {
 
+class ClientContext;
 class Executor;
 class Pipeline;
 struct ThreadLocalSchedulerState;
 
 //! Maximum number of concurrent queries the scheduler can track
 static constexpr idx_t SCHEDULER_MAX_SLOTS = 128;
+
+//! Entry in the global wait queue. Each waiting query gets its own
+//! condition variable to allow targeted wake-ups.
+struct WaitQueueEntry {
+	Executor *executor;
+	std::condition_variable cv;
+};
 
 //! SchedulerSlot represents a single slot in the global slot array.
 //! Each slot corresponds to one active query (Resource Group in paper terminology).
@@ -93,8 +103,23 @@ public:
 	idx_t RegisterQuery(Executor &executor);
 
 	//! Deregister a query and free its slot.
-	//! Pushes a return mask update to all registered workers.
+	//! If queries are waiting in the global wait queue, wakes the front waiter.
 	void DeregisterQuery(idx_t slot_index);
+
+	//===--------------------------------------------------------------------===//
+	// Global Wait Queue (stride-only)
+	//===--------------------------------------------------------------------===//
+
+	//! Block the calling thread until a slot becomes available, then register.
+	//! Throws InterruptException if the query is interrupted while waiting.
+	//! @param executor The query's executor
+	//! @param context The client context (checked for interrupts)
+	//! @return Valid slot index (never INVALID_INDEX on success)
+	idx_t WaitForSlot(Executor &executor, ClientContext &context);
+
+	//! Signal a specific waiter in the wait queue to wake up.
+	//! Called from the interrupt callback to wake a query waiting for a slot.
+	void InterruptWaiting(Executor &executor);
 
 	//===--------------------------------------------------------------------===//
 	// Pipeline Management (lock-free)
@@ -209,6 +234,23 @@ private:
 	//! Protected by worker_registry_lock.
 	vector<ThreadLocalSchedulerState *> registered_workers;
 	mutex worker_registry_lock;
+
+	//===--------------------------------------------------------------------===//
+	// Global Wait Queue (private)
+	//===--------------------------------------------------------------------===//
+
+	//! FIFO queue of queries waiting for a free slot.
+	//! Protected by registration_lock.
+	std::deque<unique_ptr<WaitQueueEntry>> wait_queue;
+
+	//! Register a query into a free slot (caller already holds registration_lock).
+	idx_t RegisterQueryInternal(Executor &executor);
+
+	//! Check if any slot is free.
+	bool HasFreeSlot() const;
+
+	//! Remove an executor from the wait queue.
+	void RemoveFromQueue(Executor &executor);
 };
 
 } // namespace duckdb
