@@ -28,6 +28,11 @@ struct ThreadLocalSchedulerState;
 //! Maximum number of concurrent queries the scheduler can track
 static constexpr idx_t SCHEDULER_MAX_SLOTS = 128;
 
+//! Number of chunks a worker processes per scheduling quantum in stride mode.
+//! Controls the tradeoff between scheduling overhead and fairness granularity.
+//! Only used when SchedulerType::STRIDE is active.
+static constexpr idx_t STRIDE_QUANTUM_CHUNKS = 50;
+
 //! Entry in the global wait queue. Each waiting query gets its own
 //! condition variable to allow targeted wake-ups.
 struct WaitQueueEntry {

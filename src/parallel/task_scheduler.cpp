@@ -341,7 +341,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				}
 			}
 
-			// 3. Fallback to FIFO only if ALL active slots have no tasks
+			// 3. Fallback to FIFO only if ALL active slots have no tasks(NEED TO CHECK THIS AGAIN)
 			if (!got_task) {
 				got_task = queue->Dequeue(task);
 			}
@@ -354,8 +354,14 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 		}
 
 		if (got_task) {
-			auto process_mode = config.options.scheduler_process_partial ? TaskExecutionMode::PROCESS_PARTIAL
-			                                                             : TaskExecutionMode::PROCESS_ALL;
+			TaskExecutionMode process_mode;
+			if (policy->GetType() == SchedulerType::STRIDE) {
+				// Stride: yield after each quantum so workers re-enter scheduling loop
+				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
+			} else {
+				process_mode = config.options.scheduler_process_partial ? TaskExecutionMode::PROCESS_PARTIAL
+				                                                        : TaskExecutionMode::PROCESS_ALL;
+			}
 			auto execute_result = task->Execute(process_mode);
 
 			// After task execution: update stride state
