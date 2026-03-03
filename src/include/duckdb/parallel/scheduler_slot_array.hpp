@@ -15,6 +15,7 @@
 
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 
@@ -59,12 +60,32 @@ struct SchedulerSlot {
 	//! Query start time in nanoseconds (for latency tracking)
 	atomic<int64_t> start_time_ns;
 
+	//! Accumulated work time (microseconds) across all workers.
+	//! Reset on RegisterQuery, accumulated via fetch_add per quantum.
+	atomic<uint64_t> total_elapsed_us;
+	//! Wall-clock time when this query was registered (milliseconds since epoch).
+	//! Written once at registration, read at deregistration.
+	double arrival_time_ms;
+
 	//! Default constructor - slot is empty/unused
 	//! Actual values are set by RegisterQuery()
 	SchedulerSlot()
 	    : executor(nullptr), active_pipeline(nullptr), priority(0.0), stride(0.0), pass(0.0), decay_count(0),
-	      start_time_ns(0) {
+	      start_time_ns(0), total_elapsed_us(0), arrival_time_ms(0.0) {
 	}
+};
+
+//! Entry recording a completed query during a tracking window.
+//! Used by the workload simulator to evaluate candidate scheduling parameters.
+struct QueryTraceEntry {
+	//! When the query arrived, relative to tracking window start (ms)
+	double arrival_time_ms;
+	//! Total scheduling quanta consumed (= decay_count at completion)
+	int total_quanta;
+	//! Average wall-clock time per quantum (ms) = total_elapsed / total_quanta
+	double avg_quantum_ms;
+	//! Actual observed wall-clock latency (ms) = completion_time - arrival_time
+	double actual_latency_ms;
 };
 
 //! SchedulerSlotArray manages the global slot array for stride scheduling.
@@ -152,6 +173,10 @@ public:
 	//! @param slot_index Slot to update
 	void IncrementDecayCountAndApply(idx_t slot_index);
 
+	//! Accumulate wall-clock elapsed time for a quantum (lock-free atomic add).
+	//! Called from ExecuteForever after timing each quantum.
+	void AccumulateElapsedTime(idx_t slot_index, uint64_t elapsed_us);
+
 	//! Get current values (lock-free reads)
 	double GetPriority(idx_t slot_index) const;
 	double GetStride(idx_t slot_index) const;
@@ -165,6 +190,25 @@ public:
 	//! Increment global pass by global stride.
 	//! Called from ExecuteForever after each stride task execution.
 	void IncrementGlobalPass();
+
+	//===--------------------------------------------------------------------===//
+	// Self-Tuning: Tracking Window & Data Collection
+	//===--------------------------------------------------------------------===//
+
+	//! Start a tracking window. Clears previous tracked workload.
+	void StartTrackingWindow();
+
+	//! Stop the tracking window. No more entries will be appended.
+	void StopTrackingWindow();
+
+	//! Check if tracking is currently active.
+	bool IsTrackingActive() const;
+
+	//! Get the tracked workload (read-only, only valid after StopTrackingWindow).
+	const vector<QueryTraceEntry> &GetTrackedWorkload() const;
+
+	//! Helper: current wall-clock time in milliseconds (steady_clock).
+	static double NowMs();
 
 	//===--------------------------------------------------------------------===//
 	// Scheduling Queries (lock-free)
@@ -239,6 +283,28 @@ private:
 	//! Protected by worker_registry_lock.
 	vector<ThreadLocalSchedulerState *> registered_workers;
 	mutex worker_registry_lock;
+
+	//===--------------------------------------------------------------------===//
+	// Self-Tuning: Tracking State (private)
+	//===--------------------------------------------------------------------===//
+
+	//! Whether the tracking window is currently open.
+	atomic<bool> tracking_active {false};
+	//! Wall-clock time when the current tracking window started (ms).
+	double tracking_start_time_ms {0.0};
+	//! Collected query traces during the tracking window.
+	//! Writes are serialized under registration_lock (in DeregisterQuery).
+	//! Reads happen after StopTrackingWindow() (no concurrent writes).
+	vector<QueryTraceEntry> tracked_workload;
+
+	//===--------------------------------------------------------------------===//
+	// Self-Tuning: Timing Constants
+	//===--------------------------------------------------------------------===//
+
+	//! Tracking window duration (t_t from paper Section 4)
+	static constexpr double T_TRACKING_MS = 20000.0;
+	//! Refresh period — interval between tracking windows (t_r from paper Section 4)
+	static constexpr double T_REFRESH_MS = 60000.0;
 
 	//===--------------------------------------------------------------------===//
 	// Global Wait Queue (private)

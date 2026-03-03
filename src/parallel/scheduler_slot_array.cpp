@@ -32,6 +32,8 @@ idx_t SchedulerSlotArray::RegisterQueryInternal(Executor &executor) {
 			slot.pass.store(global_pass.load(std::memory_order_acquire), std::memory_order_release);
 			slot.decay_count.store(0, std::memory_order_release);
 			slot.start_time_ns.store(0, std::memory_order_release);
+			slot.total_elapsed_us.store(0, std::memory_order_release);
+			slot.arrival_time_ms = NowMs();
 
 			active_slots.set(i);
 			active_count.fetch_add(1, std::memory_order_release);
@@ -83,6 +85,20 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 
 	// Recompute global stride: LARGE_CONSTANT / Σ(priorities)
 	RecomputeGlobalStride();
+
+	// Record trace entry if tracking is active
+	if (tracking_active.load(std::memory_order_acquire)) {
+		int quanta = slot.decay_count.load(std::memory_order_acquire);
+		if (quanta > 0) {
+			QueryTraceEntry entry;
+			entry.arrival_time_ms = slot.arrival_time_ms - tracking_start_time_ms;
+			entry.total_quanta = quanta;
+			double cpu_ms = static_cast<double>(slot.total_elapsed_us.load(std::memory_order_acquire)) / 1000.0;
+			entry.avg_quantum_ms = cpu_ms / static_cast<double>(quanta);
+			entry.actual_latency_ms = NowMs() - slot.arrival_time_ms;
+			tracked_workload.push_back(entry);
+		}
+	}
 
 	// Wake the front waiter in the queue (if any) — a slot is now free
 	if (!wait_queue.empty()) {
@@ -374,6 +390,37 @@ void SchedulerSlotArray::RemoveFromQueue(Executor &executor) {
 			return;
 		}
 	}
+}
+
+void SchedulerSlotArray::AccumulateElapsedTime(idx_t slot_index, uint64_t elapsed_us) {
+	if (slot_index >= SCHEDULER_MAX_SLOTS) {
+		return;
+	}
+	slots[slot_index].total_elapsed_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+}
+
+void SchedulerSlotArray::StartTrackingWindow() {
+	// Called under registration_lock or by a single thread
+	tracked_workload.clear();
+	tracking_start_time_ms = NowMs();
+	tracking_active.store(true, std::memory_order_release);
+}
+
+void SchedulerSlotArray::StopTrackingWindow() {
+	tracking_active.store(false, std::memory_order_release);
+}
+
+bool SchedulerSlotArray::IsTrackingActive() const {
+	return tracking_active.load(std::memory_order_acquire);
+}
+
+const vector<QueryTraceEntry> &SchedulerSlotArray::GetTrackedWorkload() const {
+	return tracked_workload;
+}
+
+double SchedulerSlotArray::NowMs() {
+	auto now = std::chrono::steady_clock::now();
+	return std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
 }
 
 } // namespace duckdb

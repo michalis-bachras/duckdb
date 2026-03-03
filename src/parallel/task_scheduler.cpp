@@ -355,13 +355,17 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 
 		if (got_task) {
 			TaskExecutionMode process_mode;
+			std::chrono::steady_clock::time_point quantum_start;
 			if (policy->GetType() == SchedulerType::STRIDE) {
 				// Stride: yield after each quantum so workers re-enter scheduling loop
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
+				// Record start time for stride quantum timing
+			    quantum_start = std::chrono::steady_clock::now();
 			} else {
 				process_mode = config.options.scheduler_process_partial ? TaskExecutionMode::PROCESS_PARTIAL
 				                                                        : TaskExecutionMode::PROCESS_ALL;
 			}
+			
 			auto execute_result = task->Execute(process_mode);
 
 			// After task execution: update stride state
@@ -369,6 +373,11 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				auto *executor_task = dynamic_cast<ExecutorTask *>(task.get());
 				if (executor_task && executor_task->executor.IsRegisteredWithScheduler()) {
 					idx_t slot_idx = executor_task->executor.GetSchedulerSlotIndex();
+					// Accumulate wall-clock elapsed time for this quantum
+					auto elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+					                                            std::chrono::steady_clock::now() - quantum_start)
+					                                            .count());
+					slot_array.AccumulateElapsedTime(slot_idx, elapsed_us);
 					// Update pass value: pass += stride
 					double stride = slot_array.GetStride(slot_idx);
 					slot_array.UpdatePass(slot_idx, stride);
