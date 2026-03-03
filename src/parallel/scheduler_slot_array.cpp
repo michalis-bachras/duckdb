@@ -35,6 +35,13 @@ idx_t SchedulerSlotArray::RegisterQueryInternal(Executor &executor) {
 			slot.total_elapsed_us.store(0, std::memory_order_release);
 			slot.arrival_time_ms = NowMs();
 
+			// Reset snapshot for this slot if tracking is active
+			// (prevents stale snapshot from a previous query in this slot)
+			if (tracking_active.load(std::memory_order_acquire)) {
+				quanta_at_window_start[i] = 0;
+				elapsed_at_window_start[i] = 0;
+			}
+
 			active_slots.set(i);
 			active_count.fetch_add(1, std::memory_order_release);
 			sequence_number.fetch_add(1, std::memory_order_release);
@@ -86,16 +93,29 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 	// Recompute global stride: LARGE_CONSTANT / Σ(priorities)
 	RecomputeGlobalStride();
 
-	// Record trace entry if tracking is active
+	// Record trace entry if tracking is active (in-window portion only)
 	if (tracking_active.load(std::memory_order_acquire)) {
-		int quanta = slot.decay_count.load(std::memory_order_acquire);
-		if (quanta > 0) {
+		int total_quanta = slot.decay_count.load(std::memory_order_acquire);
+		int snapshot_quanta = quanta_at_window_start[slot_index];
+		int window_quanta = total_quanta - snapshot_quanta;
+
+		if (window_quanta > 0) {
+			uint64_t total_elapsed = slot.total_elapsed_us.load(std::memory_order_acquire);
+			uint64_t snapshot_elapsed = elapsed_at_window_start[slot_index];
+			uint64_t window_elapsed = total_elapsed - snapshot_elapsed;
+
 			QueryTraceEntry entry;
-			entry.arrival_time_ms = slot.arrival_time_ms - tracking_start_time_ms;
-			entry.total_quanta = quanta;
-			double cpu_ms = static_cast<double>(slot.total_elapsed_us.load(std::memory_order_acquire)) / 1000.0;
-			entry.avg_quantum_ms = cpu_ms / static_cast<double>(quanta);
-			entry.actual_latency_ms = NowMs() - slot.arrival_time_ms;
+			// Pre-existing query → entered window at t=0; new query → relative arrival
+			if (snapshot_quanta > 0) {
+				entry.arrival_time_ms = 0.0;
+			} else {
+				entry.arrival_time_ms = slot.arrival_time_ms - tracking_start_time_ms;
+			}
+			entry.window_quanta = window_quanta;
+			entry.avg_quantum_ms = (static_cast<double>(window_elapsed) / 1000.0) / static_cast<double>(window_quanta);
+			// In-window wall time: from when query entered window to now
+			double window_entry_time = (snapshot_quanta > 0) ? tracking_start_time_ms : slot.arrival_time_ms;
+			entry.in_window_wall_time_ms = NowMs() - window_entry_time;
 			tracked_workload.push_back(entry);
 		}
 	}
@@ -400,13 +420,63 @@ void SchedulerSlotArray::AccumulateElapsedTime(idx_t slot_index, uint64_t elapse
 }
 
 void SchedulerSlotArray::StartTrackingWindow() {
-	// Called under registration_lock or by a single thread
+	lock_guard<mutex> lock(registration_lock);
 	tracked_workload.clear();
 	tracking_start_time_ms = NowMs();
+
+	// Snapshot per-slot state for delta computation
+	for (idx_t i = 0; i < SCHEDULER_MAX_SLOTS; i++) {
+		if (active_slots.test(i)) {
+			quanta_at_window_start[i] = slots[i].decay_count.load(std::memory_order_acquire);
+			elapsed_at_window_start[i] = slots[i].total_elapsed_us.load(std::memory_order_acquire);
+		} else {
+			quanta_at_window_start[i] = 0;
+			elapsed_at_window_start[i] = 0;
+		}
+	}
+
 	tracking_active.store(true, std::memory_order_release);
 }
 
 void SchedulerSlotArray::StopTrackingWindow() {
+	lock_guard<mutex> lock(registration_lock);
+	double window_end_time = NowMs();
+
+	// Record still-active queries — they create contention and experience slowdown
+	for (idx_t i = 0; i < SCHEDULER_MAX_SLOTS; i++) {
+		if (!active_slots.test(i)) {
+			continue;
+		}
+		if (slots[i].executor.load(std::memory_order_acquire) == nullptr) {
+			continue;
+		}
+
+		int current_quanta = slots[i].decay_count.load(std::memory_order_acquire);
+		int snapshot_quanta = quanta_at_window_start[i];
+		int window_quanta = current_quanta - snapshot_quanta;
+
+		if (window_quanta <= 0) {
+			continue;
+		}
+
+		uint64_t current_elapsed = slots[i].total_elapsed_us.load(std::memory_order_acquire);
+		uint64_t snapshot_elapsed = elapsed_at_window_start[i];
+		uint64_t window_elapsed = current_elapsed - snapshot_elapsed;
+
+		QueryTraceEntry entry;
+		if (snapshot_quanta > 0) {
+			entry.arrival_time_ms = 0.0;
+		} else {
+			entry.arrival_time_ms = slots[i].arrival_time_ms - tracking_start_time_ms;
+		}
+		entry.window_quanta = window_quanta;
+		entry.avg_quantum_ms = (static_cast<double>(window_elapsed) / 1000.0) / static_cast<double>(window_quanta);
+		double window_entry_time = (snapshot_quanta > 0) ? tracking_start_time_ms : slots[i].arrival_time_ms;
+		entry.in_window_wall_time_ms = window_end_time - window_entry_time;
+		tracked_workload.push_back(entry);
+	}
+
+	// Disable tracking AFTER recording — prevents race with DeregisterQuery
 	tracking_active.store(false, std::memory_order_release);
 }
 

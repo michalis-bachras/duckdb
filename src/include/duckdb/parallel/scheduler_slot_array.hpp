@@ -75,17 +75,20 @@ struct SchedulerSlot {
 	}
 };
 
-//! Entry recording a completed query during a tracking window.
+//! Entry recording a query's in-window execution during a tracking window.
 //! Used by the workload simulator to evaluate candidate scheduling parameters.
+//! All fields measure only the portion of execution within the tracking window.
 struct QueryTraceEntry {
-	//! When the query arrived, relative to tracking window start (ms)
+	//! When the query entered the window (ms, relative to window start).
+	//! 0.0 for queries already running when the window opened.
 	double arrival_time_ms;
-	//! Total scheduling quanta consumed (= decay_count at completion)
-	int total_quanta;
-	//! Average wall-clock time per quantum (ms) = total_elapsed / total_quanta
+	//! Quanta consumed DURING the window only (delta from snapshot).
+	int window_quanta;
+	//! Average work time per quantum (ms), computed from in-window data only.
 	double avg_quantum_ms;
-	//! Actual observed wall-clock latency (ms) = completion_time - arrival_time
-	double actual_latency_ms;
+	//! Wall-clock time the query was active in the window (ms).
+	//! From window entry to completion or window end, whichever comes first.
+	double in_window_wall_time_ms;
 };
 
 //! SchedulerSlotArray manages the global slot array for stride scheduling.
@@ -293,9 +296,16 @@ private:
 	//! Wall-clock time when the current tracking window started (ms).
 	double tracking_start_time_ms {0.0};
 	//! Collected query traces during the tracking window.
-	//! Writes are serialized under registration_lock (in DeregisterQuery).
+	//! Writes are serialized under registration_lock (in DeregisterQuery and StopTrackingWindow).
 	//! Reads happen after StopTrackingWindow() (no concurrent writes).
 	vector<QueryTraceEntry> tracked_workload;
+
+	//! Per-slot snapshot of decay_count at tracking window start.
+	//! Used to compute in-window quanta delta: window_quanta = current - snapshot.
+	std::array<int, SCHEDULER_MAX_SLOTS> quanta_at_window_start {};
+	//! Per-slot snapshot of total_elapsed_us at tracking window start.
+	//! Used to compute in-window elapsed time delta.
+	std::array<uint64_t, SCHEDULER_MAX_SLOTS> elapsed_at_window_start {};
 
 	//===--------------------------------------------------------------------===//
 	// Self-Tuning: Timing Constants
