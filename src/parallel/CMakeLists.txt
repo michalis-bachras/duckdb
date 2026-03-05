@@ -19,7 +19,8 @@ add_library_unity(
   task_executor.cpp
   task_notifier.cpp
   task_scheduler.cpp
-  thread_context.cpp)
+  thread_context.cpp
+  workload_simulator.cpp)
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_parallel>
     PARENT_SCOPE)
