@@ -74,6 +74,20 @@ struct ThreadLocalSchedulerState {
 	//! Cached strides for each slot
 	std::array<double, SCHEDULER_MAX_SLOTS> strides;
 
+	//! Per-worker local global pass.
+	//! Updated after each quantum by f × local_global_stride. Used to initialize pass for new queries.
+	double local_global_pass {0.0};
+
+	//! Per-worker local global stride = LARGE_CONSTANT / Σ(local priorities).
+	//! Recomputed when local priorities change (decay, new slot, slot removed).
+	double local_global_stride {0.0};
+
+	//! Per-slot CPU time accumulator (microseconds) for driving local decay.
+	std::array<uint64_t, SCHEDULER_MAX_SLOTS> cpu_time_accum_us;
+
+	//! Per-slot count of decay steps applied by this worker.
+	std::array<int, SCHEDULER_MAX_SLOTS> decay_steps;
+
 	//! Active slots sorted by pass value (ascending = lowest pass first)
 	//! sorted_slots[0] = slot with minimum pass (first choice for scheduling)
 	std::array<idx_t, SCHEDULER_MAX_SLOTS> sorted_slots;
@@ -94,6 +108,8 @@ struct ThreadLocalSchedulerState {
 		pass_values.fill(0.0);
 		strides.fill(0.0);
 		sorted_slots.fill(DConstants::INVALID_INDEX);
+		cpu_time_accum_us.fill(0);
+		decay_steps.fill(0);
 	}
 
 	//===--------------------------------------------------------------------===//
@@ -108,10 +124,13 @@ struct ThreadLocalSchedulerState {
 		active_slots.reset();
 		for (idx_t slot_idx : active_indices) {
 			active_slots.set(slot_idx);
-			priorities[slot_idx] = global.GetPriority(slot_idx);
-			pass_values[slot_idx] = global.GetPass(slot_idx);
-			strides[slot_idx] = global.GetStride(slot_idx);
+			priorities[slot_idx] = SchedulerSlotArray::INITIAL_PRIORITY;
+			pass_values[slot_idx] = local_global_pass;
+			strides[slot_idx] = SchedulerSlotArray::LARGE_CONSTANT / SchedulerSlotArray::INITIAL_PRIORITY;
+			cpu_time_accum_us[slot_idx] = 0;
+			decay_steps[slot_idx] = 0;
 		}
+		RecomputeLocalGlobalStride();
 
 		// Drain any pending masks (we just did a full refresh)
 		change_mask_low.exchange(0, std::memory_order_relaxed);
@@ -213,6 +232,40 @@ struct ThreadLocalSchedulerState {
 		}
 	}
 
+	//! Update per-worker local global pass after executing a quantum.
+	//! f = elapsed_ms / REFERENCE_DURATION_MS. Uses local_global_stride.
+	void UpdateLocalGlobalPass(double f) {
+		local_global_pass += f * local_global_stride;
+	}
+
+	//! Apply priority decay locally after executing a quantum.
+	//! Accumulates CPU time and fires decay steps when threshold is reached.
+	void ApplyLocalDecay(idx_t slot_idx, uint64_t elapsed_us) {
+		if (slot_idx >= SCHEDULER_MAX_SLOTS || !active_slots.test(slot_idx)) {
+			return;
+		}
+		cpu_time_accum_us[slot_idx] += elapsed_us;
+		// Decay fires once per REFERENCE_DURATION_MS of accumulated CPU time
+		static constexpr uint64_t DECAY_THRESHOLD_US =
+		    static_cast<uint64_t>(SchedulerSlotArray::REFERENCE_DURATION_MS * 1000.0);
+		while (cpu_time_accum_us[slot_idx] >= DECAY_THRESHOLD_US) {
+			cpu_time_accum_us[slot_idx] -= DECAY_THRESHOLD_US;
+			decay_steps[slot_idx]++;
+			// Only apply decay after DECAY_START_QUANTA steps
+			if (decay_steps[slot_idx] <= SchedulerSlotArray::DECAY_START_QUANTA) {
+				continue;
+			}
+			// Exponential decay: p_new = λ * p_current
+			double new_prio = SchedulerSlotArray::DECAY_LAMBDA * priorities[slot_idx];
+			if (new_prio < SchedulerSlotArray::MIN_PRIORITY) {
+				new_prio = SchedulerSlotArray::MIN_PRIORITY;
+			}
+			priorities[slot_idx] = new_prio;
+			strides[slot_idx] = SchedulerSlotArray::LARGE_CONSTANT / new_prio;
+			RecomputeLocalGlobalStride();
+		}
+	}
+
 	//===--------------------------------------------------------------------===//
 	// Lazy Slot Disable (for deregistration)
 	//===--------------------------------------------------------------------===//
@@ -222,6 +275,9 @@ struct ThreadLocalSchedulerState {
 	void DisableSlotLocally(idx_t slot_idx) {
 		if (slot_idx < SCHEDULER_MAX_SLOTS && active_slots.test(slot_idx)) {
 			active_slots.reset(slot_idx);
+			cpu_time_accum_us[slot_idx] = 0;
+			decay_steps[slot_idx] = 0;
+			RecomputeLocalGlobalStride();
 			RebuildSortedSlots();
 		}
 	}
@@ -247,14 +303,14 @@ private:
 	}
 
 	//! Process return mask bits — new pipeline in existing slot
-	//! Set local pass = global_pass, retain existing priority/stride
+	//! Set local pass = local_global_pass, retain existing priority/stride
 	bool ProcessReturnMask(uint64_t mask, idx_t offset, const SchedulerSlotArray &global) {
 		bool changed = false;
 		while (mask != 0) {
 			int bit_pos = __builtin_ctzll(mask);
 			idx_t slot_idx = static_cast<idx_t>(bit_pos) + offset;
 			if (active_slots.test(slot_idx)) {
-				pass_values[slot_idx] = global.GetGlobalPass();
+				pass_values[slot_idx] = local_global_pass;
 				// Priority and stride are retained (bound to resource group, not task set)
 				changed = true;
 			}
@@ -263,20 +319,41 @@ private:
 		return changed;
 	}
 
-	//! Process change mask bits — new resource group, activate and read all from global
+	//! Process change mask bits — new resource group, init all from constants
 	bool ProcessChangeMask(uint64_t mask, idx_t offset, const SchedulerSlotArray &global) {
 		bool changed = false;
 		while (mask != 0) {
 			int bit_pos = __builtin_ctzll(mask);
 			idx_t slot_idx = static_cast<idx_t>(bit_pos) + offset;
 			active_slots.set(slot_idx);
-			priorities[slot_idx] = global.GetPriority(slot_idx);
-			pass_values[slot_idx] = global.GetPass(slot_idx);
-			strides[slot_idx] = global.GetStride(slot_idx);
+			priorities[slot_idx] = SchedulerSlotArray::INITIAL_PRIORITY;
+			pass_values[slot_idx] = local_global_pass;
+			strides[slot_idx] = SchedulerSlotArray::LARGE_CONSTANT / SchedulerSlotArray::INITIAL_PRIORITY;
+			cpu_time_accum_us[slot_idx] = 0;
+			decay_steps[slot_idx] = 0;
 			changed = true;
 			mask &= mask - 1;
 		}
+		if (changed) {
+			RecomputeLocalGlobalStride();
+		}
 		return changed;
+	}
+
+	//! Recompute local global stride from local priorities of active slots.
+	//! local_global_stride = LARGE_CONSTANT / Σ(local priorities of active slots).
+	void RecomputeLocalGlobalStride() {
+		double total_priority = 0.0;
+		for (idx_t i = 0; i < SCHEDULER_MAX_SLOTS; i++) {
+			if (active_slots.test(i)) {
+				total_priority += priorities[i];
+			}
+		}
+		if (total_priority > 0.0) {
+			local_global_stride = SchedulerSlotArray::LARGE_CONSTANT / total_priority;
+		} else {
+			local_global_stride = 0.0;
+		}
 	}
 
 	//! Rebuild the sorted_slots array from active_slots.

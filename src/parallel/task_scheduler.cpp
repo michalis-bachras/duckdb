@@ -360,12 +360,12 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				// Stride: yield after each quantum so workers re-enter scheduling loop
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 				// Record start time for stride quantum timing
-			    quantum_start = std::chrono::steady_clock::now();
+				quantum_start = std::chrono::steady_clock::now();
 			} else {
 				process_mode = config.options.scheduler_process_partial ? TaskExecutionMode::PROCESS_PARTIAL
 				                                                        : TaskExecutionMode::PROCESS_ALL;
 			}
-			
+
 			auto execute_result = task->Execute(process_mode);
 
 			// After task execution: update stride state
@@ -378,16 +378,15 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 					                                            std::chrono::steady_clock::now() - quantum_start)
 					                                            .count());
 					slot_array.AccumulateElapsedTime(slot_idx, elapsed_us);
-					// Update pass value: pass += stride
-					double stride = slot_array.GetStride(slot_idx);
-					slot_array.UpdatePass(slot_idx, stride);
-					// Update thread-local pass too
-					thread_local_state.UpdateLocalPass(slot_idx, 1.0);
-					// Apply priority decay
-					slot_array.IncrementDecayCountAndApply(slot_idx);
+					slot_array.IncrementQuantaCount(slot_idx);
+					// Compute time fraction: f = actual_duration / reference_duration
+					double elapsed_ms = static_cast<double>(elapsed_us) / 1000.0;
+					double f = elapsed_ms / SchedulerSlotArray::REFERENCE_DURATION_MS;
+					// All scheduling updates are local (no global synchronization):
+					thread_local_state.UpdateLocalPass(slot_idx, f);
+					thread_local_state.ApplyLocalDecay(slot_idx, elapsed_us);
+					thread_local_state.UpdateLocalGlobalPass(f);
 				}
-				// Increment global pass by global stride after each time slice
-				slot_array.IncrementGlobalPass();
 			}
 
 			switch (execute_result) {

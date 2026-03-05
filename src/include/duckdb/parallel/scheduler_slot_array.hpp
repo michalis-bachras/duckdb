@@ -43,20 +43,14 @@ struct WaitQueueEntry {
 
 //! SchedulerSlot represents a single slot in the global slot array.
 //! Each slot corresponds to one active query (Resource Group in paper terminology).
+//! Scheduling state (priority, stride, pass) is maintained per-worker in ThreadLocalSchedulerState.
 struct SchedulerSlot {
 	//! The executor (query) occupying this slot. nullptr if slot is free.
 	atomic<Executor *> executor;
 	//! The currently active pipeline for this query. nullptr if no active pipeline.
 	atomic<Pipeline *> active_pipeline;
-	//! Current priority (higher = more resources, decays over time)
-	//! Initialized to INITIAL_PRIORITY when registered, decays via Formula 2
-	atomic<double> priority;
-	//! Stride value = LARGE_CONSTANT / priority
-	atomic<double> stride;
-	//! Pass value (accumulated stride, for scheduling decisions)
-	atomic<double> pass;
-	//! Number of quanta consumed (for priority decay)
-	atomic<int> decay_count;
+	//! Number of quanta consumed (for tracking/data collection only, not scheduling).
+	atomic<int> quanta_count;
 	//! Query start time in nanoseconds (for latency tracking)
 	atomic<int64_t> start_time_ns;
 
@@ -70,8 +64,8 @@ struct SchedulerSlot {
 	//! Default constructor - slot is empty/unused
 	//! Actual values are set by RegisterQuery()
 	SchedulerSlot()
-	    : executor(nullptr), active_pipeline(nullptr), priority(0.0), stride(0.0), pass(0.0), decay_count(0),
-	      start_time_ns(0), total_elapsed_us(0), arrival_time_ms(0.0) {
+	    : executor(nullptr), active_pipeline(nullptr), quanta_count(0), start_time_ns(0), total_elapsed_us(0),
+	      arrival_time_ms(0.0) {
 	}
 };
 
@@ -104,6 +98,10 @@ class SchedulerSlotArray {
 public:
 	//! Stride scheduling constant (determines granularity)
 	static constexpr double LARGE_CONSTANT = 1000.0;
+
+	//! Reference duration for time-based pass updates.
+	//! f = actual_quantum_ms / REFERENCE_DURATION_MS scales pass increments by real CPU time.
+	static constexpr double REFERENCE_DURATION_MS = 2.0;
 
 	//! Initial priority for all queries (p0 from paper, Section 2.3)
 	static constexpr double INITIAL_PRIORITY = 10000.0;
@@ -161,38 +159,19 @@ public:
 	Pipeline *GetActivePipeline(idx_t slot_index) const;
 
 	//===--------------------------------------------------------------------===//
-	// Priority and Pass Updates (lock-free)
+	// Tracking & Elapsed Time (lock-free)
 	//===--------------------------------------------------------------------===//
-
-	//! Update priority after consuming CPU time.
-	//! @param slot_index Slot to update
-	//! @param new_priority New priority value
-	void UpdatePriority(idx_t slot_index, double new_priority);
-
-	//! Update pass value after task execution.
-	void UpdatePass(idx_t slot_index, double pass_increment);
-
-	//! Increment decay count and apply priority decay if threshold reached.
-	//! @param slot_index Slot to update
-	void IncrementDecayCountAndApply(idx_t slot_index);
 
 	//! Accumulate wall-clock elapsed time for a quantum (lock-free atomic add).
 	//! Called from ExecuteForever after timing each quantum.
 	void AccumulateElapsedTime(idx_t slot_index, uint64_t elapsed_us);
 
-	//! Get current values (lock-free reads)
-	double GetPriority(idx_t slot_index) const;
-	double GetStride(idx_t slot_index) const;
-	double GetPass(idx_t slot_index) const;
-	int GetDecayCount(idx_t slot_index) const;
+	//! Increment the quanta count for tracking (lock-free atomic add).
+	//! Called from ExecuteForever after each quantum. Used by tracking only.
+	void IncrementQuantaCount(idx_t slot_index);
+
+	//! Get the executor for a slot (lock-free read).
 	Executor *GetExecutor(idx_t slot_index) const;
-
-	//! Get the current global pass value
-	double GetGlobalPass() const;
-
-	//! Increment global pass by global stride.
-	//! Called from ExecuteForever after each stride task execution.
-	void IncrementGlobalPass();
 
 	//===--------------------------------------------------------------------===//
 	// Self-Tuning: Tracking Window & Data Collection
@@ -227,10 +206,6 @@ public:
 	//! Used for thread-local cache invalidation.
 	uint64_t GetSequenceNumber() const;
 
-	//! Find the slot with minimum pass value (for stride scheduling).
-	//! Returns -1 if no active slots.
-	idx_t FindMinPassSlot() const;
-
 	//===--------------------------------------------------------------------===//
 	// Worker Registration & Change/Return Masks
 	//===--------------------------------------------------------------------===//
@@ -245,7 +220,7 @@ public:
 
 	//! Push a change notification for a slot to all registered workers.
 	//! Called when an initial task set of a new query is registered to a slot.
-	//! Workers: activate slot locally, read priority/stride from global.
+	//! Workers: activate slot locally, init priority/stride/pass from constants.
 	void PushChangeToWorkers(idx_t slot_index);
 
 	//! Push a finalization notification for a slot to all registered workers.
@@ -273,14 +248,6 @@ private:
 	atomic<uint64_t> sequence_number;
 	//! Mutex for registration/deregistration
 	mutex registration_lock;
-	//! Global pass value (for initializing new queries and new task sets)
-	atomic<double> global_pass;
-	//! Global stride = LARGE_CONSTANT / Σ(priorities)
-	//! Recomputed on register/deregister/decay
-	atomic<double> global_stride;
-
-	//! Recompute global stride from current active priorities
-	void RecomputeGlobalStride();
 
 	//! Registry of worker thread states for push-based mask updates.
 	//! Protected by worker_registry_lock.
