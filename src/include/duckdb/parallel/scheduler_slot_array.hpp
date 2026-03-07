@@ -85,6 +85,10 @@ struct QueryTraceEntry {
 	double in_window_wall_time_ms;
 };
 
+//! Optimizer lifecycle phase for the self-tuning scheduler (Section 4 of the paper).
+//! Transitions: IDLE --(t_r elapsed)--> TRACKING --(t_t elapsed)--> OPTIMIZING --> IDLE
+enum class OptimizerPhase : int { IDLE = 0, TRACKING = 1, OPTIMIZING = 2 };
+
 //! SchedulerSlotArray manages the global slot array for stride scheduling.
 //! Based on Section 2.3 of "Self-Tuning Query Scheduling for Analytical Workloads".
 //!
@@ -99,7 +103,7 @@ public:
 	//! Stride scheduling constant (determines granularity)
 	static constexpr double LARGE_CONSTANT = 1000.0;
 
-	//! Reference duration for time-based pass updates.
+	//! Reference duration for time-based pass updates. (t_decay)
 	//! f = actual_quantum_ms / REFERENCE_DURATION_MS scales pass increments by real CPU time.
 	static constexpr double REFERENCE_DURATION_MS = 2.0;
 
@@ -109,12 +113,15 @@ public:
 	//! Minimum priority bound (p_min from paper)
 	static constexpr double MIN_PRIORITY = 100.0;
 
-	//! Priority decay constants from Section 2.3 of the paper (Formula 2)
-	//! d_start: Number of quanta before decay starts
-	static constexpr int DECAY_START_QUANTA = 10;
-	//! λ (lambda): Decay factor applied each quantum after d_start
-	//! Formula 2: p_{i+1} = max(p_min, λ * p_i) for i >= d_start
-	static constexpr double DECAY_LAMBDA = 0.9;
+	//! Default decay parameters (compile-time constants for initialization).
+	//! The optimizer may update the live values at runtime.
+	static constexpr int DEFAULT_DECAY_START_QUANTA = 10;
+	static constexpr double DEFAULT_DECAY_LAMBDA = 0.9;
+
+	//! Tracking window duration (t_t from paper Section 4)
+	static constexpr double TRACKING_DURATION_MS = 20000.0;
+	//! Refresh period — interval between tracking windows (t_r from paper Section 4)
+	static constexpr double REFRESH_DURATION_MS = 60000.0;
 
 	SchedulerSlotArray();
 
@@ -188,6 +195,28 @@ public:
 
 	//! Get the tracked workload (read-only, only valid after StopTrackingWindow).
 	const vector<QueryTraceEntry> &GetTrackedWorkload() const;
+
+	//! Set live decay parameters (called by the optimizer after search).
+	void SetDecayParameters(int new_d_start, double new_lambda);
+
+	//===--------------------------------------------------------------------===//
+	// Self-Tuning: Mutable Decay Parameters (updated by optimizer)
+	//===--------------------------------------------------------------------===//
+
+	//! Live decay parameters — read by workers (relaxed), written by optimizer.
+	atomic<int> decay_start_quanta {DEFAULT_DECAY_START_QUANTA};
+	atomic<double> decay_lambda {DEFAULT_DECAY_LAMBDA};
+
+	//===--------------------------------------------------------------------===//
+	// Self-Tuning: Optimizer Lifecycle State
+	//===--------------------------------------------------------------------===//
+
+	//! Current optimizer phase (IDLE/TRACKING/OPTIMIZING).
+	//! Transitions are CAS-guarded so only one worker drives each transition.
+	atomic<int> optimizer_phase {static_cast<int>(OptimizerPhase::IDLE)};
+	//! Wall-clock time when the current phase started (ms).
+	//! Written before phase transitions, read by workers to compute elapsed time.
+	atomic<double> phase_start_time_ms {0.0};
 
 	//! Helper: current wall-clock time in milliseconds (steady_clock).
 	static double NowMs();
@@ -273,15 +302,6 @@ private:
 	//! Per-slot snapshot of total_elapsed_us at tracking window start.
 	//! Used to compute in-window elapsed time delta.
 	std::array<uint64_t, SCHEDULER_MAX_SLOTS> elapsed_at_window_start {};
-
-	//===--------------------------------------------------------------------===//
-	// Self-Tuning: Timing Constants
-	//===--------------------------------------------------------------------===//
-
-	//! Tracking window duration (t_t from paper Section 4)
-	static constexpr double T_TRACKING_MS = 20000.0;
-	//! Refresh period — interval between tracking windows (t_r from paper Section 4)
-	static constexpr double T_REFRESH_MS = 60000.0;
 
 	//===--------------------------------------------------------------------===//
 	// Global Wait Queue (private)

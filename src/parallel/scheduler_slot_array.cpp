@@ -353,4 +353,9 @@ double SchedulerSlotArray::NowMs() {
 	return std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
 }
 
+void SchedulerSlotArray::SetDecayParameters(int new_d_start, double new_lambda) {
+	decay_start_quanta.store(new_d_start, std::memory_order_relaxed);
+	decay_lambda.store(new_lambda, std::memory_order_relaxed);
+}
+
 } // namespace duckdb

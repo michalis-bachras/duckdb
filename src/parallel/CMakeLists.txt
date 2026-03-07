@@ -16,6 +16,7 @@ add_library_unity(
   pipeline_initialize_event.cpp
   pipeline_prepare_finish_event.cpp
   scheduler_slot_array.cpp
+  scheduler_optimizer.cpp
   task_executor.cpp
   task_notifier.cpp
   task_scheduler.cpp

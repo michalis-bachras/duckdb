@@ -10,6 +10,7 @@
 #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/parallel/thread_local_scheduler_state.hpp"
+#include "duckdb/parallel/scheduler_optimizer.hpp"
 #ifndef DUCKDB_NO_THREADS
 #include "concurrentqueue.h"
 #include "duckdb/common/thread.hpp"
@@ -283,6 +284,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 
 	// Register this worker's local state with the slot array for push-based updates.
 	if (policy->GetType() == SchedulerType::STRIDE) {
+		thread_local_state.slot_array_ptr = &slot_array;
 		slot_array.RegisterWorker(&thread_local_state);
 	}
 
@@ -386,6 +388,65 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 					thread_local_state.UpdateLocalPass(slot_idx, f);
 					thread_local_state.ApplyLocalDecay(slot_idx, elapsed_us);
 					thread_local_state.UpdateLocalGlobalPass(f);
+				}
+
+				// ── Optimizer lifecycle check ──
+				// Phase transitions happen once every ~80 seconds.
+				{
+					auto phase =
+					    static_cast<OptimizerPhase>(slot_array.optimizer_phase.load(std::memory_order_relaxed));
+
+					// Fast exit: OPTIMIZING means another worker is running
+					// the optimizer.
+					if (phase != OptimizerPhase::OPTIMIZING) {
+						// Load timestamp BEFORE phase (with acquire).
+						// The acquire pairs with the release on all phase
+						// stores/CAS below, ensuring we see the timestamp
+						// written before that phase transition.
+						double start_time = slot_array.phase_start_time_ms.load(std::memory_order_relaxed);
+						phase = static_cast<OptimizerPhase>(slot_array.optimizer_phase.load(std::memory_order_acquire));
+
+						double now = SchedulerSlotArray::NowMs();
+						double elapsed_phase = now - start_time;
+
+						if (phase == OptimizerPhase::IDLE && elapsed_phase >= SchedulerSlotArray::REFRESH_DURATION_MS) {
+							// Pre-store timestamp BEFORE CAS.
+							// If CAS fails: harmless (shifts IDLE start forward).
+							// If CAS succeeds: timestamp precedes the CAS's release,
+							// so any worker acquiring through the CAS sees it.
+							slot_array.phase_start_time_ms.store(now, std::memory_order_relaxed);
+
+							int expected = static_cast<int>(OptimizerPhase::IDLE);
+							if (slot_array.optimizer_phase.compare_exchange_strong(
+							        expected, static_cast<int>(OptimizerPhase::TRACKING), std::memory_order_acq_rel)) {
+								slot_array.StartTrackingWindow();
+							}
+
+						} else if (phase == OptimizerPhase::TRACKING &&
+						           elapsed_phase >= SchedulerSlotArray::TRACKING_DURATION_MS) {
+							int expected = static_cast<int>(OptimizerPhase::TRACKING);
+							if (slot_array.optimizer_phase.compare_exchange_strong(
+							        expected, static_cast<int>(OptimizerPhase::OPTIMIZING),
+							        std::memory_order_acq_rel)) {
+								slot_array.StopTrackingWindow();
+								auto &workload = slot_array.GetTrackedWorkload();
+								if (!workload.empty()) {
+									double prev_lambda = slot_array.decay_lambda.load(std::memory_order_relaxed);
+									auto result = SchedulerOptimizer::Optimize(
+									    workload, static_cast<idx_t>(NumberOfThreads()), prev_lambda);
+									slot_array.SetDecayParameters(result.d_start, result.lambda);
+								}
+
+								// Store timestamp BEFORE phase. The release store
+								// on phase below creates a happens-before edge:
+								// any worker acquiring through that store sees this.
+								slot_array.phase_start_time_ms.store(now, std::memory_order_relaxed);
+
+								slot_array.optimizer_phase.store(static_cast<int>(OptimizerPhase::IDLE),
+								                                 std::memory_order_release);
+							}
+						}
+					}
 				}
 			}
 

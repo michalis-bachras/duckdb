@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cmath>
 #include <limits>
 
 namespace duckdb {
@@ -81,6 +82,10 @@ struct ThreadLocalSchedulerState {
 	//! Per-worker local global stride = LARGE_CONSTANT / Σ(local priorities).
 	//! Recomputed when local priorities change (decay, new slot, slot removed).
 	double local_global_stride {0.0};
+
+	//! Pointer to the global slot array. Set once at thread start in ExecuteForever.
+	//! Used by ApplyLocalDecay to read live decay parameters (atomics).
+	const SchedulerSlotArray *slot_array_ptr = nullptr;
 
 	//! Per-slot CPU time accumulator (microseconds) for driving local decay.
 	std::array<uint64_t, SCHEDULER_MAX_SLOTS> cpu_time_accum_us;
@@ -240,30 +245,55 @@ struct ThreadLocalSchedulerState {
 
 	//! Apply priority decay locally after executing a quantum.
 	//! Accumulates CPU time and fires decay steps when threshold is reached.
+	//! Reads live decay parameters (d_start, lambda) from slot_array_ptr atomics.
 	void ApplyLocalDecay(idx_t slot_idx, uint64_t elapsed_us) {
 		if (slot_idx >= SCHEDULER_MAX_SLOTS || !active_slots.test(slot_idx)) {
 			return;
 		}
+
 		cpu_time_accum_us[slot_idx] += elapsed_us;
-		// Decay fires once per REFERENCE_DURATION_MS of accumulated CPU time
+
+		// Decay threshold
 		static constexpr uint64_t DECAY_THRESHOLD_US =
 		    static_cast<uint64_t>(SchedulerSlotArray::REFERENCE_DURATION_MS * 1000.0);
-		while (cpu_time_accum_us[slot_idx] >= DECAY_THRESHOLD_US) {
-			cpu_time_accum_us[slot_idx] -= DECAY_THRESHOLD_US;
-			decay_steps[slot_idx]++;
-			// Only apply decay after DECAY_START_QUANTA steps
-			if (decay_steps[slot_idx] <= SchedulerSlotArray::DECAY_START_QUANTA) {
-				continue;
-			}
-			// Exponential decay: p_new = λ * p_current
-			double new_prio = SchedulerSlotArray::DECAY_LAMBDA * priorities[slot_idx];
-			if (new_prio < SchedulerSlotArray::MIN_PRIORITY) {
-				new_prio = SchedulerSlotArray::MIN_PRIORITY;
-			}
-			priorities[slot_idx] = new_prio;
-			strides[slot_idx] = SchedulerSlotArray::LARGE_CONSTANT / new_prio;
-			RecomputeLocalGlobalStride();
+
+		// Fast exit: common case for cheap morsels (< 2ms accumulated)
+		if (cpu_time_accum_us[slot_idx] < DECAY_THRESHOLD_US) {
+			return;
 		}
+
+		// How many complete thresholds were crossed
+		const int steps_crossed = static_cast<int>(cpu_time_accum_us[slot_idx] / DECAY_THRESHOLD_US);
+		cpu_time_accum_us[slot_idx] %= DECAY_THRESHOLD_US;
+
+		const int old_total = decay_steps[slot_idx];
+		const int new_total = old_total + steps_crossed;
+		decay_steps[slot_idx] = new_total;
+
+		// Read live decay parameters from the global slot array (set by optimizer)
+		const int d_start = slot_array_ptr->decay_start_quanta.load(std::memory_order_relaxed);
+		const double lambda = slot_array_ptr->decay_lambda.load(std::memory_order_relaxed);
+
+		// How many of the crossed steps actually fall past d_start
+		const int effective_steps = std::max(0, new_total - d_start) - std::max(0, old_total - d_start);
+
+		if (effective_steps <= 0) {
+			return;
+		}
+
+		// Apply all effective decay steps in one pow() call
+		const double old_prio = priorities[slot_idx];
+		double new_prio = old_prio * std::pow(lambda, effective_steps);
+		new_prio = std::max(new_prio, SchedulerSlotArray::MIN_PRIORITY);
+
+		// Skip recomputation if priority didn't actually change (already at floor)
+		if (new_prio == old_prio) {
+			return;
+		}
+
+		priorities[slot_idx] = new_prio;
+		strides[slot_idx] = SchedulerSlotArray::LARGE_CONSTANT / new_prio;
+		RecomputeLocalGlobalStride();
 	}
 
 	//===--------------------------------------------------------------------===//
