@@ -883,6 +883,13 @@
         "scope": "global"
     },
     {
+        "name": "scheduler_type",
+        "description": "The type of scheduler to use. Options: 'default' (FIFO), 'stride' (priority-based stride scheduler), 'ml' (machine learning scheduler).",
+        "type": "VARCHAR",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
         "name": "schema",
         "description": "Sets the default search schema. Equivalent to setting search_path to a single value.",
         "type": "VARCHAR",

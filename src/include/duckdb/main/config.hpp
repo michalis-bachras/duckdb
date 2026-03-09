@@ -127,6 +127,8 @@ struct DBConfigOptions {
 	//! The number of external threads that work on DuckDB tasks. Default: 1.
 	//! Must be smaller or equal to maximum_threads.
 	idx_t external_threads = 1;
+	//! The scheduler type to use for query execution
+	SchedulerType scheduler_type = SchedulerType::DEFAULT;
 	//! Whether or not to create and use a temporary directory to store intermediates that do not fit in memory
 	bool use_temporary_directory = true;
 	//! Directory to store temporary structures that do not fit in memory

@@ -37,6 +37,8 @@
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/variant/variant_shredding.hpp"
 #include "duckdb/storage/block_allocator.hpp"
+#include "duckdb/common/enums/scheduler_type.hpp"
+
 
 namespace duckdb {
 
@@ -1638,6 +1640,54 @@ void SchemaSetting::ResetLocal(ClientContext &context) {
 Value SchemaSetting::GetSetting(const ClientContext &context) {
 	auto &client_data = ClientData::Get(context);
 	return client_data.catalog_search_path->GetDefault().schema;
+}
+
+//===----------------------------------------------------------------------===//
+// Scheduler Type
+//===----------------------------------------------------------------------===//
+static SchedulerType ParseSchedulerType(const string &input){
+	auto lower = StringUtil::Lower(input);
+	if (lower == "default"){
+		return SchedulerType::DEFAULT;
+	}
+	else if (lower == "stride"){
+		return SchedulerType::STRIDE;
+	}
+	else if (lower == "ml"){
+		return SchedulerType::ML;
+	}
+	throw InvalidInputException(
+		"Unknown scheduler_type '%s'. Valid options: 'default', 'stride', 'ml'", input);
+
+}
+
+void SchedulerTypeSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter) {
+	auto type = ParseSchedulerType(parameter.ToString());
+	config.options.scheduler_type = type;
+	if (db) {
+		auto &scheduler = TaskScheduler::GetScheduler(*db);
+		scheduler.SetSchedulerType(type);
+	}
+}
+
+void SchedulerTypeSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.scheduler_type = SchedulerType::DEFAULT;
+	if (db) {
+		auto &scheduler = TaskScheduler::GetScheduler(*db);
+		scheduler.SetSchedulerType(SchedulerType::DEFAULT);
+	}
+}
+
+Value SchedulerTypeSetting::GetSetting(const ClientContext &context) {
+	auto &config = DBConfig::GetConfig(context);
+	switch (config.options.scheduler_type) {
+	case SchedulerType::STRIDE:
+		return Value("stride");
+	case SchedulerType::ML:
+		return Value("ml");
+	default:
+		return Value("default");
+	}
 }
 
 //===----------------------------------------------------------------------===//

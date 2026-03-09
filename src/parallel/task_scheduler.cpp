@@ -6,7 +6,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/storage/block_allocator.hpp"
-#include "duckdb/parallel/default_scheduler_policy.hpp"
+#include "duckdb/common/enums/scheduler_type.hpp"
 #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/parallel/thread_local_scheduler_state.hpp"
@@ -232,7 +232,7 @@ TaskScheduler::TaskScheduler(DatabaseInstance &db)
     : db(db), queue(make_uniq<ConcurrentQueue>()),
       allocator_flush_threshold(db.config.options.allocator_flush_threshold),
       allocator_background_threads(db.config.options.allocator_background_threads), requested_thread_count(0),
-      current_thread_count(1), policy(make_uniq<DefaultSchedulerPolicy>()) {
+      current_thread_count(1), scheduler_type(db.config.options.scheduler_type) {
 	SetAllocatorBackgroundThreads(db.config.options.allocator_background_threads);
 }
 
@@ -283,7 +283,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 	ThreadLocalSchedulerState thread_local_state;
 
 	// Register this worker's local state with the slot array for push-based updates.
-	if (policy->GetType() == SchedulerType::STRIDE) {
+	if (scheduler_type == SchedulerType::STRIDE) {
 		thread_local_state.slot_array_ptr = &slot_array;
 		slot_array.RegisterWorker(&thread_local_state);
 	}
@@ -317,7 +317,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 		bool got_task = false;
 		idx_t selected_slot = DConstants::INVALID_INDEX;
 
-		if (policy->GetType() == SchedulerType::STRIDE && slot_array.GetActiveSlotCount() > 0) {
+		if (scheduler_type == SchedulerType::STRIDE && slot_array.GetActiveSlotCount() > 0) {
 			// STRIDE SCHEDULING
 
 			// 1. Pull updates from change/return masks, before picking a task for execution.
@@ -347,10 +347,10 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			if (!got_task) {
 				got_task = queue->Dequeue(task);
 			}
-		} else if (policy->GetType() == SchedulerType::DEFAULT) {
+		} else if (scheduler_type == SchedulerType::DEFAULT) {
 			// DEFAULT SCHEDULING: FIFO queue
 			got_task = queue->Dequeue(task);
-		} else if (policy->GetType() == SchedulerType::ML) {
+		} else if (scheduler_type == SchedulerType::ML) {
 			// ML SCHEDULING: FIFO queue(for now)
 			got_task = queue->Dequeue(task);
 		}
@@ -358,7 +358,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 		if (got_task) {
 			TaskExecutionMode process_mode;
 			std::chrono::steady_clock::time_point quantum_start;
-			if (policy->GetType() == SchedulerType::STRIDE) {
+			if (scheduler_type == SchedulerType::STRIDE) {
 				// Stride: yield after each quantum so workers re-enter scheduling loop
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 				// Record start time for stride quantum timing
@@ -371,7 +371,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			auto execute_result = task->Execute(process_mode);
 
 			// After task execution: update stride state
-			if (policy->GetType() == SchedulerType::STRIDE) {
+			if (scheduler_type == SchedulerType::STRIDE) {
 				auto *executor_task = dynamic_cast<ExecutorTask *>(task.get());
 				if (executor_task && executor_task->executor.IsRegisteredWithScheduler()) {
 					idx_t slot_idx = executor_task->executor.GetSchedulerSlotIndex();
@@ -473,7 +473,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 	}
 
 	// Deregister worker before exiting
-	if (policy->GetType() == SchedulerType::STRIDE) {
+	if (scheduler_type == SchedulerType::STRIDE) {
 		slot_array.DeregisterWorker(&thread_local_state);
 	}
 
@@ -727,16 +727,16 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n) {
 // Scheduler Policy Methods
 //===--------------------------------------------------------------------===//
 
-SchedulerPolicy &TaskScheduler::GetPolicy() {
-	return *policy;
+SchedulerType TaskScheduler::GetSchedulerType() const {
+	return scheduler_type;
 }
 
 SchedulerSlotArray &TaskScheduler::GetSlotArray() {
 	return slot_array;
 }
 
-void TaskScheduler::SetPolicy(unique_ptr<SchedulerPolicy> new_policy) {
-	policy = std::move(new_policy);
+void TaskScheduler::SetSchedulerType(SchedulerType type) {
+	scheduler_type = type;
 }
 
 } // namespace duckdb

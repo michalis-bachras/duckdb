@@ -401,7 +401,7 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		this->producer = scheduler.CreateProducer();
 
 		// Register with stride scheduler if active
-		if (scheduler.GetPolicy().GetType() == SchedulerType::STRIDE) {
+		if (scheduler.GetSchedulerType() == SchedulerType::STRIDE) {
 			idx_t slot = scheduler.GetSlotArray().RegisterQuery(*this);
 
 			if (slot == DConstants::INVALID_INDEX) {

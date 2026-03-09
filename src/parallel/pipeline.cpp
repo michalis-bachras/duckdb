@@ -41,7 +41,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	if (mode == TaskExecutionMode::PROCESS_PARTIAL) {
 		idx_t chunk_count = PARTIAL_CHUNK_COUNT;
 		auto &scheduler = TaskScheduler::GetScheduler(pipeline.GetClientContext());
-		if (scheduler.GetPolicy().GetType() == SchedulerType::STRIDE) {
+		if (scheduler.GetSchedulerType() == SchedulerType::STRIDE) {
 			chunk_count = STRIDE_QUANTUM_CHUNKS;
 		}
 		auto res = pipeline_executor->Execute(chunk_count);

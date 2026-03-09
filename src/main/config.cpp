@@ -173,6 +173,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_LOCAL(ProgressBarTimeSetting),
     DUCKDB_SETTING(ScalarSubqueryErrorOnMultipleRowsSetting),
     DUCKDB_GLOBAL(SchedulerProcessPartialSetting),
+    DUCKDB_GLOBAL(SchedulerTypeSetting),
     DUCKDB_LOCAL(SchemaSetting),
     DUCKDB_LOCAL(SearchPathSetting),
     DUCKDB_GLOBAL(SecretDirectorySetting),
@@ -186,15 +187,14 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING_CALLBACK(ValidateExternalFileCacheSetting),
     DUCKDB_GLOBAL(VariantMinimumShreddingSize),
     DUCKDB_SETTING(WriteBufferRowGroupCountSetting),
-    DUCKDB_GLOBAL(ZstdMinStringLengthSetting),
-    FINAL_SETTING};
+    DUCKDB_GLOBAL(ZstdMinStringLengthSetting),    FINAL_SETTING};
 
 static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 90),
-                                                     DUCKDB_SETTING_ALIAS("null_order", 38),
-                                                     DUCKDB_SETTING_ALIAS("profiling_output", 109),
-                                                     DUCKDB_SETTING_ALIAS("user", 124),
-                                                     DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 22),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 123),
+    DUCKDB_SETTING_ALIAS("null_order", 38),
+    DUCKDB_SETTING_ALIAS("profiling_output", 109),
+    DUCKDB_SETTING_ALIAS("user", 125),
+    DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 22),
+    DUCKDB_SETTING_ALIAS("worker_threads", 124),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {

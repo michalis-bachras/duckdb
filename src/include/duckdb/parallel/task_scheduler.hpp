@@ -13,7 +13,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parallel/task.hpp"
-#include "duckdb/parallel/scheduler_policy.hpp"
+#include "duckdb/common/enums/scheduler_type.hpp"
 #include "duckdb/parallel/scheduler_slot_array.hpp"
 
 namespace duckdb {
@@ -95,14 +95,14 @@ public:
 	// Scheduler Policy
 	//===--------------------------------------------------------------------===//
 
-	//! Get the current scheduler policy
-	SchedulerPolicy &GetPolicy();
+	//! Get the current scheduler type
+	SchedulerType GetSchedulerType() const;
 
 	//! Get the global slot array (for stride scheduling)
 	SchedulerSlotArray &GetSlotArray();
 
-	//! Set the scheduler policy (takes ownership)
-	void SetPolicy(unique_ptr<SchedulerPolicy> new_policy);
+	//! Set the scheduler type
+	void SetSchedulerType(SchedulerType type);
 
 private:
 	void RelaunchThreadsInternal(int32_t n);
@@ -130,8 +130,8 @@ private:
 	// Scheduler Policy Members
 	//===--------------------------------------------------------------------===//
 
-	//! The current scheduler policy (determines task selection strategy)
-	unique_ptr<SchedulerPolicy> policy;
+	//! The current scheduler type (determines task selection strategy)
+	SchedulerType scheduler_type;
 	//! Global slot array for stride scheduling (shared across all threads)
 	SchedulerSlotArray slot_array;
 };
