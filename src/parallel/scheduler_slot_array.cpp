@@ -7,6 +7,16 @@
 
 namespace duckdb {
 
+// Out-of-class definitions for static constexpr members (required for ODR-use in C++11/14)
+constexpr double SchedulerSlotArray::LARGE_CONSTANT;
+constexpr double SchedulerSlotArray::REFERENCE_DURATION_MS;
+constexpr double SchedulerSlotArray::INITIAL_PRIORITY;
+constexpr double SchedulerSlotArray::MIN_PRIORITY;
+constexpr int SchedulerSlotArray::DEFAULT_DECAY_START_QUANTA;
+constexpr double SchedulerSlotArray::DEFAULT_DECAY_LAMBDA;
+constexpr double SchedulerSlotArray::TRACKING_DURATION_MS;
+constexpr double SchedulerSlotArray::REFRESH_DURATION_MS;
+
 SchedulerSlotArray::SchedulerSlotArray() : active_count(0), sequence_number(0) {
 	active_slots.reset();
 }

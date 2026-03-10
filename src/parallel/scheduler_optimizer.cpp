@@ -7,6 +7,11 @@
 
 namespace duckdb {
 
+// Out-of-class definitions for static constexpr members (required for ODR-use in C++11/14)
+constexpr int SchedulerOptimizer::SEARCH_STEPS;
+constexpr double SchedulerOptimizer::DIRECTION;
+constexpr double SchedulerOptimizer::ALPHA_MAX;
+
 OptimalParams SchedulerOptimizer::Optimize(const vector<QueryTraceEntry> &workload, idx_t num_workers,
                                            double prev_lambda) {
 	constexpr double R = SchedulerSlotArray::REFERENCE_DURATION_MS;
