@@ -130,8 +130,10 @@ private:
 	// Scheduler Policy Members
 	//===--------------------------------------------------------------------===//
 
-	//! The current scheduler type (determines task selection strategy)
-	SchedulerType scheduler_type;
+
+	//! Atomic because main thread writes it (SET scheduler_type=...) while
+	//! worker threads read it in ExecuteForever's hot loop.
+	atomic<SchedulerType> scheduler_type;
 	//! Global slot array for stride scheduling (shared across all threads)
 	SchedulerSlotArray slot_array;
 };

@@ -281,11 +281,13 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 
 	// Thread-local scheduler state for stride scheduling
 	ThreadLocalSchedulerState thread_local_state;
+	bool stride_registered = false;
 
 	// Register this worker's local state with the slot array for push-based updates.
-	if (scheduler_type == SchedulerType::STRIDE) {
+	if (scheduler_type.load(std::memory_order_acquire) == SchedulerType::STRIDE) {
 		thread_local_state.slot_array_ptr = &slot_array;
 		slot_array.RegisterWorker(&thread_local_state);
+		stride_registered = true;
 	}
 
 	shared_ptr<Task> task;
@@ -313,12 +315,31 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			}
 		}
 
+		// Snapshot scheduler type once per iteration so all decisions within
+		// this iteration are consistent(Without this, multiple reads of the atomic
+		// could see different values if the type changes mid-iteration.
+		auto current_scheduler_type = scheduler_type.load(std::memory_order_acquire);
+
 		// Task dequeue: different behavior based on scheduler policy
 		bool got_task = false;
-		idx_t selected_slot = DConstants::INVALID_INDEX;
 
-		if (scheduler_type == SchedulerType::STRIDE && slot_array.GetActiveSlotCount() > 0) {
+		// Lazy deregistration: if we were using stride but scheduler switched away, deregister
+		// to stop receiving push-based mask updates (PushChangeToWorkers, etc.)
+		if (stride_registered && current_scheduler_type != SchedulerType::STRIDE) {
+			slot_array.DeregisterWorker(&thread_local_state);
+			thread_local_state.slot_array_ptr = nullptr;
+			stride_registered = false;
+		}
+
+		if (current_scheduler_type == SchedulerType::STRIDE && slot_array.GetActiveSlotCount() > 0) {
 			// STRIDE SCHEDULING
+
+			// Lazy registration: if scheduler type changed at runtime, register now
+			if (!stride_registered) {
+				thread_local_state.slot_array_ptr = &slot_array;
+				slot_array.RegisterWorker(&thread_local_state);
+				stride_registered = true;
+			}
 
 			// 1. Pull updates from change/return masks, before picking a task for execution.
 			thread_local_state.PullUpdates(slot_array);
@@ -337,28 +358,25 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 						continue;
 					}
 					got_task = GetTaskFromProducer(executor->GetToken(), task);
-					if (got_task) {
-						selected_slot = slot;
-					}
 				}
 			}
 
-			// 3. Fallback to FIFO only if ALL active slots have no tasks(NEED TO CHECK THIS AGAIN)
+			// 3. Fallback to FIFO if all active slots have no tasks
 			if (!got_task) {
 				got_task = queue->Dequeue(task);
 			}
-		} else if (scheduler_type == SchedulerType::DEFAULT) {
-			// DEFAULT SCHEDULING: FIFO queue
-			got_task = queue->Dequeue(task);
-		} else if (scheduler_type == SchedulerType::ML) {
-			// ML SCHEDULING: FIFO queue(for now)
+		} else {
+			// DEFAULT / ML / STRIDE with no active slots: FIFO queue.
+			// The STRIDE+no-active-slots case handles queries that were submitted
+			// under DEFAULT mode before a runtime switch to STRIDE — their tasks
+			// are in the queue but no slot exists, so FIFO is the only path.
 			got_task = queue->Dequeue(task);
 		}
 
 		if (got_task) {
 			TaskExecutionMode process_mode;
 			std::chrono::steady_clock::time_point quantum_start;
-			if (scheduler_type == SchedulerType::STRIDE) {
+			if (current_scheduler_type == SchedulerType::STRIDE) {
 				// Stride: yield after each quantum so workers re-enter scheduling loop
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 				// Record start time for stride quantum timing
@@ -371,7 +389,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			auto execute_result = task->Execute(process_mode);
 
 			// After task execution: update stride state
-			if (scheduler_type == SchedulerType::STRIDE) {
+			if (current_scheduler_type == SchedulerType::STRIDE) {
 				auto *executor_task = dynamic_cast<ExecutorTask *>(task.get());
 				if (executor_task && executor_task->executor.IsRegisteredWithScheduler()) {
 					idx_t slot_idx = executor_task->executor.GetSchedulerSlotIndex();
@@ -473,7 +491,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 	}
 
 	// Deregister worker before exiting
-	if (scheduler_type == SchedulerType::STRIDE) {
+	if (stride_registered) {
 		slot_array.DeregisterWorker(&thread_local_state);
 	}
 
@@ -728,7 +746,7 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n) {
 //===--------------------------------------------------------------------===//
 
 SchedulerType TaskScheduler::GetSchedulerType() const {
-	return scheduler_type;
+	return scheduler_type.load(std::memory_order_acquire);
 }
 
 SchedulerSlotArray &TaskScheduler::GetSlotArray() {
@@ -736,7 +754,7 @@ SchedulerSlotArray &TaskScheduler::GetSlotArray() {
 }
 
 void TaskScheduler::SetSchedulerType(SchedulerType type) {
-	scheduler_type = type;
+	scheduler_type.store(type, std::memory_order_release);
 }
 
 } // namespace duckdb
