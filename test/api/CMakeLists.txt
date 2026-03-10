@@ -36,7 +36,11 @@ set(TEST_API_OBJECTS
     test_threads.cpp
     test_windows_header_compatibility.cpp
     test_windows_unicode_path.cpp
-    test_object_cache.cpp)
+    test_object_cache.cpp
+    test_stride_scheduler_section2.cpp
+    test_stride_scheduler_section3.cpp
+    test_stride_scheduler_section4.cpp
+    test_scheduler_compatibility.cpp)
 
 if(NOT WIN32)
   set(TEST_API_OBJECTS ${TEST_API_OBJECTS} test_read_only.cpp)
@@ -47,6 +51,7 @@ if(DUCKDB_EXTENSION_TPCH_SHOULD_LINK)
   set(TEST_API_OBJECTS
       ${TEST_API_OBJECTS} test_tpch_with_relations.cpp
       test_tpch_with_streaming.cpp
+      test_stride_scheduler_tpch.cpp
       serialized_plans/test_plan_serialization_bwc.cpp)
 endif()
 
