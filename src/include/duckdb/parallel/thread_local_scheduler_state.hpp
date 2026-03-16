@@ -138,12 +138,13 @@ struct ThreadLocalSchedulerState {
 		RecomputeLocalGlobalStride();
 
 		// Drain any pending masks (we just did a full refresh)
-		change_mask_low.exchange(0, std::memory_order_relaxed);
-		change_mask_high.exchange(0, std::memory_order_relaxed);
-		finalization_mask_low.exchange(0, std::memory_order_relaxed);
-		finalization_mask_high.exchange(0, std::memory_order_relaxed);
-		return_mask_low.exchange(0, std::memory_order_relaxed);
-		return_mask_high.exchange(0, std::memory_order_relaxed);
+		// acquire pairs with fetch_or(release) on the push side
+		change_mask_low.exchange(0, std::memory_order_acquire);
+		change_mask_high.exchange(0, std::memory_order_acquire);
+		finalization_mask_low.exchange(0, std::memory_order_acquire);
+		finalization_mask_high.exchange(0, std::memory_order_acquire);
+		return_mask_low.exchange(0, std::memory_order_acquire);
+		return_mask_high.exchange(0, std::memory_order_acquire);
 
 		RebuildSortedSlots();
 		needs_full_refresh = false;
@@ -165,12 +166,13 @@ struct ThreadLocalSchedulerState {
 		}
 
 		// Atomically exchange all masks with zero
-		uint64_t change_low = change_mask_low.exchange(0, std::memory_order_relaxed);
-		uint64_t change_high = change_mask_high.exchange(0, std::memory_order_relaxed);
-		uint64_t fin_low = finalization_mask_low.exchange(0, std::memory_order_relaxed);
-		uint64_t fin_high = finalization_mask_high.exchange(0, std::memory_order_relaxed);
-		uint64_t ret_low = return_mask_low.exchange(0, std::memory_order_relaxed);
-		uint64_t ret_high = return_mask_high.exchange(0, std::memory_order_relaxed);
+		// acquire pairs with fetch_or(release) on the push side
+		uint64_t change_low = change_mask_low.exchange(0, std::memory_order_acquire);
+		uint64_t change_high = change_mask_high.exchange(0, std::memory_order_acquire);
+		uint64_t fin_low = finalization_mask_low.exchange(0, std::memory_order_acquire);
+		uint64_t fin_high = finalization_mask_high.exchange(0, std::memory_order_acquire);
+		uint64_t ret_low = return_mask_low.exchange(0, std::memory_order_acquire);
+		uint64_t ret_high = return_mask_high.exchange(0, std::memory_order_acquire);
 
 		// If nothing changed, no work needed
 		if (change_low == 0 && change_high == 0 && fin_low == 0 && fin_high == 0 && ret_low == 0 && ret_high == 0) {
