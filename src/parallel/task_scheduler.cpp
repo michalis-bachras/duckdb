@@ -351,6 +351,11 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			for (idx_t attempt = 0; attempt < thread_local_state.GetActiveSlotCount() && !got_task; attempt++) {
 				idx_t slot = thread_local_state.FindNthMinPassSlot(attempt);
 				if (slot != DConstants::INVALID_INDEX) {
+					// Hold per-slot access_lock while using the executor pointer.
+					// This prevents use-after-free: DeregisterQuery cannot null the
+					// pointer (and the client cannot destroy the Executor) while we
+					// are mid-dequeue.
+					lock_guard<mutex> access(slot_array.GetSlotLock(slot));
 					Executor *executor = slot_array.GetExecutor(slot);
 					if (!executor) {
 						// Lazy deactivation: query completed, slot is now inactive

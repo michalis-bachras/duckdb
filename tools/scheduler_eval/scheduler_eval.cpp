@@ -6,8 +6,10 @@
 //
 // Phase 1: Sequential calibration — measure isolation times for each TPC-H
 //          query under each scheduler type.
-// Phase 2: Mixed workload evaluation — exponential arrivals, SF3+SF30 mix,
-//          measure relative slowdown at various load factors.
+// Phase 2: Mixed workload evaluation — time-based with exponential arrivals,
+//          SF3+SF30 mix, measure relative slowdown at various load factors.
+//          Matches the paper: run for a fixed duration (default 5 minutes),
+//          with time-based warmup for self-tuner convergence.
 //===----------------------------------------------------------------------===//
 
 #include "duckdb.hpp"
@@ -19,6 +21,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <csignal>
+#include <execinfo.h>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -29,6 +33,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+static void crash_handler(int sig) {
+	fprintf(stderr, "\n=== SIGNAL %d ===\n", sig);
+	void *frames[64];
+	int n = backtrace(frames, 64);
+	backtrace_symbols_fd(frames, n, STDERR_FILENO);
+	_exit(128 + sig);
+}
 
 using namespace duckdb;
 using Clock = std::chrono::steady_clock;
@@ -60,7 +72,6 @@ struct QueryMeasurement {
 	double alpha;
 	int seed;
 	double arrival_time;
-	double start_time;       // actual start (after waiting)
 	double wall_time_sec;
 	double isolation_time_sec;
 	double relative_slowdown; // wall_time / isolation_time
@@ -71,12 +82,14 @@ struct ExperimentSummary {
 	double alpha;
 	int seed;
 	double mean_relative_slowdown;
+	double geomean_latency_ms;
 	double p50_slowdown;
 	double p95_slowdown;
 	double p99_slowdown;
 	double throughput_qps;
 	double total_wall_sec;
 	int n_queries;
+	int n_total_queries; // including warmup
 };
 
 //===----------------------------------------------------------------------===//
@@ -90,8 +103,8 @@ struct Config {
 	bool run_phase2 = true;
 	bool skip_dbgen = false;
 	std::vector<double> alphas = {0.80, 0.85, 0.90, 0.95, 1.00};
-	int queries_per_run = 200;
-	int warmup_queries = 30;
+	double duration_sec = 300.0;  // 5 minutes (paper Section 5.2)
+	double warmup_sec = 90.0;    // t_t=20s + t_r=60s + 10s margin
 	int reps = 3;
 	int base_seed = 42;
 	int threads = 0; // 0 = DuckDB default
@@ -116,6 +129,17 @@ static double percentile(std::vector<double> &sorted_vals, double p) {
 	}
 	double frac = idx - static_cast<double>(lo);
 	return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac;
+}
+
+static double geometric_mean(const std::vector<double> &vals) {
+	if (vals.empty()) {
+		return 0.0;
+	}
+	double log_sum = 0.0;
+	for (double v : vals) {
+		log_sum += std::log(v);
+	}
+	return std::exp(log_sum / static_cast<double>(vals.size()));
 }
 
 static std::string timestamp_str() {
@@ -236,25 +260,29 @@ static std::vector<IsolationTime> run_phase1(DuckDB &db, const Config &config) {
 }
 
 //===----------------------------------------------------------------------===//
-// Workload Generation
+// Workload Generation (time-based)
 //===----------------------------------------------------------------------===//
 
 static std::vector<QueryEvent> generate_workload(double alpha, double mean_query_dur_sec,
-                                                  int n_queries, unsigned seed) {
+                                                  double duration_sec, unsigned seed) {
 	double lambda = alpha / mean_query_dur_sec;
 	std::mt19937 rng(seed);
 	std::exponential_distribution<double> arrival_dist(lambda);
 	std::uniform_int_distribution<int> query_dist(1, 22);
-	// 75% SF3, 25% SF30
+	// 75% SF3, 25% SF30 (paper Section 5.1)
 	std::discrete_distribution<int> sf_dist({3, 1}); // index 0 = SF3, index 1 = SF30
 
 	std::vector<QueryEvent> events;
 	double t = 0.0;
-	for (int i = 0; i < n_queries; i++) {
+	int id = 0;
+	while (true) {
 		t += arrival_dist(rng);
+		if (t >= duration_sec) {
+			break; // stop scheduling arrivals beyond the duration
+		}
 		int sf = (sf_dist(rng) == 0) ? 3 : 30;
 		int q = query_dist(rng);
-		events.push_back({i, t, q, sf});
+		events.push_back({id++, t, q, sf});
 	}
 	return events;
 }
@@ -267,47 +295,50 @@ static std::vector<QueryMeasurement> run_experiment(DuckDB &db, const std::strin
                                                      double alpha, int seed,
                                                      const std::vector<QueryEvent> &events,
                                                      const std::map<std::tuple<std::string, int, int>, double> &iso_times,
-                                                     int warmup_count) {
+                                                     double warmup_sec, int &out_total_queries) {
 	std::vector<QueryMeasurement> results;
 	std::mutex results_mutex;
 	std::atomic<int> completed{0};
 	int total = static_cast<int>(events.size());
+	out_total_queries = total;
 
 	auto t_start = Clock::now();
 	std::vector<std::thread> workers;
 	workers.reserve(events.size());
 
-	for (const auto &event : events) {
+	for (size_t idx = 0; idx < events.size(); idx++) {
+		const auto &event = events[idx];
 		// Wait until arrival time
 		auto target = t_start + std::chrono::duration<double>(event.arrival_time);
 		std::this_thread::sleep_until(target);
 
-		workers.emplace_back([&db, &event, &scheduler_type, &iso_times, &results, &results_mutex,
-		                      alpha, seed, warmup_count, &completed, total]() {
+		// Capture event by value to avoid dangling reference
+		QueryEvent ev = event;
+		workers.emplace_back([&db, ev, &scheduler_type, &iso_times, &results, &results_mutex,
+		                      alpha, seed, warmup_sec, &completed, total, &t_start]() {
 			try {
 				Connection con(db);
 				con.Query("SET scheduler_type='" + scheduler_type + "'");
-				con.Query("SET schema='sf" + std::to_string(event.scale_factor) + "'");
+				con.Query("SET schema='sf" + std::to_string(ev.scale_factor) + "'");
 
-				std::string query_sql = TpchExtension::GetQuery(event.query_num);
+				std::string query_sql = TpchExtension::GetQuery(ev.query_num);
 
 				auto actual_start = Clock::now();
 				auto res = con.Query(query_sql);
 				auto t1 = Clock::now();
 
 				double wall = Duration(t1 - actual_start).count();
-				double start_offset = Duration(actual_start - Clock::now()).count(); // will be negative, recalc below
 
 				if (res->HasError()) {
 					int done = ++completed;
-					if (done % 20 == 0) {
+					if (done % 50 == 0) {
 						printf("    [%d/%d] Q%02d SF%d ERROR: %s\n",
-						       done, total, event.query_num, event.scale_factor, res->GetError().c_str());
+						       done, total, ev.query_num, ev.scale_factor, res->GetError().c_str());
 					}
 					return;
 				}
 
-				auto key = std::make_tuple(scheduler_type, event.query_num, event.scale_factor);
+				auto key = std::make_tuple(scheduler_type, ev.query_num, ev.scale_factor);
 				double iso = 1.0; // fallback
 				auto it = iso_times.find(key);
 				if (it != iso_times.end()) {
@@ -315,27 +346,28 @@ static std::vector<QueryMeasurement> run_experiment(DuckDB &db, const std::strin
 				}
 				double slowdown = wall / iso;
 
-				// Only record measurements after warmup
-				if (event.event_id >= warmup_count) {
+				// Only record measurements after warmup period (time-based)
+				if (ev.arrival_time >= warmup_sec) {
 					std::lock_guard<std::mutex> lock(results_mutex);
-					results.push_back({event.event_id - warmup_count, event.query_num, event.scale_factor,
-					                   scheduler_type, alpha, seed, event.arrival_time, 0.0,
+					results.push_back({ev.event_id, ev.query_num, ev.scale_factor,
+					                   scheduler_type, alpha, seed, ev.arrival_time,
 					                   wall, iso, slowdown});
 				}
 
 				int done = ++completed;
-				if (done % 20 == 0 || done == total) {
-					printf("    [%d/%d] completed\n", done, total);
+				if (done % 50 == 0 || done == total) {
+					double elapsed = Duration(Clock::now() - t_start).count();
+					printf("    [%d/%d] completed (%.0fs elapsed)\n", done, total, elapsed);
 				}
 			} catch (const std::exception &e) {
 				++completed;
 				fprintf(stderr, "    Thread exception for Q%d SF%d: %s\n",
-				        event.query_num, event.scale_factor, e.what());
+				        ev.query_num, ev.scale_factor, e.what());
 			}
 		});
 	}
 
-	// Join all threads
+	// Join all threads (queries that arrived before deadline run to completion)
 	for (auto &w : workers) {
 		if (w.joinable()) {
 			w.join();
@@ -371,16 +403,18 @@ static double compute_mean_query_duration(const std::vector<IsolationTime> &iso_
 
 static ExperimentSummary compute_summary(const std::vector<QueryMeasurement> &measurements,
                                           const std::string &scheduler_type, double alpha, int seed,
-                                          double total_wall_sec) {
+                                          double total_wall_sec, int n_total_queries) {
 	ExperimentSummary summary;
 	summary.scheduler_type = scheduler_type;
 	summary.alpha = alpha;
 	summary.seed = seed;
 	summary.n_queries = static_cast<int>(measurements.size());
+	summary.n_total_queries = n_total_queries;
 	summary.total_wall_sec = total_wall_sec;
 
 	if (measurements.empty()) {
 		summary.mean_relative_slowdown = 0.0;
+		summary.geomean_latency_ms = 0.0;
 		summary.p50_slowdown = 0.0;
 		summary.p95_slowdown = 0.0;
 		summary.p99_slowdown = 0.0;
@@ -389,13 +423,17 @@ static ExperimentSummary compute_summary(const std::vector<QueryMeasurement> &me
 	}
 
 	std::vector<double> slowdowns;
+	std::vector<double> latencies_ms;
 	slowdowns.reserve(measurements.size());
+	latencies_ms.reserve(measurements.size());
 	for (const auto &m : measurements) {
 		slowdowns.push_back(m.relative_slowdown);
+		latencies_ms.push_back(m.wall_time_sec * 1000.0);
 	}
 
 	double sum = std::accumulate(slowdowns.begin(), slowdowns.end(), 0.0);
 	summary.mean_relative_slowdown = sum / slowdowns.size();
+	summary.geomean_latency_ms = geometric_mean(latencies_ms);
 	summary.throughput_qps = static_cast<double>(measurements.size()) / total_wall_sec;
 
 	std::sort(slowdowns.begin(), slowdowns.end());
@@ -411,6 +449,8 @@ static void run_phase2(DuckDB &db, const Config &config,
                         std::vector<QueryMeasurement> &all_measurements,
                         std::vector<ExperimentSummary> &all_summaries) {
 	log("=== Phase 2: Mixed Workload Evaluation ===");
+	log("  Duration: " + std::to_string(static_cast<int>(config.duration_sec)) + "s, "
+	    "Warmup: " + std::to_string(static_cast<int>(config.warmup_sec)) + "s");
 
 	// Build isolation time lookup
 	std::map<std::tuple<std::string, int, int>, double> iso_map;
@@ -425,30 +465,50 @@ static void run_phase2(DuckDB &db, const Config &config,
 		for (double alpha : config.alphas) {
 			for (int rep = 0; rep < config.reps; rep++) {
 				int seed = config.base_seed + rep;
-				int total_queries = config.warmup_queries + config.queries_per_run;
+
+				auto events = generate_workload(alpha, mean_dur, config.duration_sec,
+				                                 static_cast<unsigned>(seed));
+
+				double lambda = alpha / mean_dur;
+				int n_warmup = 0;
+				int n_measured = 0;
+				for (const auto &e : events) {
+					if (e.arrival_time < config.warmup_sec) {
+						n_warmup++;
+					} else {
+						n_measured++;
+					}
+				}
 
 				log("  Running: scheduler=" + sched + " alpha=" + std::to_string(alpha) +
 				    " seed=" + std::to_string(seed) +
-				    " (" + std::to_string(total_queries) + " queries, " +
-				    std::to_string(config.warmup_queries) + " warmup)");
+				    " (" + std::to_string(events.size()) + " queries, " +
+				    std::to_string(n_warmup) + " warmup, " +
+				    std::to_string(n_measured) + " measured)");
+				printf("    lambda=%.2f queries/sec, expected inter-arrival=%.4fs\n",
+				       lambda, 1.0 / lambda);
+				printf("    expected duration=%.0fs (warmup %.0fs + measurement %.0fs)\n",
+				       config.duration_sec, config.warmup_sec,
+				       config.duration_sec - config.warmup_sec);
 
-				auto events = generate_workload(alpha, mean_dur, total_queries, static_cast<unsigned>(seed));
-
-				double lambda = alpha / mean_dur;
-				printf("    lambda=%.2f queries/sec, expected inter-arrival=%.4fs\n", lambda, 1.0 / lambda);
-
+				int total_queries = 0;
 				auto t0 = Clock::now();
-				auto measurements = run_experiment(db, sched, alpha, seed, events, iso_map, config.warmup_queries);
+				auto measurements = run_experiment(db, sched, alpha, seed, events, iso_map,
+				                                    config.warmup_sec, total_queries);
 				auto t1 = Clock::now();
 				double total_wall = Duration(t1 - t0).count();
 
-				auto summary = compute_summary(measurements, sched, alpha, seed, total_wall);
+				auto summary = compute_summary(measurements, sched, alpha, seed,
+				                                total_wall, total_queries);
 				all_summaries.push_back(summary);
 
-				printf("    Result: mean_slowdown=%.3f p50=%.3f p95=%.3f p99=%.3f throughput=%.2f qps wall=%.1fs\n",
-				       summary.mean_relative_slowdown, summary.p50_slowdown,
-				       summary.p95_slowdown, summary.p99_slowdown,
-				       summary.throughput_qps, summary.total_wall_sec);
+				printf("    Result: mean_slowdown=%.3f geomean_lat=%.1fms "
+				       "p50=%.3f p95=%.3f p99=%.3f throughput=%.2f qps "
+				       "measured=%d total=%d wall=%.1fs\n",
+				       summary.mean_relative_slowdown, summary.geomean_latency_ms,
+				       summary.p50_slowdown, summary.p95_slowdown, summary.p99_slowdown,
+				       summary.throughput_qps, summary.n_queries, summary.n_total_queries,
+				       summary.total_wall_sec);
 
 				all_measurements.insert(all_measurements.end(), measurements.begin(), measurements.end());
 			}
@@ -492,13 +552,15 @@ static void write_summary_csv(const std::vector<ExperimentSummary> &data, const 
 	if (!f) {
 		throw std::runtime_error("Cannot open " + path);
 	}
-	fprintf(f, "scheduler_type,alpha,seed,mean_relative_slowdown,p50_slowdown,"
-	           "p95_slowdown,p99_slowdown,throughput_qps,total_wall_sec,n_queries\n");
+	fprintf(f, "scheduler_type,alpha,seed,mean_relative_slowdown,geomean_latency_ms,"
+	           "p50_slowdown,p95_slowdown,p99_slowdown,throughput_qps,"
+	           "total_wall_sec,n_queries,n_total_queries\n");
 	for (const auto &s : data) {
-		fprintf(f, "%s,%.2f,%d,%.6f,%.6f,%.6f,%.6f,%.4f,%.2f,%d\n",
+		fprintf(f, "%s,%.2f,%d,%.6f,%.3f,%.6f,%.6f,%.6f,%.4f,%.2f,%d,%d\n",
 		        s.scheduler_type.c_str(), s.alpha, s.seed,
-		        s.mean_relative_slowdown, s.p50_slowdown, s.p95_slowdown, s.p99_slowdown,
-		        s.throughput_qps, s.total_wall_sec, s.n_queries);
+		        s.mean_relative_slowdown, s.geomean_latency_ms,
+		        s.p50_slowdown, s.p95_slowdown, s.p99_slowdown,
+		        s.throughput_qps, s.total_wall_sec, s.n_queries, s.n_total_queries);
 	}
 	fclose(f);
 }
@@ -509,24 +571,27 @@ static void write_summary_csv(const std::vector<ExperimentSummary> &data, const 
 
 static void print_comparison(const std::vector<ExperimentSummary> &summaries) {
 	log("=== Comparison: STRIDE vs DEFAULT ===");
-	printf("\n%-10s %6s %6s | %-9s %-9s %-9s %-9s | %-9s\n",
-	       "Scheduler", "Alpha", "Seed", "MeanSlowD", "P50", "P95", "P99", "QPS");
-	printf("%-10s %6s %6s | %-9s %-9s %-9s %-9s | %-9s\n",
-	       "----------", "------", "------", "---------", "---------", "---------", "---------", "---------");
+	printf("\n%-10s %6s %6s | %-9s %-10s %-9s %-9s %-9s | %-9s %-6s\n",
+	       "Scheduler", "Alpha", "Seed", "MeanSlowD", "GeomLat ms", "P50", "P95", "P99", "QPS", "NQ");
+	printf("%-10s %6s %6s | %-9s %-10s %-9s %-9s %-9s | %-9s %-6s\n",
+	       "----------", "------", "------", "---------", "----------",
+	       "---------", "---------", "---------", "---------", "------");
 
 	for (const auto &s : summaries) {
-		printf("%-10s %6.2f %6d | %9.3f %9.3f %9.3f %9.3f | %9.2f\n",
+		printf("%-10s %6.2f %6d | %9.3f %10.1f %9.3f %9.3f %9.3f | %9.2f %6d\n",
 		       s.scheduler_type.c_str(), s.alpha, s.seed,
-		       s.mean_relative_slowdown, s.p50_slowdown, s.p95_slowdown, s.p99_slowdown,
-		       s.throughput_qps);
+		       s.mean_relative_slowdown, s.geomean_latency_ms,
+		       s.p50_slowdown, s.p95_slowdown, s.p99_slowdown,
+		       s.throughput_qps, s.n_queries);
 	}
 
 	// Aggregate by (scheduler, alpha)
 	printf("\n=== Aggregated (mean across seeds) ===\n");
-	printf("%-10s %6s | %-9s %-9s %-9s %-9s | %-9s\n",
-	       "Scheduler", "Alpha", "MeanSlowD", "P50", "P95", "P99", "QPS");
-	printf("%-10s %6s | %-9s %-9s %-9s %-9s | %-9s\n",
-	       "----------", "------", "---------", "---------", "---------", "---------", "---------");
+	printf("%-10s %6s | %-9s %-10s %-9s %-9s %-9s | %-9s %-6s\n",
+	       "Scheduler", "Alpha", "MeanSlowD", "GeomLat ms", "P50", "P95", "P99", "QPS", "NQ");
+	printf("%-10s %6s | %-9s %-10s %-9s %-9s %-9s | %-9s %-6s\n",
+	       "----------", "------", "---------", "----------",
+	       "---------", "---------", "---------", "---------", "------");
 
 	std::map<std::pair<std::string, double>, std::vector<const ExperimentSummary *>> groups;
 	for (const auto &s : summaries) {
@@ -534,18 +599,22 @@ static void print_comparison(const std::vector<ExperimentSummary> &summaries) {
 	}
 
 	for (const auto &kv : groups) {
-		double mean_sd = 0, mean_p50 = 0, mean_p95 = 0, mean_p99 = 0, mean_qps = 0;
+		double mean_sd = 0, mean_geom = 0, mean_p50 = 0, mean_p95 = 0, mean_p99 = 0, mean_qps = 0;
+		int total_nq = 0;
 		for (const auto *s : kv.second) {
 			mean_sd += s->mean_relative_slowdown;
+			mean_geom += s->geomean_latency_ms;
 			mean_p50 += s->p50_slowdown;
 			mean_p95 += s->p95_slowdown;
 			mean_p99 += s->p99_slowdown;
 			mean_qps += s->throughput_qps;
+			total_nq += s->n_queries;
 		}
 		double n = static_cast<double>(kv.second.size());
-		printf("%-10s %6.2f | %9.3f %9.3f %9.3f %9.3f | %9.2f\n",
+		printf("%-10s %6.2f | %9.3f %10.1f %9.3f %9.3f %9.3f | %9.2f %6d\n",
 		       kv.first.first.c_str(), kv.first.second,
-		       mean_sd / n, mean_p50 / n, mean_p95 / n, mean_p99 / n, mean_qps / n);
+		       mean_sd / n, mean_geom / n, mean_p50 / n, mean_p95 / n, mean_p99 / n,
+		       mean_qps / n, total_nq / static_cast<int>(n));
 	}
 }
 
@@ -582,10 +651,10 @@ static Config parse_args(int argc, char *argv[]) {
 			while (std::getline(ss, token, ',')) {
 				config.alphas.push_back(std::stod(token));
 			}
-		} else if (arg == "--queries" && i + 1 < argc) {
-			config.queries_per_run = std::stoi(argv[++i]);
+		} else if (arg == "--duration" && i + 1 < argc) {
+			config.duration_sec = std::stod(argv[++i]);
 		} else if (arg == "--warmup" && i + 1 < argc) {
-			config.warmup_queries = std::stoi(argv[++i]);
+			config.warmup_sec = std::stod(argv[++i]);
 		} else if (arg == "--reps" && i + 1 < argc) {
 			config.reps = std::stoi(argv[++i]);
 		} else if (arg == "--threads" && i + 1 < argc) {
@@ -602,8 +671,8 @@ static Config parse_args(int argc, char *argv[]) {
 			printf("  --output DIR          Output directory (default: ./eval_results)\n");
 			printf("  --skip-dbgen          Skip data generation (reuse existing database)\n");
 			printf("  --alpha LIST          Comma-separated alpha values (default: 0.8,0.85,0.9,0.95,1.0)\n");
-			printf("  --queries N           Measured queries per run (default: 200)\n");
-			printf("  --warmup N            Warmup queries per run (default: 30)\n");
+			printf("  --duration SECS       Experiment duration in seconds (default: 300 = 5 min)\n");
+			printf("  --warmup SECS         Warmup duration in seconds (default: 90)\n");
 			printf("  --reps N              Repetitions per config (default: 3)\n");
 			printf("  --threads N           DuckDB thread count (default: system)\n");
 			printf("  --calibration-runs N  Runs per query for isolation time (default: 3)\n");
@@ -653,6 +722,9 @@ static std::vector<IsolationTime> load_isolation_csv(const std::string &path) {
 //===----------------------------------------------------------------------===//
 
 int main(int argc, char *argv[]) {
+	signal(SIGSEGV, crash_handler);
+	signal(SIGABRT, crash_handler);
+
 	Config config = parse_args(argc, argv);
 
 	log("Scheduler Evaluation Client");

@@ -72,14 +72,22 @@ void SchedulerSlotArray::DeregisterQuery(idx_t slot_index) {
 
 	auto &slot = slots[slot_index];
 
-	// Reset the executor's slot index (bidirectional cleanup)
-	Executor *exec = slot.executor.load(std::memory_order_acquire);
-	if (exec) {
-		exec->SetSchedulerSlotIndex(DConstants::INVALID_INDEX);
-	}
+	// Hold the per-slot access_lock while nulling the executor pointer.
+	// This prevents workers from dereferencing a stale pointer (TOCTOU race):
+	// without this lock, a worker could load a non-null Executor* via GetExecutor(),
+	// then we null it and destroy the Executor, and the worker dereferences freed memory.
+	{
+		lock_guard<mutex> access(slot.access_lock);
 
-	// Mark slot as inactive — workers discover lazily via nullptr check
-	slot.executor.store(nullptr, std::memory_order_release);
+		// Reset the executor's slot index (bidirectional cleanup)
+		Executor *exec = slot.executor.load(std::memory_order_acquire);
+		if (exec) {
+			exec->SetSchedulerSlotIndex(DConstants::INVALID_INDEX);
+		}
+
+		// Mark slot as inactive — workers discover lazily via nullptr check
+		slot.executor.store(nullptr, std::memory_order_release);
+	}
 	slot.active_pipeline.store(nullptr, std::memory_order_release);
 
 	active_slots.reset(slot_index);
@@ -152,6 +160,11 @@ Executor *SchedulerSlotArray::GetExecutor(idx_t slot_index) const {
 		return nullptr;
 	}
 	return slots[slot_index].executor.load(std::memory_order_acquire);
+}
+
+mutex &SchedulerSlotArray::GetSlotLock(idx_t slot_index) {
+	D_ASSERT(slot_index < SCHEDULER_MAX_SLOTS);
+	return slots[slot_index].access_lock;
 }
 
 idx_t SchedulerSlotArray::GetActiveSlotCount() const {

@@ -61,6 +61,12 @@ struct SchedulerSlot {
 	//! Written once at registration, read at deregistration.
 	double arrival_time_ms;
 
+	//! Mutex protecting executor pointer lifetime.
+	//! Workers hold this while dereferencing the executor pointer;
+	//! DeregisterQuery holds this while nulling the pointer.
+	//! Prevents use-after-free when a query finishes while a worker is mid-dequeue.
+	mutex access_lock;
+
 	//! Default constructor - slot is empty/unused
 	//! Actual values are set by RegisterQuery()
 	SchedulerSlot()
@@ -179,6 +185,10 @@ public:
 
 	//! Get the executor for a slot (lock-free read).
 	Executor *GetExecutor(idx_t slot_index) const;
+
+	//! Get the access lock for a slot (for protecting executor pointer lifetime).
+	//! Workers hold this while using the executor; DeregisterQuery holds it while nulling.
+	mutex &GetSlotLock(idx_t slot_index);
 
 	//===--------------------------------------------------------------------===//
 	// Self-Tuning: Tracking Window & Data Collection
