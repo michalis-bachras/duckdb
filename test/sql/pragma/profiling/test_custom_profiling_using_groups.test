@@ -83,6 +83,9 @@ SELECT unnest(res) FROM (
 "PHYSICAL_PLANNER_COLUMN_BINDING": "true"
 "PHYSICAL_PLANNER_CREATE_PLAN": "true"
 "PHYSICAL_PLANNER_RESOLVE_TYPES": "true"
+"PIPELINE_CPU_TIME": "true"
+"PIPELINE_LATENCY": "true"
+"PIPELINE_PARALLELISM": "true"
 "PLANNER": "true"
 "PLANNER_BINDING": "true"
 "QUERY_NAME": "true"
@@ -150,6 +153,9 @@ SELECT ALL_OPTIMIZERS,
 	PHYSICAL_PLANNER_COLUMN_BINDING,
 	PHYSICAL_PLANNER_CREATE_PLAN,
 	PHYSICAL_PLANNER_RESOLVE_TYPES,
+	PIPELINE_CPU_TIME,
+	PIPELINE_LATENCY,
+	PIPELINE_PARALLELISM,
 	PLANNER,
 	PLANNER_BINDING,
 	QUERY_NAME,
@@ -616,6 +622,41 @@ SELECT ALL_OPTIMIZERS,
 	PHYSICAL_PLANNER_RESOLVE_TYPES,
 	PLANNER,
 	PLANNER_BINDING
+FROM metrics_output;
+
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '__TEST_DIR__/profiling_output.json';
+
+statement ok
+PRAGMA custom_profiling_settings='{"PIPELINE": "true"}';
+
+statement ok
+SELECT unnest(['Maia', 'Thijs', 'Mark', 'Hannes', 'Tom', 'Max', 'Carlo', 'Sam', 'Tania']) AS names ORDER BY random();
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT unnest(res) FROM (
+    SELECT current_setting('custom_profiling_settings') AS raw_setting,
+    raw_setting.trim('{}') AS setting,
+    string_split(setting, ', ') AS res
+) ORDER BY ALL;
+----
+"PIPELINE_CPU_TIME": "true"
+"PIPELINE_LATENCY": "true"
+"PIPELINE_PARALLELISM": "true"
+
+statement ok
+CREATE OR REPLACE TABLE metrics_output AS SELECT * FROM '__TEST_DIR__/profiling_output.json';
+
+statement ok
+SELECT PIPELINE_CPU_TIME,
+	PIPELINE_LATENCY,
+	PIPELINE_PARALLELISM
 FROM metrics_output;
 
 statement ok

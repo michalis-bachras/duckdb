@@ -1,0 +1,25 @@
+# name: test/sql/parallelism/intraquery/test_pipeline_profiling_parallelism.test
+# description: Test pipeline profiling parallelism output
+# group: [intraquery]
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+PRAGMA threads=4
+
+statement ok
+PRAGMA verify_parallelism
+
+statement ok
+CREATE TABLE integers AS SELECT * FROM range(1000000) tbl(i)
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT SUM(i) FROM integers
+----
+analyzed_plan	<REGEX>:.*"pipelines".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT SUM(i) FROM integers
+----
+analyzed_plan	<REGEX>:.*"parallelism": [2-9].*
