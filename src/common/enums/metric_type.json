@@ -291,6 +291,33 @@
     ]
   },
   {
+    "group": "pipeline",
+    "description": "metrics collected for each execution pipeline",
+    "metrics": [
+      {
+        "name": "PIPELINE_CPU_TIME",
+        "description": "Total CPU time across all tasks in the pipeline",
+        "type": "double",
+        "unit": "seconds",
+        "is_default": false
+      },
+      {
+        "name": "PIPELINE_LATENCY",
+        "description": "Wall-clock time from pipeline schedule to finish",
+        "type": "double",
+        "unit": "seconds",
+        "is_default": false
+      },
+      {
+        "name": "PIPELINE_PARALLELISM",
+        "description": "Number of parallel tasks launched for the pipeline",
+        "type": "uint64",
+        "unit": "absolute",
+        "is_default": false
+      }
+    ]
+  },
+  {
     "group": "optimizer",
     "description": "metrics that are collected for each optimizer",
     "generated": true,

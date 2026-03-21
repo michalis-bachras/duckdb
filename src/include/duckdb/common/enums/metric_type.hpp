@@ -26,6 +26,7 @@ enum class MetricGroup : uint8_t {
 	OPERATOR,
 	OPTIMIZER,
 	PHASE_TIMING,
+	PIPELINE,
 	INVALID,
 };
 
@@ -103,6 +104,10 @@ enum class MetricType : uint8_t {
 	PHYSICAL_PLANNER_RESOLVE_TYPES,
 	PLANNER,
 	PLANNER_BINDING,
+	// Pipeline metrics
+	PIPELINE_CPU_TIME,
+	PIPELINE_LATENCY,
+	PIPELINE_PARALLELISM,
 };
 
 struct MetricTypeHashFunction {
@@ -133,6 +138,9 @@ public:
 
 	static constexpr uint8_t START_PHASE_TIMING = static_cast<uint8_t>(MetricType::ALL_OPTIMIZERS);
 	static constexpr uint8_t END_PHASE_TIMING = static_cast<uint8_t>(MetricType::PLANNER_BINDING);
+
+	static constexpr uint8_t START_PIPELINE = static_cast<uint8_t>(MetricType::PIPELINE_CPU_TIME);
+	static constexpr uint8_t END_PIPELINE = static_cast<uint8_t>(MetricType::PIPELINE_PARALLELISM);
 
 public:
 
@@ -169,6 +177,10 @@ public:
 	// PhaseTiming metrics
 	static profiler_settings_t GetPhaseTimingMetrics();
 	static bool IsPhaseTimingMetric(MetricType type);
+
+	// Pipeline metrics
+	static profiler_settings_t GetPipelineMetrics();
+	static bool IsPipelineMetric(MetricType type);
 
 	// RootScope metrics
 	static profiler_settings_t GetRootScopeMetrics();

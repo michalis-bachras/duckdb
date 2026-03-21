@@ -8,6 +8,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline_complete_event.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
@@ -414,6 +415,14 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		// collect all pipelines from the root pipelines (recursively) for the progress bar and verify them
 		root_pipeline->GetPipelines(pipelines, true);
 
+		// assign pipeline IDs and initialize profiles if pipeline profiling is enabled
+		if (profiler->IsEnabled()) {
+			for (idx_t i = 0; i < pipelines.size(); i++) {
+				pipelines[i]->SetPipelineId(i);
+				pipelines[i]->InitializeProfile();
+			}
+		}
+
 		// finally, verify and schedule
 		VerifyPipelines();
 		ScheduleEvents(to_schedule);
@@ -610,6 +619,10 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 	D_ASSERT(!task);
 
 	lock_guard<mutex> elock(executor_lock);
+	// Collect pipeline profiles before clearing pipelines
+	if (profiler && profiler->IsEnabled()) {
+		profiler->CollectPipelineProfiles(pipelines);
+	}
 	pipelines.clear();
 	NextExecutor();
 	if (HasError()) { // LCOV_EXCL_START

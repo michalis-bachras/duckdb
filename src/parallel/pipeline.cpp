@@ -2,6 +2,7 @@
 
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/printer.hpp"
+#include "duckdb/common/profiler.hpp"
 #include "duckdb/common/tree_renderer/text_tree_renderer.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
@@ -9,6 +10,7 @@
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -37,13 +39,27 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 
 	pipeline_executor->SetTaskForInterrupts(shared_from_this());
 
+	Profiler task_timer;
+	auto *profile = pipeline.GetProfile();
+	if (profile) {
+		task_timer.Start();
+	}
+
 	if (mode == TaskExecutionMode::PROCESS_PARTIAL) {
 		auto res = pipeline_executor->Execute(PARTIAL_CHUNK_COUNT);
 
 		switch (res) {
 		case PipelineExecuteResult::NOT_FINISHED:
+			if (profile) {
+				task_timer.End();
+				profile->AddCPUTime(task_timer.Elapsed());
+			}
 			return TaskExecutionResult::TASK_NOT_FINISHED;
 		case PipelineExecuteResult::INTERRUPTED:
+			if (profile) {
+				task_timer.End();
+				profile->AddCPUTime(task_timer.Elapsed());
+			}
 			return TaskExecutionResult::TASK_BLOCKED;
 		case PipelineExecuteResult::FINISHED:
 			break;
@@ -54,10 +70,19 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		case PipelineExecuteResult::NOT_FINISHED:
 			throw InternalException("Execute without limit should not return NOT_FINISHED");
 		case PipelineExecuteResult::INTERRUPTED:
+			if (profile) {
+				task_timer.End();
+				profile->AddCPUTime(task_timer.Elapsed());
+			}
 			return TaskExecutionResult::TASK_BLOCKED;
 		case PipelineExecuteResult::FINISHED:
 			break;
 		}
+	}
+
+	if (profile) {
+		task_timer.End();
+		profile->AddCPUTime(task_timer.Elapsed());
 	}
 
 	event->FinishTask();
@@ -93,6 +118,9 @@ bool Pipeline::GetProgress(ProgressData &progress) {
 }
 
 void Pipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
+	if (profile) {
+		profile->parallelism = 1;
+	}
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelineTask>(*this, event));
 	event->SetTasks(std::move(tasks));
@@ -181,6 +209,10 @@ bool Pipeline::LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads) {
 	if (max_threads <= 1) {
 		// too small to parallelize
 		return false;
+	}
+
+	if (profile) {
+		profile->parallelism = max_threads;
 	}
 
 	// launch a task for every thread
@@ -326,6 +358,20 @@ idx_t Pipeline::UpdateBatchIndex(idx_t old_index, idx_t new_index) {
 	batch_indexes.insert(new_index);
 	return *batch_indexes.begin();
 }
+void Pipeline::InitializeProfile() {
+	profile = make_uniq<PipelineProfile>();
+	profile->pipeline_id = pipeline_id;
+	if (source) {
+		profile->source_name = source->GetName();
+	}
+	if (sink) {
+		profile->sink_name = sink->GetName();
+	}
+	for (auto &op_ref : operators) {
+		profile->operator_names.push_back(op_ref.get().GetName());
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // Pipeline Build State
 //===--------------------------------------------------------------------===//

@@ -109,6 +109,11 @@ public:
 	//! Returns true if all pipelines have been completed
 	bool ExecutionIsFinished();
 
+	//! Returns the list of pipelines
+	const vector<shared_ptr<Pipeline>> &GetPipelines() const {
+		return pipelines;
+	}
+
 	void RegisterTask() {
 		executor_tasks++;
 	}

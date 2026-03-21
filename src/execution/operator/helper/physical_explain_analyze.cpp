@@ -1,4 +1,5 @@
 #include "duckdb/execution/operator/helper/physical_explain_analyze.hpp"
+#include "duckdb/execution/executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_profiler.hpp"
 
@@ -21,6 +22,9 @@ SinkFinalizeType PhysicalExplainAnalyze::Finalize(Pipeline &pipeline, Event &eve
                                                   OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<ExplainAnalyzeStateGlobalState>();
 	auto &profiler = QueryProfiler::Get(context);
+	// Collect pipeline profiles before rendering (pipelines are still alive during Finalize)
+	auto &executor = Executor::Get(context);
+	profiler.CollectPipelineProfiles(executor.GetPipelines());
 	gstate.analyzed_plan = profiler.ToString(format);
 	return SinkFinalizeType::READY;
 }

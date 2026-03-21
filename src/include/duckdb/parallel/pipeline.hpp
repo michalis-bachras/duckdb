@@ -16,6 +16,7 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/parallel/executor_task.hpp"
+#include "duckdb/parallel/pipeline_profile.hpp"
 
 namespace duckdb {
 
@@ -115,6 +116,17 @@ public:
 		return source;
 	}
 
+	idx_t GetPipelineId() const {
+		return pipeline_id;
+	}
+	void SetPipelineId(idx_t id) {
+		pipeline_id = id;
+	}
+	PipelineProfile *GetProfile() {
+		return profile.get();
+	}
+	void InitializeProfile();
+
 	//! Returns whether any of the operators in the pipeline care about preserving order
 	bool IsOrderDependent() const;
 
@@ -125,6 +137,10 @@ public:
 	idx_t UpdateBatchIndex(idx_t old_index, idx_t new_index);
 
 private:
+	//! The pipeline ID (assigned by the executor)
+	idx_t pipeline_id = DConstants::INVALID_INDEX;
+	//! Pipeline profile (only created when profiling is enabled)
+	unique_ptr<PipelineProfile> profile;
 	//! Whether or not the pipeline has been readied
 	bool ready;
 	//! Whether or not the pipeline has been initialized

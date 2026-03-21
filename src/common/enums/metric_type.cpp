@@ -8,7 +8,7 @@ namespace duckdb {
 
 profiler_settings_t MetricsUtils::GetAllMetrics() {
 	profiler_settings_t result;
-	for (auto metric = START_CORE; metric <= END_PHASE_TIMING; metric++) {
+	for (auto metric = START_CORE; metric <= END_PIPELINE; metric++) {
 		result.insert(static_cast<MetricType>(metric));
 	}
 	return result;
@@ -32,6 +32,8 @@ profiler_settings_t MetricsUtils::GetMetricsByGroupType(MetricGroup type) {
 		return GetOptimizerMetrics();
 	case MetricGroup::PHASE_TIMING:
 		return GetPhaseTimingMetrics();
+	case MetricGroup::PIPELINE:
+		return GetPipelineMetrics();
 	default:
 		throw InternalException("The MetricGroup passed is invalid");
 	}
@@ -199,6 +201,18 @@ profiler_settings_t MetricsUtils::GetPhaseTimingMetrics() {
 
 bool MetricsUtils::IsPhaseTimingMetric(MetricType type) {
 	return static_cast<uint8_t>(type) >= START_PHASE_TIMING && static_cast<uint8_t>(type) <= END_PHASE_TIMING;
+}
+
+profiler_settings_t MetricsUtils::GetPipelineMetrics() {
+	profiler_settings_t result;
+	for (auto metric = START_PIPELINE; metric <= END_PIPELINE; metric++) {
+		result.insert(static_cast<MetricType>(metric));
+	}
+	return result;
+}
+
+bool MetricsUtils::IsPipelineMetric(MetricType type) {
+	return static_cast<uint8_t>(type) >= START_PIPELINE && static_cast<uint8_t>(type) <= END_PIPELINE;
 }
 
 profiler_settings_t MetricsUtils::GetRootScopeMetrics() {

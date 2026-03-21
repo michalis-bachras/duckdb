@@ -26,11 +26,13 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/main/profiling_node.hpp"
 #include "duckdb/main/profiling_utils.hpp"
+#include "duckdb/parallel/pipeline_profile.hpp"
 
 namespace duckdb {
 
 class ClientContext;
 class ExpressionExecutor;
+class Pipeline;
 class ProfilingNode;
 class PhysicalOperator;
 class SQLStatement;
@@ -163,6 +165,9 @@ public:
 
 	DUCKDB_API void Initialize(const PhysicalOperator &root);
 
+	//! Collect pipeline profiles from the executor's pipelines
+	void CollectPipelineProfiles(const vector<shared_ptr<Pipeline>> &pipelines);
+
 	DUCKDB_API string QueryTreeToString() const;
 	DUCKDB_API void QueryTreeToStream(std::ostream &str) const;
 	DUCKDB_API void Print();
@@ -222,6 +227,9 @@ private:
 
 	//! Top level query information.
 	QueryMetrics query_metrics;
+
+	//! Pipeline-level profiling data (collected at query end)
+	vector<unique_ptr<PipelineProfile>> pipeline_profiles;
 
 	//! A map of a Physical Operator pointer to a tree node
 	TreeMap tree_map;

@@ -14,6 +14,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/profiling_utils.hpp"
 #include "duckdb/main/profiling_info.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/storage/buffer/buffer_pool.hpp"
 #include "yyjson.hpp"
 #include "yyjson_utils.hpp"
@@ -206,6 +207,7 @@ void QueryProfiler::EndQuery() {
 			Finalize(*root->GetChild(0));
 		}
 	}
+
 	running = false;
 	bool emit_output = false;
 
@@ -251,6 +253,25 @@ void QueryProfiler::EndQuery() {
 		} else {
 			WriteToFile(save_location.c_str(), tree);
 		}
+	}
+}
+
+void QueryProfiler::CollectPipelineProfiles(const vector<shared_ptr<Pipeline>> &pipelines) {
+	pipeline_profiles.clear();
+	for (auto &pipeline : pipelines) {
+		auto *profile = pipeline->GetProfile();
+		if (!profile) {
+			continue;
+		}
+		auto snapshot = make_uniq<PipelineProfile>();
+		snapshot->pipeline_id = profile->pipeline_id;
+		snapshot->source_name = profile->source_name;
+		snapshot->operator_names = profile->operator_names;
+		snapshot->sink_name = profile->sink_name;
+		snapshot->cpu_time_seconds.store(profile->GetCPUTime());
+		snapshot->latency_seconds = profile->latency_seconds;
+		snapshot->parallelism = profile->parallelism;
+		pipeline_profiles.push_back(std::move(snapshot));
 	}
 }
 
@@ -672,6 +693,37 @@ void QueryProfiler::QueryTreeToStream(std::ostream &ss) const {
 		}
 		Render(*root, ss);
 	}
+
+	// render pipeline execution summary
+	if (!pipeline_profiles.empty()) {
+		ss << "\n";
+		ss << "┌────────────────────────────────────────────────┐\n";
+		ss << "│┌──────────────────────────────────────────────┐│\n";
+		ss << "││" + DrawPadded("Pipeline Execution Summary", TOTAL_BOX_WIDTH - 4) + "││\n";
+		ss << "│└──────────────────────────────────────────────┘│\n";
+		ss << "└────────────────────────────────────────────────┘\n";
+
+		for (auto &profile : pipeline_profiles) {
+			ss << "\nPipeline " << profile->pipeline_id;
+			ss << " (Latency: " << RenderTiming(profile->latency_seconds);
+			ss << ", CPU Time: " << RenderTiming(profile->GetCPUTime());
+			ss << ", Parallelism: " << profile->parallelism << ")\n";
+			ss << "  Source:     " << profile->source_name << "\n";
+			if (profile->operator_names.empty()) {
+				ss << "  Operators:  (none)\n";
+			} else {
+				ss << "  Operators:  ";
+				for (idx_t i = 0; i < profile->operator_names.size(); i++) {
+					if (i > 0) {
+						ss << " -> ";
+					}
+					ss << profile->operator_names[i];
+				}
+				ss << "\n";
+			}
+			ss << "  Sink:       " << profile->sink_name << "\n";
+		}
+	}
 }
 
 Value QueryProfiler::JSONSanitize(const Value &input) {
@@ -797,6 +849,30 @@ string QueryProfiler::ToJSON() const {
 	yyjson_mut_obj_add_val(json_holder.doc, result_obj, "children", children_list);
 	auto child = ToJSONRecursive(json_holder.doc, *root->GetChild(0));
 	yyjson_mut_arr_add_val(children_list, child);
+
+	// add pipeline profiles
+	if (!pipeline_profiles.empty()) {
+		auto pipelines_arr = yyjson_mut_arr(json_holder.doc);
+		for (auto &profile : pipeline_profiles) {
+			auto pipeline_obj = yyjson_mut_obj(json_holder.doc);
+			yyjson_mut_obj_add_uint(json_holder.doc, pipeline_obj, "pipeline_id", profile->pipeline_id);
+			yyjson_mut_obj_add_real(json_holder.doc, pipeline_obj, "latency_seconds", profile->latency_seconds);
+			yyjson_mut_obj_add_real(json_holder.doc, pipeline_obj, "cpu_time_seconds", profile->GetCPUTime());
+			yyjson_mut_obj_add_uint(json_holder.doc, pipeline_obj, "parallelism", profile->parallelism);
+			yyjson_mut_obj_add_strcpy(json_holder.doc, pipeline_obj, "source", profile->source_name.c_str());
+
+			auto ops_arr = yyjson_mut_arr(json_holder.doc);
+			for (auto &op_name : profile->operator_names) {
+				yyjson_mut_arr_add_strcpy(json_holder.doc, ops_arr, op_name.c_str());
+			}
+			yyjson_mut_obj_add_val(json_holder.doc, pipeline_obj, "operators", ops_arr);
+
+			yyjson_mut_obj_add_strcpy(json_holder.doc, pipeline_obj, "sink", profile->sink_name.c_str());
+			yyjson_mut_arr_add_val(pipelines_arr, pipeline_obj);
+		}
+		yyjson_mut_obj_add_val(json_holder.doc, result_obj, "pipelines", pipelines_arr);
+	}
+
 	return StringifyAndFree(json_holder, result_obj);
 }
 

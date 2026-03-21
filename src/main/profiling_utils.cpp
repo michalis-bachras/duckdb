@@ -66,6 +66,8 @@ void ProfilingUtils::SetMetricToDefault(profiler_metrics_t &metrics, const Metri
 	case MetricType::PHYSICAL_PLANNER_COLUMN_BINDING:
 	case MetricType::PHYSICAL_PLANNER_CREATE_PLAN:
 	case MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES:
+	case MetricType::PIPELINE_CPU_TIME:
+	case MetricType::PIPELINE_LATENCY:
 	case MetricType::PLANNER:
 	case MetricType::PLANNER_BINDING:
 	case MetricType::WAITING_TO_ATTACH_LATENCY:
@@ -76,6 +78,7 @@ void ProfilingUtils::SetMetricToDefault(profiler_metrics_t &metrics, const Metri
 	case MetricType::CUMULATIVE_ROWS_SCANNED:
 	case MetricType::OPERATOR_CARDINALITY:
 	case MetricType::OPERATOR_ROWS_SCANNED:
+	case MetricType::PIPELINE_PARALLELISM:
 	case MetricType::RESULT_SET_SIZE:
 	case MetricType::ROWS_RETURNED:
 	case MetricType::SYSTEM_PEAK_BUFFER_MEMORY:
@@ -117,6 +120,8 @@ void ProfilingUtils::MetricToJson(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyj
 	case MetricType::PHYSICAL_PLANNER_COLUMN_BINDING:
 	case MetricType::PHYSICAL_PLANNER_CREATE_PLAN:
 	case MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES:
+	case MetricType::PIPELINE_CPU_TIME:
+	case MetricType::PIPELINE_LATENCY:
 	case MetricType::PLANNER:
 	case MetricType::PLANNER_BINDING:
 	case MetricType::WAITING_TO_ATTACH_LATENCY:
@@ -127,6 +132,7 @@ void ProfilingUtils::MetricToJson(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyj
 	case MetricType::CUMULATIVE_ROWS_SCANNED:
 	case MetricType::OPERATOR_CARDINALITY:
 	case MetricType::OPERATOR_ROWS_SCANNED:
+	case MetricType::PIPELINE_PARALLELISM:
 	case MetricType::RESULT_SET_SIZE:
 	case MetricType::ROWS_RETURNED:
 	case MetricType::SYSTEM_PEAK_BUFFER_MEMORY:

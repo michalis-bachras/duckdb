@@ -10,6 +10,10 @@ void PipelineEvent::Schedule() {
 	auto event = shared_from_this();
 	auto &executor = pipeline->executor;
 	try {
+		auto *profile = pipeline->GetProfile();
+		if (profile) {
+			profile->MarkScheduleStart();
+		}
 		pipeline->Schedule(event);
 		D_ASSERT(total_tasks > 0);
 	} catch (std::exception &ex) {
@@ -20,6 +24,10 @@ void PipelineEvent::Schedule() {
 }
 
 void PipelineEvent::FinishEvent() {
+	auto *profile = pipeline->GetProfile();
+	if (profile) {
+		profile->MarkFinished();
+	}
 }
 
 } // namespace duckdb
