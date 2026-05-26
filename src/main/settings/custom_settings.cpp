@@ -347,9 +347,29 @@ bool IsEnabledOptimizer(MetricType metric, const set<OptimizerType> &disabled_op
 	       disabled_optimizers.find(matching_optimizer_type) == disabled_optimizers.end();
 }
 
+static bool TryEnablePipelineProfilingSetting(ClientConfig &config, const string &setting) {
+	if (setting == "PIPELINE_INFO") {
+		config.pipeline_profiling.pipeline_info = true;
+		return true;
+	}
+	if (setting == "PIPELINE_DVFS_METRICS") {
+		config.pipeline_profiling.dvfs_metrics = true;
+		return true;
+	}
+	if (setting == "PIPELINE_TASK_TRACE") {
+		config.pipeline_profiling.task_trace = true;
+		return true;
+	}
+	if (setting == "PIPELINE_PER_CPU") {
+		config.pipeline_profiling.per_cpu = true;
+		return true;
+	}
+	return false;
+}
+
 template <typename ExtractFromType>
 static profiler_settings_t ExtractSettings(ExtractFromType extract_from, const set<OptimizerType> &disabled_optimizers,
-                                           vector<std::string> &invalid_settings) {
+                                           ClientConfig &config, vector<std::string> &invalid_settings) {
 	profiler_settings_t enabled_metrics;
 
 	auto insert_if_enabled = [&](MetricType m) {
@@ -360,6 +380,9 @@ static profiler_settings_t ExtractSettings(ExtractFromType extract_from, const s
 
 	extract_from([&](const std::string &metric) {
 		const auto upper = StringUtil::Upper(metric);
+		if (TryEnablePipelineProfilingSetting(config, upper)) {
+			return;
+		}
 		try {
 			insert_if_enabled(EnumUtil::FromString<MetricType>(upper));
 		} catch (std::exception &) {
@@ -397,7 +420,7 @@ void ExtractFromList(ClientConfig &config, profiler_settings_t &enabled_metrics,
 			    func(val.GetValue<string>());
 		    }
 	    },
-	    disabled_optimizers, invalid_settings);
+	    disabled_optimizers, config, invalid_settings);
 }
 
 void ExtractFromStruct(ClientConfig &config, profiler_settings_t &enabled_metrics, vector<string> &invalid_settings,
@@ -415,7 +438,7 @@ void ExtractFromStruct(ClientConfig &config, profiler_settings_t &enabled_metric
 			    }
 		    }
 	    },
-	    disabled_optimizers, invalid_settings);
+	    disabled_optimizers, config, invalid_settings);
 }
 
 void ExtractFromJSON(ClientConfig &config, profiler_settings_t &enabled_metrics, vector<string> &invalid_settings,
@@ -440,7 +463,7 @@ void ExtractFromJSON(ClientConfig &config, profiler_settings_t &enabled_metrics,
 			    }
 		    }
 	    },
-	    disabled_optimizers, invalid_settings);
+	    disabled_optimizers, config, invalid_settings);
 }
 
 void ConstructInvalidSettingsAndThrow(const vector<string> &invalid_settings) {
@@ -462,6 +485,7 @@ void CustomProfilingSettingsSetting::SetLocal(ClientContext &context, const Valu
 
 	vector<string> invalid_settings;
 	profiler_settings_t enabled_metrics;
+	config.pipeline_profiling = PipelineProfilingSettings();
 	if (input.type() == LogicalType::LIST(LogicalType::VARCHAR)) {
 		ExtractFromList(config, enabled_metrics, invalid_settings, input, disabled_optimizers);
 	} else if (input.type().id() == LogicalTypeId::STRUCT) {
@@ -487,6 +511,7 @@ void CustomProfilingSettingsSetting::ResetLocal(ClientContext &context) {
 	config.enable_profiler = ClientConfig().enable_profiler;
 	config.profiler_settings = MetricsUtils::GetDefaultMetrics();
 	config.profiler_settings_type = LogicalTypeId::VARCHAR;
+	config.pipeline_profiling = ClientConfig().pipeline_profiling;
 }
 
 Value CustomProfilingSettingsSetting::GetSetting(const ClientContext &context) {
@@ -495,6 +520,18 @@ Value CustomProfilingSettingsSetting::GetSetting(const ClientContext &context) {
 	set<string> enabled_settings;
 	for (auto &entry : config.profiler_settings) {
 		enabled_settings.insert(EnumUtil::ToString(entry));
+	}
+	if (config.pipeline_profiling.pipeline_info) {
+		enabled_settings.insert("PIPELINE_INFO");
+	}
+	if (config.pipeline_profiling.dvfs_metrics) {
+		enabled_settings.insert("PIPELINE_DVFS_METRICS");
+	}
+	if (config.pipeline_profiling.task_trace) {
+		enabled_settings.insert("PIPELINE_TASK_TRACE");
+	}
+	if (config.pipeline_profiling.per_cpu) {
+		enabled_settings.insert("PIPELINE_PER_CPU");
 	}
 
 	switch (config.profiler_settings_type) {
@@ -1059,6 +1096,7 @@ void EnableProfilingSetting::ResetLocal(ClientContext &context) {
 	config.enable_profiler = ClientConfig().enable_profiler;
 	config.emit_profiler_output = ClientConfig().emit_profiler_output;
 	config.profiler_settings = ClientConfig().profiler_settings;
+	config.pipeline_profiling = ClientConfig().pipeline_profiling;
 }
 
 Value EnableProfilingSetting::GetSetting(const ClientContext &context) {
@@ -1455,6 +1493,7 @@ void ProfilingModeSetting::ResetLocal(ClientContext &context) {
 	ClientConfig::GetConfig(context).enable_detailed_profiling = ClientConfig().enable_detailed_profiling;
 	ClientConfig::GetConfig(context).emit_profiler_output = ClientConfig().emit_profiler_output;
 	ClientConfig::GetConfig(context).profiler_settings = ClientConfig().profiler_settings;
+	ClientConfig::GetConfig(context).pipeline_profiling = ClientConfig().pipeline_profiling;
 }
 
 Value ProfilingModeSetting::GetSetting(const ClientContext &context) {

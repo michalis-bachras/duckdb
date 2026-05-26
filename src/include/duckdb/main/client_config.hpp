@@ -28,6 +28,21 @@ class PreparedStatementData;
 typedef std::function<unique_ptr<PhysicalOperator>(ClientContext &context, PreparedStatementData &data)>
     get_result_collector_t;
 
+struct PipelineProfilingSettings {
+	bool pipeline_info = false;
+	bool dvfs_metrics = false;
+	bool task_trace = false;
+	bool per_cpu = false;
+
+	bool IsAnyEnabled() const {
+		return pipeline_info || dvfs_metrics || task_trace;
+	}
+
+	bool EmitPipelineInfo() const {
+		return pipeline_info || dvfs_metrics || task_trace;
+	}
+};
+
 struct ClientConfig {
 	//! If the query profiler is enabled or not.
 	bool enable_profiler = false;
@@ -43,6 +58,8 @@ struct ClientConfig {
 	profiler_settings_t profiler_settings = MetricsUtils::GetDefaultMetrics();
 	//! The input format type of the profiler settings
 	LogicalTypeId profiler_settings_type = LogicalTypeId::VARCHAR;
+	//! Optional pipeline-level profiling extensions controlled by custom_profiling_settings.
+	PipelineProfilingSettings pipeline_profiling;
 
 	//! Allows suppressing profiler output, even if enabled. We turn on the profiler on all test runs but don't want
 	//! to output anything
