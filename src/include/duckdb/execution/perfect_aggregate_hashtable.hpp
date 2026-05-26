@@ -30,6 +30,14 @@ public:
 	//! Scan the HT starting from the scan_position
 	void Scan(idx_t &scan_position, DataChunk &result);
 
+	idx_t Count() const {
+		return count;
+	}
+
+	idx_t Capacity() const {
+		return total_groups;
+	}
+
 protected:
 	Vector addresses;
 	//! The required bits per group
@@ -38,6 +46,8 @@ protected:
 	idx_t total_required_bits;
 	//! The total amount of groups
 	idx_t total_groups;
+	//! The number of occupied groups
+	idx_t count;
 	//! The tuple size
 	idx_t tuple_size;
 	//! The number of grouping columns

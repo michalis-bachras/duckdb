@@ -561,6 +561,17 @@ public:
 		return MaxValue<idx_t>(sink.heap.heap.size() / TUPLES_PER_BATCH, 1);
 	}
 
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		volume.kind = "top_n_heap_rows";
+		volume.confidence = "exact";
+		volume.rows = sink.heap.heap.size();
+		volume.chunks_equiv = volume.rows == 0 ? 0 : (volume.rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+		volume.native_units = volume.chunks_equiv;
+		volume.native_unit = "standard_chunk";
+		return volume;
+	}
+
 public:
 	static constexpr idx_t CHUNKS_PER_BATCH = 60;
 	static constexpr idx_t TUPLES_PER_BATCH = CHUNKS_PER_BATCH * STANDARD_VECTOR_SIZE;

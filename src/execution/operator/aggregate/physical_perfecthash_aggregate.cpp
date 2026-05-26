@@ -177,15 +177,29 @@ SinkCombineResultType PhysicalPerfectHashAggregate::Combine(ExecutionContext &co
 //===--------------------------------------------------------------------===//
 class PerfectHashAggregateState : public GlobalSourceState {
 public:
-	PerfectHashAggregateState() : ht_scan_position(0) {
+	explicit PerfectHashAggregateState(const PhysicalPerfectHashAggregate &op_p) : op(op_p), ht_scan_position(0) {
 	}
 
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		auto &gstate = op.sink_state->Cast<PerfectHashAggregateGlobalState>();
+		volume.kind = "perfect_hash_groups";
+		volume.confidence = "exact";
+		volume.rows = gstate.ht->Count();
+		volume.chunks_equiv =
+		    volume.rows == 0 ? 0 : (volume.rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+		volume.native_units = gstate.ht->Capacity();
+		volume.native_unit = "perfect_hash_slot";
+		return volume;
+	}
+
+	const PhysicalPerfectHashAggregate &op;
 	//! The current position to scan the HT for output tuples
 	idx_t ht_scan_position;
 };
 
 unique_ptr<GlobalSourceState> PhysicalPerfectHashAggregate::GetGlobalSourceState(ClientContext &context) const {
-	return make_uniq<PerfectHashAggregateState>();
+	return make_uniq<PerfectHashAggregateState>(*this);
 }
 
 SourceResultType PhysicalPerfectHashAggregate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,

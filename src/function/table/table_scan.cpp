@@ -34,6 +34,10 @@
 
 namespace duckdb {
 
+static idx_t RowsToStandardChunks(idx_t rows) {
+	return rows == 0 ? 0 : (rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+}
+
 struct TableScanLocalState : public LocalTableFunctionState {
 	//! The current position in the scan.
 	TableScanState scan_state;
@@ -89,6 +93,7 @@ public:
 	idx_t MaxThreads() const override {
 		return max_threads;
 	}
+
 	bool CanRemoveFilterColumns() const {
 		return !projection_ids.empty();
 	}
@@ -253,6 +258,17 @@ public:
 		auto &l_state = state.Cast<IndexScanLocalState>();
 		return l_state.rows_scanned;
 	}
+
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		volume.kind = "index_scan_row_ids";
+		volume.confidence = "exact";
+		volume.rows = row_id_count;
+		volume.chunks_equiv = RowsToStandardChunks(row_id_count);
+		volume.native_units = volume.chunks_equiv;
+		volume.native_unit = "standard_chunk";
+		return volume;
+	}
 };
 
 class DuckTableScanState : public TableScanGlobalState {
@@ -374,6 +390,17 @@ public:
 	idx_t TableScanRowsScanned(LocalTableFunctionState &state) override {
 		auto &l_state = state.Cast<TableScanLocalState>();
 		return l_state.rows_scanned;
+	}
+
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		volume.kind = "table_rows_upper_bound";
+		volume.confidence = "upper_bound";
+		volume.rows = total_rows;
+		volume.chunks_equiv = RowsToStandardChunks(total_rows);
+		volume.native_units = max_threads;
+		volume.native_unit = "row_group_scan_task_bound";
+		return volume;
 	}
 };
 

@@ -689,6 +689,24 @@ idx_t RadixPartitionedHashTable::MaxThreads(GlobalSinkState &sink_p) const {
 	return MinValue<idx_t>(partitions_fit, max_threads);
 }
 
+SourceInputVolume RadixPartitionedHashTable::GetSourceInputVolume(GlobalSinkState &sink_p) const {
+	auto &sink = sink_p.Cast<RadixHTGlobalSinkState>();
+	SourceInputVolume volume;
+	volume.kind = "hash_aggregate_groups";
+	volume.confidence = "exact";
+	volume.native_unit = "aggregate_partition";
+	volume.native_units = sink.partitions.size();
+
+	for (auto &partition : sink.partitions) {
+		if (!partition || !partition->data) {
+			continue;
+		}
+		volume.rows += partition->data->Count();
+		volume.chunks_equiv += partition->data->ChunkCount();
+	}
+	return volume;
+}
+
 void RadixPartitionedHashTable::SetMultiScan(GlobalSinkState &sink_p) {
 	auto &sink = sink_p.Cast<RadixHTGlobalSinkState>();
 	sink.scan_pin_properties = TupleDataPinProperties::UNPIN_AFTER_DONE;

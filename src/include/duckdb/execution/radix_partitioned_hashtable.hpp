@@ -59,6 +59,7 @@ public:
 	shared_ptr<TupleDataLayout> GetLayoutPtr() const;
 	const TupleDataLayout &GetLayout() const;
 	idx_t MaxThreads(GlobalSinkState &sink) const;
+	SourceInputVolume GetSourceInputVolume(GlobalSinkState &sink) const;
 	static void SetMultiScan(GlobalSinkState &sink);
 
 private:

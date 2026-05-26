@@ -25,7 +25,8 @@ PhysicalColumnDataScan::PhysicalColumnDataScan(PhysicalPlan &physical_plan, vect
 class PhysicalColumnDataGlobalScanState : public GlobalSourceState {
 public:
 	explicit PhysicalColumnDataGlobalScanState(const ColumnDataCollection &collection)
-	    : max_threads(MaxValue<idx_t>(collection.ChunkCount(), 1)) {
+	    : row_count(collection.Count()), chunk_count(collection.ChunkCount()),
+	      max_threads(MaxValue<idx_t>(chunk_count, 1)) {
 		collection.InitializeScan(global_scan_state);
 	}
 
@@ -33,9 +34,22 @@ public:
 		return max_threads;
 	}
 
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		volume.kind = "column_data_rows";
+		volume.confidence = "exact";
+		volume.rows = row_count;
+		volume.chunks_equiv = chunk_count;
+		volume.native_units = chunk_count;
+		volume.native_unit = "column_data_chunk";
+		return volume;
+	}
+
 public:
 	ColumnDataParallelScanState global_scan_state;
 
+	const idx_t row_count;
+	const idx_t chunk_count;
 	const idx_t max_threads;
 };
 

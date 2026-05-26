@@ -89,6 +89,18 @@ public:
 		return state->MaxThreads();
 	}
 
+	SourceInputVolume GetSourceInputVolume() const override {
+		auto volume = state->GetSourceInputVolume();
+		if (volume.kind != "unknown") {
+			return volume;
+		}
+		volume.kind = "sort_source_units";
+		volume.confidence = "estimate";
+		volume.native_units = state->MaxThreads();
+		volume.native_unit = "sort_source_task_bound";
+		return volume;
+	}
+
 public:
 	Sort &sort;
 	unique_ptr<GlobalSourceState> state;

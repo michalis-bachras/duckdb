@@ -29,6 +29,10 @@
 
 namespace duckdb {
 
+static idx_t HashJoinRowsToStandardChunks(idx_t rows) {
+	return rows == 0 ? 0 : (rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+}
+
 PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left,
                                    PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
                                    const vector<idx_t> &left_projection_map, const vector<idx_t> &right_projection_map,
@@ -1156,6 +1160,35 @@ public:
 			return 0;
 		}
 		return count / ((idx_t)STANDARD_VECTOR_SIZE * parallel_scan_chunk_count);
+	}
+
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		D_ASSERT(op.sink_state);
+		auto &gstate = op.sink_state->Cast<HashJoinGlobalSinkState>();
+		if (!gstate.probe_spill && PropagatesBuildSide(op.join_type)) {
+			auto &data_collection = gstate.hash_table->GetDataCollection();
+			volume.kind = "hash_join_build_rows";
+			volume.confidence = "exact";
+			volume.rows = gstate.hash_table->Count();
+			volume.chunks_equiv = data_collection.ChunkCount();
+			volume.native_units = volume.chunks_equiv;
+			volume.native_unit = "hash_table_chunk";
+			return volume;
+		}
+		if (gstate.probe_spill) {
+			volume.kind = "hash_join_probe_rows";
+			volume.confidence = "estimate";
+			volume.rows = probe_count;
+			volume.chunks_equiv = HashJoinRowsToStandardChunks(probe_count);
+			volume.native_units = volume.chunks_equiv;
+			volume.native_unit = "standard_chunk";
+			return volume;
+		}
+		volume.kind = "hash_join_no_source_scan";
+		volume.confidence = "exact";
+		volume.native_unit = "none";
+		return volume;
 	}
 
 public:

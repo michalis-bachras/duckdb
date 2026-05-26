@@ -27,6 +27,15 @@ class PipelineBuildState;
 class MetaPipeline;
 class InterruptState;
 
+struct SourceInputVolume {
+	string kind = "unknown";
+	string confidence = "unknown";
+	idx_t rows = 0;
+	idx_t chunks_equiv = 0;
+	idx_t native_units = 0;
+	string native_unit;
+};
+
 // LCOV_EXCL_START
 class OperatorState {
 public:
@@ -121,6 +130,10 @@ public:
 
 	virtual idx_t MaxThreads() {
 		return 1;
+	}
+
+	virtual SourceInputVolume GetSourceInputVolume() const {
+		return SourceInputVolume();
 	}
 
 	template <class TARGET>

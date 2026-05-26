@@ -834,6 +834,27 @@ public:
 		}
 		return MaxValue<idx_t>(1, threads);
 	}
+
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		volume.kind = "hash_aggregate_groups";
+		volume.confidence = "exact";
+		volume.native_unit = "aggregate_partition";
+		if (op.groupings.empty()) {
+			return volume;
+		}
+
+		auto &ht_state = op.sink_state->Cast<HashAggregateGlobalSinkState>();
+		for (size_t sidx = 0; sidx < op.groupings.size(); ++sidx) {
+			auto &grouping = op.groupings[sidx];
+			auto &grouping_gstate = ht_state.grouping_states[sidx];
+			auto grouping_volume = grouping.table_data.GetSourceInputVolume(*grouping_gstate.table_state);
+			volume.rows += grouping_volume.rows;
+			volume.chunks_equiv += grouping_volume.chunks_equiv;
+			volume.native_units += grouping_volume.native_units;
+		}
+		return volume;
+	}
 };
 
 unique_ptr<GlobalSourceState> PhysicalHashAggregate::GetGlobalSourceState(ClientContext &context) const {

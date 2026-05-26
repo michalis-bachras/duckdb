@@ -67,6 +67,10 @@ public:
 		return 1;
 	}
 
+	virtual SourceInputVolume GetSourceInputVolume() const {
+		return SourceInputVolume();
+	}
+
 	template <class TARGET>
 	TARGET &Cast() {
 		DynamicCastCheck<TARGET>(this);

@@ -76,6 +76,13 @@ public:
 	idx_t MaxThreads() override {
 		return max_threads;
 	}
+
+	SourceInputVolume GetSourceInputVolume() const override {
+		if (global_state) {
+			return global_state->GetSourceInputVolume();
+		}
+		return SourceInputVolume();
+	}
 };
 
 class TableScanLocalSourceState : public LocalSourceState {
