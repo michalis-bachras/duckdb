@@ -18,6 +18,8 @@
 #include "yyjson.hpp"
 #include "yyjson_utils.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <utility>
 
 using namespace duckdb_yyjson; // NOLINT
@@ -25,8 +27,8 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 
 QueryProfiler::QueryProfiler(ClientContext &context_p)
-    : context(context_p), running(false), query_requires_profiling(false), is_explain_analyze(false),
-      metrics_finalized(false) {
+    : context(context_p), running(false), query_requires_profiling(false), next_pipeline_profile_id(1),
+      next_pipeline_task_profile_id(1), is_explain_analyze(false), metrics_finalized(false) {
 }
 
 bool QueryProfiler::IsEnabled() const {
@@ -102,13 +104,209 @@ void QueryProfiler::Start(const string &query) {
 }
 
 void QueryProfiler::Reset() {
+	pipeline_dvfs_profiler.Reset();
 	tree_map.clear();
+	pipeline_profiles.clear();
+	pipeline_task_profiles.clear();
+	pipeline_profile_index.clear();
+	pipeline_task_profile_index.clear();
+	next_pipeline_profile_id = 1;
+	next_pipeline_task_profile_id = 1;
 	root = nullptr;
 	phase_timings.clear();
 	phase_stack.clear();
 	running = false;
 	query_metrics.Reset();
 	metrics_finalized = false;
+}
+
+PipelineProfilingInfo *QueryProfiler::GetPipelineProfile(idx_t pipeline_id) {
+	auto entry = pipeline_profile_index.find(pipeline_id);
+	if (entry == pipeline_profile_index.end()) {
+		return nullptr;
+	}
+	return &pipeline_profiles[entry->second];
+}
+
+static void AppendPipelineOperatorType(string &sequence, const string &operator_type) {
+	if (!sequence.empty()) {
+		sequence += ">";
+	}
+	sequence += operator_type;
+}
+
+static string EstimatedTaskInputRowsBucket(double rows) {
+	if (!std::isfinite(rows) || rows <= 0) {
+		return "unknown";
+	}
+	if (rows < 1) {
+		return "<1";
+	}
+	auto exponent = LossyNumericCast<int>(std::floor(std::log10(rows)));
+	return StringUtil::Format("1e%d-1e%d", exponent, exponent + 1);
+}
+
+static SourceInputVolume ApplySourceInputVolumeFallback(const PipelineProfilingInfo &profile,
+                                                        SourceInputVolume volume) {
+	if (volume.kind != "unknown" || profile.source_type != "UNGROUPED_AGGREGATE") {
+		return volume;
+	}
+	volume.kind = "single_aggregate_row";
+	volume.confidence = "exact";
+	volume.rows = 1;
+	volume.chunks_equiv = 1;
+	volume.native_units = 1;
+	volume.native_unit = "row";
+	return volume;
+}
+
+idx_t QueryProfiler::RegisterPipelineProfile(const PhysicalOperator &source,
+                                             const vector<reference<PhysicalOperator>> &operators,
+                                             optional_ptr<PhysicalOperator> sink) {
+	lock_guard<std::mutex> guard(lock);
+	if (!running || !IsEnabled()) {
+		return 0;
+	}
+	auto &pipeline_settings = ClientConfig::GetConfig(context).pipeline_profiling;
+	if (!pipeline_settings.IsAnyEnabled()) {
+		return 0;
+	}
+	pipeline_dvfs_profiler.Initialize(pipeline_settings);
+
+	PipelineProfilingInfo profile;
+	profile.pipeline_id = next_pipeline_profile_id++;
+	profile.estimated_task_input_rows_bucket = "unknown";
+	profile.source_name = source.GetName();
+	profile.source_type = EnumUtil::ToString(source.type);
+	profile.source_estimated_cardinality = source.estimated_cardinality;
+	profile.operator_count = 1;
+	AppendPipelineOperatorType(profile.operator_type_sequence, profile.source_type);
+	for (auto &op_ref : operators) {
+		auto &op = op_ref.get();
+		profile.operator_names.push_back(op.GetName());
+		profile.operator_types.push_back(EnumUtil::ToString(op.type));
+		profile.operator_estimated_cardinalities.push_back(op.estimated_cardinality);
+		profile.operator_count++;
+		AppendPipelineOperatorType(profile.operator_type_sequence, profile.operator_types.back());
+	}
+	if (sink) {
+		profile.sink_name = sink->GetName();
+		profile.sink_type = EnumUtil::ToString(sink->type);
+		profile.sink_estimated_cardinality = sink->estimated_cardinality;
+		profile.operator_count++;
+		AppendPipelineOperatorType(profile.operator_type_sequence, profile.sink_type);
+	}
+	pipeline_profiles.push_back(std::move(profile));
+	pipeline_profile_index[pipeline_profiles.back().pipeline_id] = pipeline_profiles.size() - 1;
+	return pipeline_profiles.back().pipeline_id;
+}
+
+void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_count, idx_t source_max_threads,
+                                               const SourceInputVolume &source_input_volume) {
+	if (!pipeline_id) {
+		return;
+	}
+	lock_guard<std::mutex> guard(lock);
+	auto profile = GetPipelineProfile(pipeline_id);
+	if (!profile) {
+		return;
+	}
+	if (!profile->start_ns) {
+		profile->dvfs_metrics_enabled = pipeline_dvfs_profiler.MetricsEnabled();
+		profile->source_max_threads = source_max_threads;
+		auto planned_volume = ApplySourceInputVolumeFallback(*profile, source_input_volume);
+		profile->source_input_kind = planned_volume.kind;
+		profile->source_input_confidence = planned_volume.confidence;
+		profile->planned_input_rows = planned_volume.rows;
+		profile->planned_input_chunks_equiv = planned_volume.chunks_equiv;
+		profile->planned_input_native_units = planned_volume.native_units;
+		profile->planned_input_native_unit = planned_volume.native_unit;
+		if (task_count > 0) {
+			profile->estimated_task_input_rows =
+			    static_cast<double>(profile->source_estimated_cardinality) / static_cast<double>(task_count);
+			profile->estimated_task_input_rows_bucket =
+			    EstimatedTaskInputRowsBucket(profile->estimated_task_input_rows);
+			if (profile->planned_input_chunks_equiv > 0) {
+				profile->planned_task_input_chunks_equiv =
+				    static_cast<double>(profile->planned_input_chunks_equiv) / static_cast<double>(task_count);
+				profile->planned_task_input_chunks_bucket =
+				    EstimatedTaskInputRowsBucket(profile->planned_task_input_chunks_equiv);
+			} else if (profile->source_input_kind == "hash_join_no_source_scan") {
+				profile->planned_task_input_chunks_bucket = "no_source_scan";
+			}
+		}
+		auto measurement_begin_ns = PipelineDVFSProfiler::TimestampNs();
+		if (profile->dvfs_metrics_enabled) {
+			pipeline_dvfs_profiler.Start(*profile);
+		}
+		profile->start_ns = PipelineDVFSProfiler::TimestampNs();
+		profile->measurement_start_overhead_ns = profile->start_ns - measurement_begin_ns;
+	}
+	profile->schedule_count++;
+	profile->task_count += task_count;
+}
+
+void QueryProfiler::RecordPipelineProfileTasksDone(idx_t pipeline_id) {
+	if (!pipeline_id) {
+		return;
+	}
+	lock_guard<std::mutex> guard(lock);
+	auto profile = GetPipelineProfile(pipeline_id);
+	if (!profile) {
+		return;
+	}
+	profile->tasks_done_ns = PipelineDVFSProfiler::TimestampNs();
+	if (profile->dvfs_metrics_enabled && !profile->dvfs_measurement_stopped) {
+		auto measurement_begin_ns = profile->tasks_done_ns;
+		pipeline_dvfs_profiler.Stop(*profile);
+		profile->measurement_end_overhead_ns = PipelineDVFSProfiler::TimestampNs() - measurement_begin_ns;
+		profile->dvfs_measurement_stopped = true;
+	}
+}
+
+void QueryProfiler::RecordPipelineProfileFinishDone(idx_t pipeline_id) {
+	if (!pipeline_id) {
+		return;
+	}
+	lock_guard<std::mutex> guard(lock);
+	auto profile = GetPipelineProfile(pipeline_id);
+	if (!profile) {
+		return;
+	}
+	profile->finish_done_ns = PipelineDVFSProfiler::TimestampNs();
+}
+
+idx_t QueryProfiler::RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu) {
+	if (!pipeline_id || !pipeline_dvfs_profiler.TaskTraceEnabled()) {
+		return 0;
+	}
+	lock_guard<std::mutex> guard(lock);
+	if (!running || !IsEnabled() || !GetPipelineProfile(pipeline_id)) {
+		return 0;
+	}
+	PipelineTaskProfilingInfo task_profile;
+	task_profile.task_id = next_pipeline_task_profile_id++;
+	task_profile.pipeline_id = pipeline_id;
+	task_profile.thread_id = thread_id;
+	task_profile.start_cpu = start_cpu;
+	task_profile.start_ns = PipelineDVFSProfiler::TimestampNs();
+	pipeline_task_profiles.push_back(std::move(task_profile));
+	pipeline_task_profile_index[pipeline_task_profiles.back().task_id] = pipeline_task_profiles.size() - 1;
+	return pipeline_task_profiles.back().task_id;
+}
+
+void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu) {
+	if (!task_id) {
+		return;
+	}
+	lock_guard<std::mutex> guard(lock);
+	auto entry = pipeline_task_profile_index.find(task_id);
+	if (entry == pipeline_task_profile_index.end()) {
+		return;
+	}
+	auto &task_profile = pipeline_task_profiles[entry->second];
+	task_profile.end_cpu = end_cpu;
+	task_profile.end_ns = PipelineDVFSProfiler::TimestampNs();
 }
 
 void QueryProfiler::StartQuery(const string &query, bool is_explain_analyze_p, bool start_at_optimizer) {
@@ -203,6 +401,7 @@ void QueryProfiler::EndQuery() {
 
 	FinalizeMetricsInternal();
 	running = false;
+	pipeline_dvfs_profiler.Reset();
 	bool emit_output = false;
 
 	// Print or output the query profiling after query termination.
@@ -740,6 +939,177 @@ static yyjson_mut_val *ToJSONRecursive(yyjson_mut_doc *doc, ProfilingNode &node)
 	return result_obj;
 }
 
+static void PipelineProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *result_obj,
+                                   const vector<PipelineProfilingInfo> &pipeline_profiles) {
+	auto pipelines_list = yyjson_mut_arr(doc);
+	yyjson_mut_obj_add_val(doc, result_obj, "pipeline_info", pipelines_list);
+
+	for (auto &profile : pipeline_profiles) {
+		auto pipeline_obj = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_id", profile.pipeline_id);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_name", profile.source_name.c_str());
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_type", profile.source_type.c_str());
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "sink_name", profile.sink_name.c_str());
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "sink_type", profile.sink_type.c_str());
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "operator_type_sequence", profile.operator_type_sequence.c_str());
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "operator_count", profile.operator_count);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "source_estimated_cardinality",
+		                        profile.source_estimated_cardinality);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "sink_estimated_cardinality",
+		                        profile.sink_estimated_cardinality);
+
+		auto operator_names = yyjson_mut_arr(doc);
+		for (auto &operator_name : profile.operator_names) {
+			yyjson_mut_arr_add_strcpy(doc, operator_names, operator_name.c_str());
+		}
+		yyjson_mut_obj_add_val(doc, pipeline_obj, "operator_names", operator_names);
+
+		auto operator_types = yyjson_mut_arr(doc);
+		for (auto &operator_type : profile.operator_types) {
+			yyjson_mut_arr_add_strcpy(doc, operator_types, operator_type.c_str());
+		}
+		yyjson_mut_obj_add_val(doc, pipeline_obj, "operator_types", operator_types);
+
+		auto operator_estimated_cardinalities = yyjson_mut_arr(doc);
+		for (auto estimated_cardinality : profile.operator_estimated_cardinalities) {
+			yyjson_mut_arr_add_val(operator_estimated_cardinalities, yyjson_mut_uint(doc, estimated_cardinality));
+		}
+		yyjson_mut_obj_add_val(doc, pipeline_obj, "operator_estimated_cardinalities",
+		                       operator_estimated_cardinalities);
+
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "schedule_count", profile.schedule_count);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "task_count", profile.task_count);
+		yyjson_mut_obj_add_real(doc, pipeline_obj, "estimated_task_input_rows",
+		                        profile.estimated_task_input_rows);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "estimated_task_input_rows_bucket",
+		                       profile.estimated_task_input_rows_bucket.c_str());
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "source_max_threads", profile.source_max_threads);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_input_kind", profile.source_input_kind.c_str());
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_input_confidence",
+		                       profile.source_input_confidence.c_str());
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "planned_input_rows", profile.planned_input_rows);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "planned_input_chunks_equiv",
+		                        profile.planned_input_chunks_equiv);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "planned_input_native_units",
+		                        profile.planned_input_native_units);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "planned_input_native_unit",
+		                       profile.planned_input_native_unit.c_str());
+		yyjson_mut_obj_add_real(doc, pipeline_obj, "planned_task_input_chunks_equiv",
+		                        profile.planned_task_input_chunks_equiv);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "planned_task_input_chunks_bucket",
+		                       profile.planned_task_input_chunks_bucket.c_str());
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "start_ns", profile.start_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "tasks_done_ns", profile.tasks_done_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "finish_done_ns", profile.finish_done_ns);
+
+		auto task_end_ns = profile.tasks_done_ns;
+		auto lifecycle_end_ns = profile.finish_done_ns ? profile.finish_done_ns : profile.tasks_done_ns;
+		auto task_duration_ns = task_end_ns >= profile.start_ns ? task_end_ns - profile.start_ns : 0;
+		auto lifecycle_duration_ns =
+		    lifecycle_end_ns >= profile.start_ns ? lifecycle_end_ns - profile.start_ns : 0;
+		auto finish_tail_ns =
+		    profile.finish_done_ns && profile.tasks_done_ns && profile.finish_done_ns >= profile.tasks_done_ns
+		        ? profile.finish_done_ns - profile.tasks_done_ns
+		        : 0;
+
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "task_end_ns", task_end_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "task_duration_ns", task_duration_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "lifecycle_end_ns", lifecycle_end_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "lifecycle_duration_ns", lifecycle_duration_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "finish_tail_ns", finish_tail_ns);
+		auto end_ns = task_end_ns;
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "end_ns", end_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "duration_ns", task_duration_ns);
+
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "dvfs_metrics_enabled", profile.dvfs_metrics_enabled ? 1 : 0);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "measurement_start_overhead_ns",
+		                        profile.measurement_start_overhead_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "measurement_end_overhead_ns",
+		                        profile.measurement_end_overhead_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "rapl_start_overhead_ns", profile.rapl_start_overhead_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "perf_start_overhead_ns", profile.perf_start_overhead_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "rapl_end_overhead_ns", profile.rapl_end_overhead_ns);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "perf_end_overhead_ns", profile.perf_end_overhead_ns);
+		if (profile.dvfs_metrics_enabled) {
+			yyjson_mut_obj_add_uint(doc, pipeline_obj, "rapl_supported", profile.rapl_supported ? 1 : 0);
+			yyjson_mut_obj_add_str(doc, pipeline_obj, "rapl_source", profile.rapl_source.c_str());
+			if (!profile.rapl_error.empty()) {
+				yyjson_mut_obj_add_str(doc, pipeline_obj, "rapl_error", profile.rapl_error.c_str());
+			}
+			yyjson_mut_obj_add_uint(doc, pipeline_obj, "rapl_perf_fd_count", profile.rapl_perf_fd_count);
+			yyjson_mut_obj_add_uint(doc, pipeline_obj, "rapl_perf_group_count", profile.rapl_perf_group_count);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "rapl_perf_min_running_pct",
+			                        profile.rapl_perf_min_running_pct);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "cpu_package_j", profile.cpu_package_j);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "dram_j", profile.dram_j);
+			yyjson_mut_obj_add_uint(doc, pipeline_obj, "perf_supported", profile.perf_supported ? 1 : 0);
+			yyjson_mut_obj_add_str(doc, pipeline_obj, "perf_scope", profile.perf_scope.c_str());
+			yyjson_mut_obj_add_str(doc, pipeline_obj, "perf_cgroup_path", profile.perf_cgroup_path.c_str());
+			yyjson_mut_obj_add_uint(doc, pipeline_obj, "perf_fd_count", profile.perf_fd_count);
+			yyjson_mut_obj_add_uint(doc, pipeline_obj, "perf_group_count", profile.perf_group_count);
+			yyjson_mut_obj_add_uint(doc, pipeline_obj, "perf_cpu_count", profile.perf_cpu_count);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "perf_min_running_pct", profile.perf_min_running_pct);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "cycles", profile.cycles);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "instructions", profile.instructions);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "cache_references", profile.cache_references);
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "cache_misses", profile.cache_misses);
+			if (profile.cycles > 0) {
+				yyjson_mut_obj_add_real(doc, pipeline_obj, "ipc", profile.instructions / profile.cycles);
+			}
+			if (profile.instructions > 0) {
+				yyjson_mut_obj_add_real(doc, pipeline_obj, "cache_mpki",
+				                        1000.0 * profile.cache_misses / profile.instructions);
+			}
+			if (!profile.per_cpu_perf.empty()) {
+				auto per_cpu_list = yyjson_mut_arr(doc);
+				for (auto &cpu_profile : profile.per_cpu_perf) {
+					auto cpu_obj = yyjson_mut_obj(doc);
+					yyjson_mut_obj_add_int(doc, cpu_obj, "cpu", cpu_profile.cpu);
+					yyjson_mut_obj_add_real(doc, cpu_obj, "perf_min_running_pct", cpu_profile.min_running_pct);
+					yyjson_mut_obj_add_real(doc, cpu_obj, "cycles", cpu_profile.cycles);
+					yyjson_mut_obj_add_real(doc, cpu_obj, "instructions", cpu_profile.instructions);
+					yyjson_mut_obj_add_real(doc, cpu_obj, "cache_references", cpu_profile.cache_references);
+					yyjson_mut_obj_add_real(doc, cpu_obj, "cache_misses", cpu_profile.cache_misses);
+					if (cpu_profile.cycles > 0) {
+						yyjson_mut_obj_add_real(doc, cpu_obj, "ipc", cpu_profile.instructions / cpu_profile.cycles);
+					}
+					if (cpu_profile.instructions > 0) {
+						yyjson_mut_obj_add_real(doc, cpu_obj, "cache_mpki",
+						                        1000.0 * cpu_profile.cache_misses / cpu_profile.instructions);
+					}
+					yyjson_mut_arr_add_val(per_cpu_list, cpu_obj);
+				}
+				yyjson_mut_obj_add_val(doc, pipeline_obj, "per_cpu_perf", per_cpu_list);
+			}
+			if (!profile.perf_error.empty()) {
+				yyjson_mut_obj_add_str(doc, pipeline_obj, "perf_error", profile.perf_error.c_str());
+			}
+		}
+
+		yyjson_mut_arr_add_val(pipelines_list, pipeline_obj);
+	}
+}
+
+static void PipelineTaskProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *result_obj,
+                                       const vector<PipelineTaskProfilingInfo> &pipeline_task_profiles) {
+	auto task_list = yyjson_mut_arr(doc);
+	yyjson_mut_obj_add_val(doc, result_obj, "pipeline_task_info", task_list);
+
+	for (auto &profile : pipeline_task_profiles) {
+		auto task_obj = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_uint(doc, task_obj, "task_id", profile.task_id);
+		yyjson_mut_obj_add_uint(doc, task_obj, "pipeline_id", profile.pipeline_id);
+		yyjson_mut_obj_add_uint(doc, task_obj, "thread_id", profile.thread_id);
+		yyjson_mut_obj_add_int(doc, task_obj, "start_cpu", profile.start_cpu);
+		yyjson_mut_obj_add_int(doc, task_obj, "end_cpu", profile.end_cpu);
+		yyjson_mut_obj_add_uint(doc, task_obj, "start_ns", profile.start_ns);
+		yyjson_mut_obj_add_uint(doc, task_obj, "end_ns", profile.end_ns);
+		auto duration_ns = profile.end_ns >= profile.start_ns ? profile.end_ns - profile.start_ns : 0;
+		yyjson_mut_obj_add_uint(doc, task_obj, "duration_ns", duration_ns);
+		yyjson_mut_arr_add_val(task_list, task_obj);
+	}
+}
+
 static string StringifyAndFree(ConvertedJSONHolder &json_holder, yyjson_mut_val *object) {
 	json_holder.stringified_json = yyjson_mut_val_write_opts(
 	    object, YYJSON_WRITE_ALLOW_INF_AND_NAN | YYJSON_WRITE_PRETTY, nullptr, nullptr, nullptr);
@@ -789,6 +1159,13 @@ string QueryProfiler::ToJSON() const {
 	yyjson_mut_obj_add_val(json_holder.doc, result_obj, "children", children_list);
 	auto child = ToJSONRecursive(json_holder.doc, *root->GetChild(0));
 	yyjson_mut_arr_add_val(children_list, child);
+	auto &pipeline_settings = ClientConfig::GetConfig(context).pipeline_profiling;
+	if (pipeline_settings.EmitPipelineInfo()) {
+		PipelineProfilesToJSON(json_holder.doc, result_obj, pipeline_profiles);
+	}
+	if (pipeline_settings.task_trace) {
+		PipelineTaskProfilesToJSON(json_holder.doc, result_obj, pipeline_task_profiles);
+	}
 	return StringifyAndFree(json_holder, result_obj);
 }
 

@@ -9,12 +9,38 @@
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/settings.hpp"
 
+#include <functional>
+#include <thread>
+
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace duckdb {
+
+static uint64_t PipelineTaskThreadId() {
+#ifdef __linux__
+	return static_cast<uint64_t>(syscall(SYS_gettid));
+#else
+	return static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+#endif
+}
+
+static int PipelineTaskCurrentCPU() {
+#ifdef __linux__
+	return sched_getcpu();
+#else
+	return -1;
+#endif
+}
 
 PipelineTask::PipelineTask(Pipeline &pipeline_p, shared_ptr<Event> event_p)
     : ExecutorTask(pipeline_p.executor, std::move(event_p)), pipeline(pipeline_p) {
@@ -31,6 +57,9 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 }
 
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
+	auto profiler_task_id = pipeline.RecordProfilerTaskStart(PipelineTaskThreadId(), PipelineTaskCurrentCPU());
+	auto finish_profiler_task = [&]() { pipeline.RecordProfilerTaskEnd(profiler_task_id, PipelineTaskCurrentCPU()); };
+
 	if (!pipeline_executor) {
 		pipeline_executor = make_uniq<PipelineExecutor>(pipeline.GetClientContext(), pipeline);
 	}
@@ -42,8 +71,10 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 
 		switch (res) {
 		case PipelineExecuteResult::NOT_FINISHED:
+			finish_profiler_task();
 			return TaskExecutionResult::TASK_NOT_FINISHED;
 		case PipelineExecuteResult::INTERRUPTED:
+			finish_profiler_task();
 			return TaskExecutionResult::TASK_BLOCKED;
 		case PipelineExecuteResult::FINISHED:
 			break;
@@ -54,12 +85,14 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		case PipelineExecuteResult::NOT_FINISHED:
 			throw InternalException("Execute without limit should not return NOT_FINISHED");
 		case PipelineExecuteResult::INTERRUPTED:
+			finish_profiler_task();
 			return TaskExecutionResult::TASK_BLOCKED;
 		case PipelineExecuteResult::FINISHED:
 			break;
 		}
 	}
 
+	finish_profiler_task();
 	event->FinishTask();
 	pipeline_executor.reset();
 	return TaskExecutionResult::TASK_FINISHED;
@@ -95,6 +128,9 @@ bool Pipeline::GetProgress(ProgressData &progress) {
 void Pipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelineTask>(*this, event));
+	auto source_max_threads = source_state ? source_state->MaxThreads() : 0;
+	auto source_input_volume = source_state ? source_state->GetSourceInputVolume() : SourceInputVolume();
+	RecordProfilerStart(tasks.size(), source_max_threads, source_input_volume);
 	event->SetTasks(std::move(tasks));
 }
 
@@ -188,6 +224,9 @@ bool Pipeline::LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads) {
 	for (idx_t i = 0; i < max_threads; i++) {
 		tasks.push_back(make_uniq<PipelineTask>(*this, event));
 	}
+	auto source_max_threads = source_state ? source_state->MaxThreads() : 0;
+	auto source_input_volume = source_state ? source_state->GetSourceInputVolume() : SourceInputVolume();
+	RecordProfilerStart(tasks.size(), source_max_threads, source_input_volume);
 	event->SetTasks(std::move(tasks));
 	return true;
 }
@@ -247,6 +286,48 @@ void Pipeline::Ready() {
 	}
 	ready = true;
 	std::reverse(operators.begin(), operators.end());
+	RegisterProfilerPipeline();
+}
+
+void Pipeline::RegisterProfilerPipeline() {
+	if (profiler_pipeline_id || !source || !sink) {
+		return;
+	}
+	profiler_pipeline_id = QueryProfiler::Get(GetClientContext()).RegisterPipelineProfile(*source, operators, sink);
+}
+
+void Pipeline::RecordProfilerStart(idx_t task_count, idx_t source_max_threads,
+                                   const SourceInputVolume &source_input_volume) {
+	if (profiler_pipeline_id) {
+		QueryProfiler::Get(GetClientContext())
+		    .RecordPipelineProfileStart(profiler_pipeline_id, task_count, source_max_threads, source_input_volume);
+	}
+}
+
+void Pipeline::RecordProfilerTasksDone() {
+	if (profiler_pipeline_id) {
+		QueryProfiler::Get(GetClientContext()).RecordPipelineProfileTasksDone(profiler_pipeline_id);
+	}
+}
+
+void Pipeline::RecordProfilerFinishDone() {
+	if (profiler_pipeline_id) {
+		QueryProfiler::Get(GetClientContext()).RecordPipelineProfileFinishDone(profiler_pipeline_id);
+	}
+}
+
+idx_t Pipeline::RecordProfilerTaskStart(uint64_t thread_id, int start_cpu) {
+	if (!profiler_pipeline_id) {
+		return 0;
+	}
+	return QueryProfiler::Get(GetClientContext()).RecordPipelineTaskStart(profiler_pipeline_id, thread_id, start_cpu);
+}
+
+void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu) {
+	if (!task_id) {
+		return;
+	}
+	QueryProfiler::Get(GetClientContext()).RecordPipelineTaskEnd(task_id, end_cpu);
 }
 
 void Pipeline::AddDependency(shared_ptr<Pipeline> &pipeline) {

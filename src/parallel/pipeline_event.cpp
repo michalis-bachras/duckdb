@@ -20,6 +20,7 @@ void PipelineEvent::Schedule() {
 }
 
 void PipelineEvent::FinishEvent() {
+	pipeline->RecordProfilerTasksDone();
 }
 
 } // namespace duckdb

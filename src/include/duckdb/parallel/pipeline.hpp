@@ -119,11 +119,21 @@ public:
 	//! Returns whether any of the operators in the pipeline care about preserving order
 	bool IsOrderDependent() const;
 
+	//! Record a PipelineTask execution interval for external per-core DVFS analysis.
+	idx_t RecordProfilerTaskStart(uint64_t thread_id, int start_cpu);
+	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu);
+
 	//! Registers a new batch index for a pipeline executor - returns the current minimum batch index
 	idx_t RegisterNewBatchIndex();
 
 	//! Updates the batch index of a pipeline (and returns the new minimum batch index)
 	idx_t UpdateBatchIndex(idx_t old_index, idx_t new_index);
+
+private:
+	void RegisterProfilerPipeline();
+	void RecordProfilerStart(idx_t task_count, idx_t source_max_threads, const SourceInputVolume &source_input_volume);
+	void RecordProfilerTasksDone();
+	void RecordProfilerFinishDone();
 
 private:
 	//! Whether or not the pipeline has been readied
@@ -136,6 +146,8 @@ private:
 	vector<reference<PhysicalOperator>> operators;
 	//! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
 	optional_ptr<PhysicalOperator> sink;
+	//! The per-query pipeline profile id, if query profiling is enabled.
+	idx_t profiler_pipeline_id = 0;
 
 	//! The global source state
 	unique_ptr<GlobalSourceState> source_state;

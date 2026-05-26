@@ -24,6 +24,7 @@
 #include "duckdb/common/winapi.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/main/pipeline_dvfs_profiler.hpp"
 #include "duckdb/main/profiling_node.hpp"
 #include "duckdb/main/profiling_utils.hpp"
 
@@ -84,6 +85,90 @@ struct OperatorInformation {
 			throw InternalException("OperatorProfiler: Unknown metric type");
 		}
 	}
+};
+
+//! One PipelineTask execution interval, used to align external per-core PMU samples with active pipelines.
+struct PipelineTaskProfilingInfo {
+	idx_t task_id = 0;
+	idx_t pipeline_id = 0;
+	uint64_t thread_id = 0;
+	int start_cpu = -1;
+	int end_cpu = -1;
+	uint64_t start_ns = 0;
+	uint64_t end_ns = 0;
+};
+
+//! Coarse pipeline-level timing information emitted into the existing JSON query profile.
+struct PipelineProfilingInfo {
+	idx_t pipeline_id = 0;
+
+	string source_name;
+	string source_type;
+	vector<string> operator_names;
+	vector<string> operator_types;
+	vector<idx_t> operator_estimated_cardinalities;
+	string sink_name;
+	string sink_type;
+	idx_t source_estimated_cardinality = 0;
+	idx_t sink_estimated_cardinality = 0;
+	idx_t operator_count = 0;
+	string operator_type_sequence;
+	double estimated_task_input_rows = 0;
+	string estimated_task_input_rows_bucket;
+	idx_t source_max_threads = 0;
+	string source_input_kind = "unknown";
+	string source_input_confidence = "unknown";
+	idx_t planned_input_rows = 0;
+	idx_t planned_input_chunks_equiv = 0;
+	idx_t planned_input_native_units = 0;
+	string planned_input_native_unit;
+	double planned_task_input_chunks_equiv = 0;
+	string planned_task_input_chunks_bucket = "unknown";
+
+	idx_t schedule_count = 0;
+	idx_t task_count = 0;
+	uint64_t start_ns = 0;
+	uint64_t tasks_done_ns = 0;
+	uint64_t finish_done_ns = 0;
+
+	bool dvfs_metrics_enabled = false;
+	bool dvfs_measurement_stopped = false;
+	bool rapl_supported = false;
+	string rapl_source;
+	string rapl_error;
+	bool perf_supported = false;
+	string perf_scope;
+	string perf_cgroup_path;
+	string perf_error;
+	uint64_t measurement_start_overhead_ns = 0;
+	uint64_t measurement_end_overhead_ns = 0;
+	uint64_t rapl_start_overhead_ns = 0;
+	uint64_t perf_start_overhead_ns = 0;
+	uint64_t rapl_end_overhead_ns = 0;
+	uint64_t perf_end_overhead_ns = 0;
+
+	vector<uint64_t> rapl_package_start_uj;
+	vector<uint64_t> rapl_package_max_uj;
+	vector<uint64_t> rapl_dram_start_uj;
+	vector<uint64_t> rapl_dram_max_uj;
+	double cpu_package_j = 0;
+	double dram_j = 0;
+
+	idx_t rapl_perf_fd_count = 0;
+	idx_t rapl_perf_group_count = 0;
+	double rapl_perf_min_running_pct = 0;
+	vector<PipelinePerfGroupSnapshot> rapl_perf_start_snapshots;
+
+	idx_t perf_fd_count = 0;
+	idx_t perf_group_count = 0;
+	idx_t perf_cpu_count = 0;
+	double perf_min_running_pct = 0;
+	double cycles = 0;
+	double instructions = 0;
+	double cache_references = 0;
+	double cache_misses = 0;
+	vector<PipelinePerfGroupSnapshot> perf_start_snapshots;
+	vector<PipelinePerfCPUCounters> per_cpu_perf;
 };
 
 //! The OperatorProfiler measures timings of individual operators
@@ -165,6 +250,17 @@ public:
 
 	DUCKDB_API void Initialize(const PhysicalOperator &root);
 
+	//! Register and update coarse pipeline-level timings for JSON profiling output.
+	DUCKDB_API idx_t RegisterPipelineProfile(const PhysicalOperator &source,
+	                                         const vector<reference<PhysicalOperator>> &operators,
+	                                         optional_ptr<PhysicalOperator> sink);
+	DUCKDB_API void RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_count, idx_t source_max_threads,
+	                                           const SourceInputVolume &source_input_volume);
+	DUCKDB_API void RecordPipelineProfileTasksDone(idx_t pipeline_id);
+	DUCKDB_API void RecordPipelineProfileFinishDone(idx_t pipeline_id);
+	DUCKDB_API idx_t RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu);
+	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu);
+
 	DUCKDB_API string QueryTreeToString() const;
 	DUCKDB_API void QueryTreeToStream(std::ostream &str) const;
 	DUCKDB_API void Print();
@@ -227,6 +323,20 @@ private:
 
 	//! A map of a Physical Operator pointer to a tree node
 	TreeMap tree_map;
+	//! Pipeline-level profiling records emitted alongside the operator tree.
+	vector<PipelineProfilingInfo> pipeline_profiles;
+	//! Pipeline task execution intervals emitted alongside the operator tree.
+	vector<PipelineTaskProfilingInfo> pipeline_task_profiles;
+	//! Fast lookup for pipeline records by stable id.
+	unordered_map<idx_t, idx_t> pipeline_profile_index;
+	//! Fast lookup for task records by stable id.
+	unordered_map<idx_t, idx_t> pipeline_task_profile_index;
+	//! Next stable per-query pipeline profile id.
+	idx_t next_pipeline_profile_id;
+	//! Next stable per-query pipeline task profile id.
+	idx_t next_pipeline_task_profile_id;
+	//! Optional direct DVFS measurement support for pipeline intervals.
+	PipelineDVFSProfiler pipeline_dvfs_profiler;
 	//! Whether or not we are running as part of a explain_analyze query
 	bool is_explain_analyze;
 	//! Whether root metrics have been finalized for output
@@ -250,6 +360,7 @@ private:
 private:
 	void MoveOptimizerPhasesToRoot();
 	void FinalizeMetricsInternal();
+	PipelineProfilingInfo *GetPipelineProfile(idx_t pipeline_id);
 
 	//! Check whether or not an operator type requires query profiling. If none of the ops in a query require profiling
 	//! no profiling information is output.
