@@ -1168,7 +1168,7 @@ public:
 		auto &gstate = op.sink_state->Cast<HashJoinGlobalSinkState>();
 		if (!gstate.probe_spill && PropagatesBuildSide(op.join_type)) {
 			auto &data_collection = gstate.hash_table->GetDataCollection();
-			volume.kind = "hash_join_build_rows";
+			volume.kind = SourceThroughputKindToString(SourceThroughputKind::HASH_JOIN_BUILD_ROWS);
 			volume.confidence = "exact";
 			volume.rows = gstate.hash_table->Count();
 			volume.chunks_equiv = data_collection.ChunkCount();
@@ -1177,7 +1177,7 @@ public:
 			return volume;
 		}
 		if (gstate.probe_spill) {
-			volume.kind = "hash_join_probe_rows";
+			volume.kind = SourceThroughputKindToString(SourceThroughputKind::HASH_JOIN_PROBE_ROWS);
 			volume.confidence = "estimate";
 			volume.rows = probe_count;
 			volume.chunks_equiv = HashJoinRowsToStandardChunks(probe_count);
@@ -1225,13 +1225,16 @@ public:
 	HashJoinLocalSourceState(const PhysicalHashJoin &op, const HashJoinGlobalSinkState &sink, Allocator &allocator);
 
 	//! Do the work this thread has been assigned
-	void ExecuteTask(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk);
+	void ExecuteTask(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk,
+	                 OperatorSourceInput &input);
 	//! Whether this thread has finished the work it has been assigned
 	bool TaskFinished() const;
 	//! Build, probe and scan for external hash join
 	void ExternalBuild(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate);
-	void ExternalProbe(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk);
-	void ExternalScanHT(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk);
+	void ExternalProbe(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk,
+	                   OperatorSourceInput &input);
+	void ExternalScanHT(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate, DataChunk &chunk,
+	                    OperatorSourceInput &input);
 
 public:
 	//! The stage that this thread was assigned work for
@@ -1458,16 +1461,16 @@ HashJoinLocalSourceState::HashJoinLocalSourceState(const PhysicalHashJoin &op, c
 }
 
 void HashJoinLocalSourceState::ExecuteTask(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate,
-                                           DataChunk &chunk) {
+                                           DataChunk &chunk, OperatorSourceInput &input) {
 	switch (local_stage) {
 	case HashJoinSourceStage::BUILD:
 		ExternalBuild(sink, gstate);
 		break;
 	case HashJoinSourceStage::PROBE:
-		ExternalProbe(sink, gstate, chunk);
+		ExternalProbe(sink, gstate, chunk, input);
 		break;
 	case HashJoinSourceStage::SCAN_HT:
-		ExternalScanHT(sink, gstate, chunk);
+		ExternalScanHT(sink, gstate, chunk, input);
 		break;
 	default:
 		throw InternalException("Unexpected HashJoinSourceStage in ExecuteTask!");
@@ -1499,7 +1502,7 @@ void HashJoinLocalSourceState::ExternalBuild(HashJoinGlobalSinkState &sink, Hash
 }
 
 void HashJoinLocalSourceState::ExternalProbe(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate,
-                                             DataChunk &chunk) {
+                                             DataChunk &chunk, OperatorSourceInput &input) {
 	D_ASSERT(local_stage == HashJoinSourceStage::PROBE && sink.hash_table->finalized);
 
 	if (!scan_structure.is_null) {
@@ -1522,6 +1525,7 @@ void HashJoinLocalSourceState::ExternalProbe(HashJoinGlobalSinkState &sink, Hash
 
 	// Scan input chunk for next probe
 	sink.probe_spill->consumer->ScanChunk(probe_local_scan, lhs_probe_chunk);
+	input.ReportSourceTuplesTouched(lhs_probe_chunk.size(), SourceThroughputKind::HASH_JOIN_PROBE_ROWS, "exact", true);
 
 	// Get the probe chunk columns/hashes
 	lhs_join_keys.Reset();
@@ -1541,14 +1545,15 @@ void HashJoinLocalSourceState::ExternalProbe(HashJoinGlobalSinkState &sink, Hash
 }
 
 void HashJoinLocalSourceState::ExternalScanHT(HashJoinGlobalSinkState &sink, HashJoinGlobalSourceState &gstate,
-                                              DataChunk &chunk) {
+                                              DataChunk &chunk, OperatorSourceInput &input) {
 	D_ASSERT(local_stage == HashJoinSourceStage::SCAN_HT);
 
 	if (!full_outer_scan_state) {
 		full_outer_scan_state = make_uniq<JoinHTScanState>(sink.hash_table->GetDataCollection(),
 		                                                   full_outer_chunk_idx_from, full_outer_chunk_idx_to);
 	}
-	sink.hash_table->ScanFullOuter(*full_outer_scan_state, addresses, chunk);
+	auto rows_inspected = sink.hash_table->ScanFullOuter(*full_outer_scan_state, addresses, chunk);
+	input.ReportSourceTuplesTouched(rows_inspected, SourceThroughputKind::HASH_JOIN_BUILD_ROWS, "exact", true);
 
 	if (chunk.size() == 0) {
 		full_outer_scan_state = nullptr;
@@ -1571,6 +1576,7 @@ SourceResultType PhysicalHashJoin::GetDataInternal(ExecutionContext &context, Da
 			sink.hash_table->Reset();
 			sink.temporary_memory_state->SetZero();
 		}
+		input.ReportSourceControl(SourceThroughputKind::NO_SOURCE_SCAN, "exact");
 		return SourceResultType::FINISHED;
 	}
 
@@ -1582,7 +1588,7 @@ SourceResultType PhysicalHashJoin::GetDataInternal(ExecutionContext &context, Da
 	// Therefore, we loop until we've produced tuples, or until the operator is actually done
 	while (gstate.global_stage != HashJoinSourceStage::DONE && chunk.size() == 0) {
 		if (!lstate.TaskFinished() || gstate.AssignTask(sink, lstate)) {
-			lstate.ExecuteTask(sink, gstate, chunk);
+			lstate.ExecuteTask(sink, gstate, chunk, input);
 		} else {
 			auto guard = gstate.Lock();
 			if (gstate.TryPrepareNextStage(sink) || gstate.global_stage == HashJoinSourceStage::DONE) {

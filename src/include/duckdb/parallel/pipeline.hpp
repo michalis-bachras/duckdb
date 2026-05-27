@@ -11,6 +11,7 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/set.hpp"
+#include "duckdb/execution/source_throughput.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -121,7 +122,8 @@ public:
 
 	//! Record a PipelineTask execution interval for external per-core DVFS analysis.
 	idx_t RecordProfilerTaskStart(uint64_t thread_id, int start_cpu);
-	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu);
+	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
+	                           uint64_t task_duration_ns);
 
 	//! Registers a new batch index for a pipeline executor - returns the current minimum batch index
 	idx_t RegisterNewBatchIndex();
@@ -166,6 +168,9 @@ private:
 	//! The reason is that when we start a new pipeline we insert the current minimum batch index as a placeholder
 	//! Which leads to duplicate entries in the set of active batch indexes
 	multiset<idx_t> batch_indexes;
+	//! Lock and state for per-pipeline online source-throughput estimation.
+	mutex source_throughput_lock;
+	SourceThroughputEstimator source_throughput_estimator;
 
 private:
 	void ScheduleSequentialTask(shared_ptr<Event> &event);

@@ -563,7 +563,7 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = "top_n_heap_rows";
+		volume.kind = SourceThroughputKindToString(SourceThroughputKind::TOP_N_HEAP_ROWS);
 		volume.confidence = "exact";
 		volume.rows = sink.heap.heap.size();
 		volume.chunks_equiv = volume.rows == 0 ? 0 : (volume.rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
@@ -609,6 +609,7 @@ SourceResultType PhysicalTopN::GetDataInternal(ExecutionContext &context, DataCh
 	}
 
 	sink.heap.Scan(gstate.state, chunk, lstate.pos);
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::TOP_N_HEAP_ROWS, "exact", true, "top_n_heap_row");
 
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }

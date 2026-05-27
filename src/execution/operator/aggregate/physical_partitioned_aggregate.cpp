@@ -194,6 +194,8 @@ SourceResultType PhysicalPartitionedAggregate::GetDataInternal(ExecutionContext 
 	auto &gstate = sink_state->Cast<PartitionedAggregateGlobalSinkState>();
 	auto &gsource = input.global_state.Cast<PartitionedAggregateGlobalSourceState>();
 	gstate.aggregate_result.Scan(gsource.scan_state, chunk);
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::PARTITIONED_AGGREGATE_GROUPS, "exact", true,
+	                              "aggregate_group");
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 

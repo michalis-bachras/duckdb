@@ -227,6 +227,7 @@ SourceResultType PhysicalRecursiveCTE::GetDataInternal(ExecutionContext &context
 		}
 	}
 
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::RECURSIVE_CTE_ROWS, "estimate", true, "recursive_row");
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 

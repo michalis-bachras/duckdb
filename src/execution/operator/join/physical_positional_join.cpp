@@ -175,6 +175,7 @@ SourceResultType PhysicalPositionalJoin::GetDataInternal(ExecutionContext &conte
                                                          OperatorSourceInput &input) const {
 	auto &sink = sink_state->Cast<PositionalJoinGlobalState>();
 	sink.GetData(result);
+	input.ReportSourceOutputChunk(result, SourceThroughputKind::POSITIONAL_JOIN_ROWS, "exact", true, "joined_row");
 
 	return result.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }

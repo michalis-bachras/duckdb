@@ -33,13 +33,14 @@ struct PipelineProfilingSettings {
 	bool dvfs_metrics = false;
 	bool task_trace = false;
 	bool per_cpu = false;
+	bool throughput = false;
 
 	bool IsAnyEnabled() const {
-		return pipeline_info || dvfs_metrics || task_trace;
+		return pipeline_info || dvfs_metrics || task_trace || throughput;
 	}
 
 	bool EmitPipelineInfo() const {
-		return pipeline_info || dvfs_metrics || task_trace;
+		return pipeline_info || dvfs_metrics || task_trace || throughput;
 	}
 };
 

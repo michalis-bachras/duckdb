@@ -904,6 +904,8 @@ SourceResultType PhysicalHashAggregate::GetDataInternal(ExecutionContext &contex
 			return res;
 		}
 		if (chunk.size() != 0) {
+			input.ReportSourceOutputChunk(chunk, SourceThroughputKind::AGGREGATE_GROUPS, "exact", true,
+			                              "aggregate_group");
 			return SourceResultType::HAVE_MORE_OUTPUT;
 		}
 

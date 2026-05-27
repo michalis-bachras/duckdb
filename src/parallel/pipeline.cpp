@@ -57,12 +57,20 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 }
 
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
+	auto task_start_ns = PipelineDVFSProfiler::TimestampNs();
 	auto profiler_task_id = pipeline.RecordProfilerTaskStart(PipelineTaskThreadId(), PipelineTaskCurrentCPU());
-	auto finish_profiler_task = [&]() { pipeline.RecordProfilerTaskEnd(profiler_task_id, PipelineTaskCurrentCPU()); };
+	auto finish_profiler_task = [&]() {
+		auto empty_counters = SourceThroughputCounters();
+		const auto &counters = pipeline_executor ? pipeline_executor->GetSourceThroughputCounters() : empty_counters;
+		auto task_end_ns = PipelineDVFSProfiler::TimestampNs();
+		auto task_duration_ns = task_end_ns >= task_start_ns ? task_end_ns - task_start_ns : 0;
+		pipeline.RecordProfilerTaskEnd(profiler_task_id, PipelineTaskCurrentCPU(), counters, task_duration_ns);
+	};
 
 	if (!pipeline_executor) {
 		pipeline_executor = make_uniq<PipelineExecutor>(pipeline.GetClientContext(), pipeline);
 	}
+	pipeline_executor->ResetSourceThroughputCounters();
 
 	pipeline_executor->SetTaskForInterrupts(shared_from_this());
 
@@ -257,6 +265,10 @@ void Pipeline::PrepareFinalize() {
 }
 
 void Pipeline::Reset() {
+	{
+		lock_guard<mutex> guard(source_throughput_lock);
+		source_throughput_estimator.Reset();
+	}
 	ResetSink();
 	for (auto &op_ref : operators) {
 		auto &op = op_ref.get();
@@ -323,11 +335,18 @@ idx_t Pipeline::RecordProfilerTaskStart(uint64_t thread_id, int start_cpu) {
 	return QueryProfiler::Get(GetClientContext()).RecordPipelineTaskStart(profiler_pipeline_id, thread_id, start_cpu);
 }
 
-void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu) {
+void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
+                                     uint64_t task_duration_ns) {
 	if (!task_id) {
 		return;
 	}
-	QueryProfiler::Get(GetClientContext()).RecordPipelineTaskEnd(task_id, end_cpu);
+	SourceThroughputEstimate throughput_estimate;
+	{
+		lock_guard<mutex> guard(source_throughput_lock);
+		throughput_estimate = source_throughput_estimator.Update(source_throughput, task_duration_ns);
+	}
+	QueryProfiler::Get(GetClientContext()).RecordPipelineTaskEnd(task_id, end_cpu, source_throughput,
+	                                                             throughput_estimate);
 }
 
 void Pipeline::AddDependency(shared_ptr<Pipeline> &pipeline) {

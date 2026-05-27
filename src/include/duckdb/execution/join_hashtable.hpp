@@ -196,7 +196,7 @@ public:
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
 	//! Scan the HT to construct the full outer join result
-	void ScanFullOuter(JoinHTScanState &state, Vector &addresses, DataChunk &result) const;
+	idx_t ScanFullOuter(JoinHTScanState &state, Vector &addresses, DataChunk &result) const;
 
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);

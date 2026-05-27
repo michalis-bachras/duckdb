@@ -72,6 +72,8 @@ SourceResultType PhysicalColumnDataScan::GetDataInternal(ExecutionContext &conte
 	auto &gstate = input.global_state.Cast<PhysicalColumnDataGlobalScanState>();
 	auto &lstate = input.local_state.Cast<PhysicalColumnDataLocalScanState>();
 	collection->Scan(gstate.global_scan_state, lstate.local_scan_state, chunk);
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::MATERIALIZED_ROWS, "exact", true,
+	                              "column_data_chunk");
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 

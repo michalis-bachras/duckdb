@@ -665,6 +665,7 @@ SourceResultType PhysicalUngroupedAggregate::GetDataInternal(ExecutionContext &c
 	// initialize the result chunk with the aggregate values
 	gstate.state.Finalize(chunk);
 	VerifyNullHandling(chunk, gstate.state.state, aggregates);
+	input.ReportSourceTuplesTouched(1, SourceThroughputKind::SINGLE_AGGREGATE_ROW, "exact", false, 1, 1, "row");
 
 	return SourceResultType::FINISHED;
 }

@@ -45,7 +45,6 @@ struct TableScanLocalState : public LocalTableFunctionState {
 	//! This includes filter columns, which are immediately removed.
 	DataChunk all_columns;
 
-	idx_t rows_scanned = 0;
 	idx_t rows_in_current_row_group = 0;
 };
 
@@ -333,8 +332,7 @@ public:
 				return;
 			}
 
-			// We have fully processed a row group. Add to scanned_rows
-			l_state.rows_scanned += l_state.rows_in_current_row_group;
+			// We have fully processed a row group. Move to the next one.
 			l_state.rows_in_current_row_group = storage.NextParallelScan(context, state, l_state.scan_state);
 
 			if (data_p.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
@@ -389,7 +387,7 @@ public:
 
 	idx_t TableScanRowsScanned(LocalTableFunctionState &state) override {
 		auto &l_state = state.Cast<TableScanLocalState>();
-		return l_state.rows_scanned;
+		return l_state.scan_state.table_state.rows_touched + l_state.scan_state.local_state.rows_touched;
 	}
 
 	SourceInputVolume GetSourceInputVolume() const override {

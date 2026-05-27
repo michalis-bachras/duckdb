@@ -360,6 +360,10 @@ static bool TryEnablePipelineProfilingSetting(ClientConfig &config, const string
 		config.pipeline_profiling.task_trace = true;
 		return true;
 	}
+	if (setting == "PIPELINE_THROUGHPUT") {
+		config.pipeline_profiling.throughput = true;
+		return true;
+	}
 	if (setting == "PIPELINE_PER_CPU") {
 		config.pipeline_profiling.per_cpu = true;
 		return true;
@@ -529,6 +533,9 @@ Value CustomProfilingSettingsSetting::GetSetting(const ClientContext &context) {
 	}
 	if (config.pipeline_profiling.task_trace) {
 		enabled_settings.insert("PIPELINE_TASK_TRACE");
+	}
+	if (config.pipeline_profiling.throughput) {
+		enabled_settings.insert("PIPELINE_THROUGHPUT");
 	}
 	if (config.pipeline_profiling.per_cpu) {
 		enabled_settings.insert("PIPELINE_PER_CPU");

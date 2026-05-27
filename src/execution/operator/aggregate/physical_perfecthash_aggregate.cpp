@@ -183,7 +183,7 @@ public:
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
 		auto &gstate = op.sink_state->Cast<PerfectHashAggregateGlobalState>();
-		volume.kind = "perfect_hash_groups";
+		volume.kind = SourceThroughputKindToString(SourceThroughputKind::PERFECT_HASH_GROUPS);
 		volume.confidence = "exact";
 		volume.rows = gstate.ht->Count();
 		volume.chunks_equiv =
@@ -210,6 +210,8 @@ SourceResultType PhysicalPerfectHashAggregate::GetDataInternal(ExecutionContext 
 	gstate.ht->Scan(state.ht_scan_position, chunk);
 
 	if (chunk.size() > 0) {
+		input.ReportSourceOutputChunk(chunk, SourceThroughputKind::PERFECT_HASH_GROUPS, "exact", true,
+		                              "perfect_hash_group");
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	} else {
 		return SourceResultType::FINISHED;

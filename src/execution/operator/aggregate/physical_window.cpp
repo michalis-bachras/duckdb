@@ -1138,6 +1138,7 @@ SourceResultType PhysicalWindow::GetDataInternal(ExecutionContext &context, Data
 	if (chunk.size() == 0) {
 		return SourceResultType::FINISHED;
 	}
+	source.ReportSourceOutputChunk(chunk, SourceThroughputKind::WINDOW_ROWS, "exact", true, "window_row");
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 

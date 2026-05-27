@@ -91,6 +91,7 @@ SourceResultType PhysicalReservoirSample::GetDataInternal(ExecutionContext &cont
 		return SourceResultType::FINISHED;
 	}
 	chunk.Move(*sample_chunk);
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::RESERVOIR_SAMPLE_ROWS, "exact", false, "sample_row");
 
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }

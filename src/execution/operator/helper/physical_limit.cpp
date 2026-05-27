@@ -180,6 +180,8 @@ SourceResultType PhysicalLimit::GetDataInternal(ExecutionContext &context, DataC
 		if (chunk.size() == 0) {
 			return SourceResultType::FINISHED;
 		}
+		input.ReportSourceOutputChunk(chunk, SourceThroughputKind::LIMIT_MATERIALIZED_ROWS, "exact", true,
+		                              "materialized_row");
 		if (HandleOffset(chunk, state.current_offset, gstate.offset, gstate.limit)) {
 			break;
 		}

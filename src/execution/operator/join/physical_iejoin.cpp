@@ -1533,6 +1533,7 @@ SourceResultType PhysicalIEJoin::GetDataInternal(ExecutionContext &context, Data
 			}
 		}
 	}
+	input.ReportSourceOutputChunk(result, SourceThroughputKind::IE_JOIN_ROWS, "estimate", true, "joined_row");
 	return result.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 

@@ -159,6 +159,8 @@ SourceResultType PhysicalLimitPercent::GetDataInternal(ExecutionContext &context
 		return SourceResultType::FINISHED;
 	}
 
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::LIMIT_PERCENT_MATERIALIZED_ROWS, "exact", true,
+	                              "materialized_row");
 	PhysicalLimit::HandleOffset(chunk, current_offset, 0, limit.GetIndex());
 
 	return SourceResultType::HAVE_MORE_OUTPUT;

@@ -620,6 +620,7 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
 
 		// second, scan the version chunk manager to figure out which tuples to load for this transaction
 		idx_t count = current_row_group.GetSelVector(options, state.vector_index, state.valid_sel, max_count);
+		state.rows_touched += count;
 		if (count == 0) {
 			// nothing to scan for this vector, skip the entire vector
 			NextVector(state);

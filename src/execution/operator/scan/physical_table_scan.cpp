@@ -163,6 +163,35 @@ static void ValidateAsyncStrategyResult(const PhysicalTableScanExecutionStrategy
 	}
 }
 
+static SourceThroughputKind TableScanThroughputKind(const SourceInputVolume &volume) {
+	if (volume.kind == "index_scan_row_ids") {
+		return SourceThroughputKind::INDEX_ROWIDS;
+	}
+	if (volume.kind == "table_rows_upper_bound") {
+		return SourceThroughputKind::BASE_TABLE_ROWS;
+	}
+	if (volume.kind != "unknown") {
+		return SourceThroughputKindFromString(volume.kind);
+	}
+	return SourceThroughputKind::TABLE_SCAN_ROWS;
+}
+
+static void ReportTableScanRowsTouched(OperatorSourceInput &input, TableScanGlobalSourceState &g_state,
+                                       optional_idx rows_touched_before, optional_idx rows_touched_after) {
+	if (!rows_touched_before.IsValid() || !rows_touched_after.IsValid()) {
+		return;
+	}
+	if (rows_touched_after.GetIndex() < rows_touched_before.GetIndex()) {
+		return;
+	}
+	auto rows_delta = rows_touched_after.GetIndex() - rows_touched_before.GetIndex();
+	if (rows_delta == 0) {
+		return;
+	}
+	auto source_volume = g_state.global_state->GetSourceInputVolume();
+	input.ReportSourceTuplesTouched(rows_delta, TableScanThroughputKind(source_volume), "exact", true);
+}
+
 SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                     OperatorSourceInput &input) const {
 	D_ASSERT(!column_ids.empty());
@@ -170,6 +199,7 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 	auto &l_state = input.local_state.Cast<TableScanLocalSourceState>();
 
 	TableFunctionInput data(bind_data.get(), l_state.local_state.get(), g_state.global_state.get());
+	auto rows_touched_before = GetRowsScanned(input.global_state, input.local_state);
 
 	if (function.function) {
 		data.async_result = AsyncResultType::IMPLICIT;
@@ -188,6 +218,8 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 		// inconsistencies
 		ValidateAsyncStrategyResult(execution_strategy, input_execution_mode, data.results_execution_mode,
 		                            initial_async_result, output_async_result, chunk.size());
+		auto rows_touched_after = GetRowsScanned(input.global_state, input.local_state);
+		ReportTableScanRowsTouched(input, g_state, rows_touched_before, rows_touched_after);
 
 		// Handle results
 		switch (output_async_result) {
@@ -235,6 +267,8 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 		function.in_out_function_final(context, data, chunk);
 		g_state.in_out_final = true;
 	}
+	auto rows_touched_after = GetRowsScanned(input.global_state, input.local_state);
+	ReportTableScanRowsTouched(input, g_state, rows_touched_before, rows_touched_after);
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 

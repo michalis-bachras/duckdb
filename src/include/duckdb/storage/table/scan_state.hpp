@@ -241,6 +241,8 @@ public:
 	idx_t max_row;
 	//! The current batch index
 	idx_t batch_index;
+	//! Exact visible source rows touched by this scan state before table filters are applied
+	idx_t rows_touched = 0;
 	//! The valid selection
 	SelectionVector valid_sel;
 

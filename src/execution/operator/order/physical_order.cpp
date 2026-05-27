@@ -131,7 +131,9 @@ SourceResultType PhysicalOrder::GetDataInternal(ExecutionContext &context, DataC
 	auto &gstate = input.global_state.Cast<OrderGlobalSourceState>();
 	auto &lstate = input.local_state.Cast<OrderLocalSourceState>();
 	OperatorSourceInput sort_input {*gstate.state, *lstate.state, input.interrupt_state};
-	return gstate.sort.GetData(context, chunk, sort_input);
+	auto result = gstate.sort.GetData(context, chunk, sort_input);
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::SORTED_ROWS, "exact", true, "sorted_row");
+	return result;
 }
 
 OperatorPartitionData PhysicalOrder::GetPartitionData(ExecutionContext &context, DataChunk &chunk,

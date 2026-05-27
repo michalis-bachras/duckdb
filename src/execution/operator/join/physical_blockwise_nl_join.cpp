@@ -271,6 +271,8 @@ SourceResultType PhysicalBlockwiseNLJoin::GetDataInternal(ExecutionContext &cont
 
 	// if the LHS is exhausted in a FULL/RIGHT OUTER JOIN, we scan chunks we still need to output
 	sink.right_outer.Scan(gstate.scan_state, lstate.scan_state, chunk);
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::BLOCKWISE_NL_JOIN_BUILD_ROWS, "estimate", true,
+	                              "build_row");
 
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }

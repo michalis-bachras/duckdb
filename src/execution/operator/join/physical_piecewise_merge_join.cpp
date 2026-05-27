@@ -793,6 +793,8 @@ SourceResultType PhysicalPiecewiseMergeJoin::GetDataInternal(ExecutionContext &c
 		if (count == 0) {
 			return result.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 		}
+		source.ReportSourceOutputChunk(rhs_chunk, SourceThroughputKind::PIECEWISE_MERGE_JOIN_BUILD_ROWS, "exact", true,
+		                               "build_row");
 
 		idx_t result_count = 0;
 		// figure out which tuples didn't find a match in the RHS

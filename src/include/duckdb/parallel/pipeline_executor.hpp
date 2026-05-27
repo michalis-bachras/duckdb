@@ -78,6 +78,8 @@ public:
 
 	//! Registers the task in the interrupt_state to allow Source/Sink operators to block the task
 	void SetTaskForInterrupts(weak_ptr<Task> current_task);
+	void ResetSourceThroughputCounters();
+	const SourceThroughputCounters &GetSourceThroughputCounters() const;
 
 private:
 	//! The pipeline to process
@@ -98,6 +100,9 @@ private:
 	unique_ptr<LocalSinkState> local_sink_state;
 	//! The interrupt state, holding required information for sink/source operators to block
 	InterruptState interrupt_state;
+	//! Per-task source-side tuples touched by this pipeline executor.
+	SourceThroughputCounters source_throughput_counters;
+	bool collect_source_throughput = false;
 
 	//! The final chunk used for moving data into the sink
 	DataChunk final_chunk;

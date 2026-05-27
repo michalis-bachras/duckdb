@@ -4,6 +4,7 @@ namespace duckdb {
 
 SourceResultType PhysicalEmptyResult::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                       OperatorSourceInput &input) const {
+	input.ReportSourceControl(SourceThroughputKind::EMPTY_RESULT, "exact");
 	return SourceResultType::FINISHED;
 }
 

@@ -1,6 +1,7 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 
 #include "duckdb/common/limits.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #ifdef DUCKDB_DEBUG_ASYNC_SINK_SOURCE
@@ -13,6 +14,7 @@ namespace duckdb {
 PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_p)
     : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p) {
 	D_ASSERT(pipeline.source_state);
+	collect_source_throughput = ClientConfig::GetConfig(context_p).pipeline_profiling.throughput;
 	if (pipeline.sink) {
 		local_sink_state = pipeline.sink->GetLocalSinkState(context);
 		required_partition_info = pipeline.sink->RequiredPartitionInfo();
@@ -484,6 +486,14 @@ void PipelineExecutor::SetTaskForInterrupts(weak_ptr<Task> current_task) {
 	interrupt_state = InterruptState(std::move(current_task));
 }
 
+void PipelineExecutor::ResetSourceThroughputCounters() {
+	source_throughput_counters = SourceThroughputCounters();
+}
+
+const SourceThroughputCounters &PipelineExecutor::GetSourceThroughputCounters() const {
+	return source_throughput_counters;
+}
+
 SourceResultType PipelineExecutor::GetData(DataChunk &chunk, OperatorSourceInput &input) {
 	//! Testing feature to enable async source on every operator
 #ifdef DUCKDB_DEBUG_ASYNC_SINK_SOURCE
@@ -526,7 +536,8 @@ SinkResultType PipelineExecutor::Sink(DataChunk &chunk, OperatorSinkInput &input
 SourceResultType PipelineExecutor::FetchFromSource(DataChunk &result) {
 	StartOperator(*pipeline.source);
 
-	OperatorSourceInput source_input = {*pipeline.source_state, *local_source_state, interrupt_state};
+	OperatorSourceInput source_input {*pipeline.source_state, *local_source_state, interrupt_state,
+	                                  collect_source_throughput ? &source_throughput_counters : nullptr};
 	auto res = GetData(result, source_input);
 
 	// Ensures sources only return empty results when Blocking or Finished

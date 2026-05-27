@@ -1389,14 +1389,15 @@ void ScanStructure::NextSingleJoin(DataChunk &keys, DataChunk &left, DataChunk &
 	}
 }
 
-void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, DataChunk &result) const {
+idx_t JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, DataChunk &result) const {
 	// scan the HT starting from the current position and check which rows from the build side did not find a match
 	auto key_locations = FlatVector::GetData<data_ptr_t>(addresses);
 	idx_t found_entries = 0;
+	idx_t rows_inspected = 0;
 
 	auto &iterator = state.iterator;
 	if (iterator.Done()) {
-		return;
+		return 0;
 	}
 
 	// When scanning Full Outer for right semi joins, we only propagate matches that have true
@@ -1411,6 +1412,7 @@ void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, Dat
 	do {
 		const auto count = iterator.GetCurrentChunkCount();
 		for (idx_t i = state.offset_in_chunk; i < count; i++) {
+			rows_inspected++;
 			auto found_match = Load<bool>(row_locations[i] + tuple_size);
 			if (found_match == match_propagation_value) {
 				key_locations[found_entries++] = row_locations[i];
@@ -1428,7 +1430,7 @@ void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, Dat
 
 	// now gather from the found rows
 	if (found_entries == 0) {
-		return;
+		return rows_inspected;
 	}
 	result.SetCardinality(found_entries);
 
@@ -1451,6 +1453,7 @@ void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, Dat
 		D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
 		data_collection->Gather(addresses, sel_vector, found_entries, output_col_idx, vector, sel_vector, nullptr);
 	}
+	return rows_inspected;
 }
 
 idx_t JoinHashTable::FillWithHTOffsets(JoinHTScanState &state, Vector &addresses) {

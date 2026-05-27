@@ -146,18 +146,67 @@ static string EstimatedTaskInputRowsBucket(double rows) {
 	return StringUtil::Format("1e%d-1e%d", exponent, exponent + 1);
 }
 
+static string SourceThroughputSignatureKey(const PipelineProfilingInfo &profile) {
+	return StringUtil::Format("%s::%s::%s", profile.operator_type_sequence, profile.source_input_kind,
+	                          profile.planned_task_input_chunks_bucket);
+}
+
 static SourceInputVolume ApplySourceInputVolumeFallback(const PipelineProfilingInfo &profile,
                                                         SourceInputVolume volume) {
 	if (volume.kind != "unknown" || profile.source_type != "UNGROUPED_AGGREGATE") {
 		return volume;
 	}
-	volume.kind = "single_aggregate_row";
+	volume.kind = SourceThroughputKindToString(SourceThroughputKind::SINGLE_AGGREGATE_ROW);
 	volume.confidence = "exact";
 	volume.rows = 1;
 	volume.chunks_equiv = 1;
 	volume.native_units = 1;
 	volume.native_unit = "row";
 	return volume;
+}
+
+static SourceThroughputCounters ApplySourceThroughputFallback(const PipelineProfilingInfo &profile,
+                                                              SourceThroughputCounters counters) {
+	if (counters.reported) {
+		return counters;
+	}
+	if (profile.source_input_kind == "hash_join_no_source_scan") {
+		counters.AddTuples(0, SourceThroughputKind::NO_SOURCE_SCAN, "exact", false, 0, 0, "none");
+		return counters;
+	}
+	if (SourceThroughputKindFromString(profile.source_input_kind) == SourceThroughputKind::SINGLE_AGGREGATE_ROW) {
+		counters.AddTuples(1, SourceThroughputKind::SINGLE_AGGREGATE_ROW, "exact", false, 1, 1, "row");
+		return counters;
+	}
+	if (profile.source_input_kind != "unknown" && profile.source_input_confidence != "unknown" &&
+	    profile.planned_input_rows == 0 && profile.planned_input_chunks_equiv == 0) {
+		auto native_unit = profile.planned_input_native_unit.empty() ? string("none") : profile.planned_input_native_unit;
+		counters.AddTuples(0, profile.source_input_kind, profile.source_input_confidence, false, 0, 0, native_unit);
+		return counters;
+	}
+	return counters;
+}
+
+static void MergeSourceThroughputCounters(PipelineProfilingInfo &profile,
+                                          const SourceThroughputCounters &counters) {
+	if (!counters.reported) {
+		return;
+	}
+	if (profile.source_tuple_kind == "unknown") {
+		profile.source_tuple_kind = counters.tuple_kind;
+		profile.source_tuple_confidence = counters.tuple_confidence;
+		profile.source_native_unit = counters.native_unit;
+	} else if (profile.source_tuple_kind != counters.tuple_kind) {
+		profile.source_tuple_kind = SourceThroughputKindToString(SourceThroughputKind::MIXED_SOURCE_TUPLES);
+		profile.source_tuple_confidence = "estimate";
+	} else if (profile.source_tuple_confidence != counters.tuple_confidence &&
+	           profile.source_tuple_confidence != "estimate") {
+		profile.source_tuple_confidence = "estimate";
+	}
+	profile.source_tuples_touched += counters.tuples_touched;
+	profile.source_chunks_touched += counters.chunks_touched;
+	profile.source_native_units_touched += counters.native_units_touched;
+	profile.adaptive_morsel_candidate = profile.adaptive_morsel_candidate || counters.adaptive_morsel_candidate;
 }
 
 idx_t QueryProfiler::RegisterPipelineProfile(const PhysicalOperator &source,
@@ -213,6 +262,7 @@ void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_cou
 	}
 	if (!profile->start_ns) {
 		profile->dvfs_metrics_enabled = pipeline_dvfs_profiler.MetricsEnabled();
+		profile->throughput_enabled = ClientConfig::GetConfig(context).pipeline_profiling.throughput;
 		profile->source_max_threads = source_max_threads;
 		auto planned_volume = ApplySourceInputVolumeFallback(*profile, source_input_volume);
 		profile->source_input_kind = planned_volume.kind;
@@ -232,9 +282,11 @@ void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_cou
 				profile->planned_task_input_chunks_bucket =
 				    EstimatedTaskInputRowsBucket(profile->planned_task_input_chunks_equiv);
 			} else if (profile->source_input_kind == "hash_join_no_source_scan") {
-				profile->planned_task_input_chunks_bucket = "no_source_scan";
+				profile->planned_task_input_chunks_bucket =
+				    SourceThroughputKindToString(SourceThroughputKind::NO_SOURCE_SCAN);
 			}
 		}
+		profile->task_signature_key = SourceThroughputSignatureKey(*profile);
 		auto measurement_begin_ns = PipelineDVFSProfiler::TimestampNs();
 		if (profile->dvfs_metrics_enabled) {
 			pipeline_dvfs_profiler.Start(*profile);
@@ -277,7 +329,8 @@ void QueryProfiler::RecordPipelineProfileFinishDone(idx_t pipeline_id) {
 }
 
 idx_t QueryProfiler::RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu) {
-	if (!pipeline_id || !pipeline_dvfs_profiler.TaskTraceEnabled()) {
+	auto &pipeline_settings = ClientConfig::GetConfig(context).pipeline_profiling;
+	if (!pipeline_id || (!pipeline_dvfs_profiler.TaskTraceEnabled() && !pipeline_settings.throughput)) {
 		return 0;
 	}
 	lock_guard<std::mutex> guard(lock);
@@ -295,7 +348,9 @@ idx_t QueryProfiler::RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_
 	return pipeline_task_profiles.back().task_id;
 }
 
-void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu) {
+void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu,
+                                          const SourceThroughputCounters &source_throughput,
+                                          const SourceThroughputEstimate &throughput_estimate) {
 	if (!task_id) {
 		return;
 	}
@@ -307,6 +362,33 @@ void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu) {
 	auto &task_profile = pipeline_task_profiles[entry->second];
 	task_profile.end_cpu = end_cpu;
 	task_profile.end_ns = PipelineDVFSProfiler::TimestampNs();
+	auto profile = GetPipelineProfile(task_profile.pipeline_id);
+	if (!profile) {
+		return;
+	}
+	auto counters = ApplySourceThroughputFallback(*profile, source_throughput);
+	task_profile.source_tuple_kind = counters.tuple_kind;
+	task_profile.source_tuple_confidence = counters.tuple_confidence;
+	task_profile.source_tuples_touched = counters.tuples_touched;
+	task_profile.source_chunks_touched = counters.chunks_touched;
+	task_profile.source_native_units_touched = counters.native_units_touched;
+	task_profile.source_native_unit = counters.native_unit;
+	task_profile.adaptive_morsel_candidate = counters.adaptive_morsel_candidate;
+
+	if (profile->throughput_enabled && counters.reported) {
+		auto duration_ns = task_profile.end_ns >= task_profile.start_ns ? task_profile.end_ns - task_profile.start_ns : 0;
+		profile->throughput_task_duration_ns += duration_ns;
+		profile->throughput_task_count++;
+		MergeSourceThroughputCounters(*profile, counters);
+		task_profile.task_signature_key = profile->task_signature_key;
+		task_profile.estimated_tuples_per_task_s = throughput_estimate.estimated_tuples_per_task_s;
+		profile->estimated_tuples_per_task_s = throughput_estimate.estimated_tuples_per_task_s;
+		profile->last_task_tuples_per_s = throughput_estimate.last_task_tuples_per_s;
+		profile->throughput_ewma_alpha = throughput_estimate.alpha;
+		profile->throughput_sample_count = throughput_estimate.sample_count;
+		profile->throughput_sample_tuples = throughput_estimate.sample_tuples;
+		profile->throughput_sample_ns = throughput_estimate.sample_ns;
+	}
 }
 
 void QueryProfiler::StartQuery(const string &query, bool is_explain_analyze_p, bool start_at_optimizer) {
@@ -998,6 +1080,33 @@ static void PipelineProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *result_o
 		                        profile.planned_task_input_chunks_equiv);
 		yyjson_mut_obj_add_str(doc, pipeline_obj, "planned_task_input_chunks_bucket",
 		                       profile.planned_task_input_chunks_bucket.c_str());
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_enabled", profile.throughput_enabled ? 1 : 0);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_tuple_kind", profile.source_tuple_kind.c_str());
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_tuple_confidence",
+		                       profile.source_tuple_confidence.c_str());
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "source_tuples_touched", profile.source_tuples_touched);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "source_chunks_touched", profile.source_chunks_touched);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "source_native_units_touched",
+		                        profile.source_native_units_touched);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_native_unit", profile.source_native_unit.c_str());
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "adaptive_morsel_candidate",
+		                        profile.adaptive_morsel_candidate ? 1 : 0);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_task_count", profile.throughput_task_count);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_task_duration_ns",
+		                        profile.throughput_task_duration_ns);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "task_signature_key", profile.task_signature_key.c_str());
+		yyjson_mut_obj_add_real(doc, pipeline_obj, "estimated_tuples_per_task_s",
+		                        profile.estimated_tuples_per_task_s);
+		yyjson_mut_obj_add_real(doc, pipeline_obj, "last_task_tuples_per_s", profile.last_task_tuples_per_s);
+		yyjson_mut_obj_add_real(doc, pipeline_obj, "throughput_ewma_alpha", profile.throughput_ewma_alpha);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_sample_count", profile.throughput_sample_count);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_sample_tuples", profile.throughput_sample_tuples);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_sample_ns", profile.throughput_sample_ns);
+		if (profile.throughput_task_duration_ns > 0) {
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "source_tuples_per_task_s",
+			                        SourceTuplesPerTaskSecond(profile.source_tuples_touched,
+			                                                  profile.throughput_task_duration_ns));
+		}
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "start_ns", profile.start_ns);
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "tasks_done_ns", profile.tasks_done_ns);
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "finish_done_ns", profile.finish_done_ns);
@@ -1106,6 +1215,21 @@ static void PipelineTaskProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *resu
 		yyjson_mut_obj_add_uint(doc, task_obj, "end_ns", profile.end_ns);
 		auto duration_ns = profile.end_ns >= profile.start_ns ? profile.end_ns - profile.start_ns : 0;
 		yyjson_mut_obj_add_uint(doc, task_obj, "duration_ns", duration_ns);
+		yyjson_mut_obj_add_str(doc, task_obj, "source_tuple_kind", profile.source_tuple_kind.c_str());
+		yyjson_mut_obj_add_str(doc, task_obj, "source_tuple_confidence", profile.source_tuple_confidence.c_str());
+		yyjson_mut_obj_add_uint(doc, task_obj, "source_tuples_touched", profile.source_tuples_touched);
+		yyjson_mut_obj_add_uint(doc, task_obj, "source_chunks_touched", profile.source_chunks_touched);
+		yyjson_mut_obj_add_uint(doc, task_obj, "source_native_units_touched", profile.source_native_units_touched);
+		yyjson_mut_obj_add_str(doc, task_obj, "source_native_unit", profile.source_native_unit.c_str());
+		yyjson_mut_obj_add_uint(doc, task_obj, "adaptive_morsel_candidate",
+		                        profile.adaptive_morsel_candidate ? 1 : 0);
+		yyjson_mut_obj_add_str(doc, task_obj, "task_signature_key", profile.task_signature_key.c_str());
+		yyjson_mut_obj_add_real(doc, task_obj, "estimated_tuples_per_task_s",
+		                        profile.estimated_tuples_per_task_s);
+		if (duration_ns > 0) {
+			yyjson_mut_obj_add_real(doc, task_obj, "source_tuples_per_task_s",
+			                        SourceTuplesPerTaskSecond(profile.source_tuples_touched, duration_ns));
+		}
 		yyjson_mut_arr_add_val(task_list, task_obj);
 	}
 }
@@ -1163,7 +1287,7 @@ string QueryProfiler::ToJSON() const {
 	if (pipeline_settings.EmitPipelineInfo()) {
 		PipelineProfilesToJSON(json_holder.doc, result_obj, pipeline_profiles);
 	}
-	if (pipeline_settings.task_trace) {
+	if (pipeline_settings.task_trace || pipeline_settings.throughput) {
 		PipelineTaskProfilesToJSON(json_holder.doc, result_obj, pipeline_task_profiles);
 	}
 	return StringifyAndFree(json_holder, result_obj);

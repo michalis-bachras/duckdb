@@ -6,6 +6,7 @@ SourceResultType PhysicalDummyScan::GetDataInternal(ExecutionContext &context, D
                                                     OperatorSourceInput &input) const {
 	// return a single row on the first call to the dummy scan
 	chunk.SetCardinality(1);
+	input.ReportSourceTuplesTouched(1, SourceThroughputKind::DUMMY_ROW, "exact", false, 1, 1, "row");
 
 	return SourceResultType::FINISHED;
 }

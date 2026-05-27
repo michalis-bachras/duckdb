@@ -1604,6 +1604,7 @@ SourceResultType PhysicalAsOfJoin::GetDataInternal(ExecutionContext &context, Da
 		}
 	}
 
+	input.ReportSourceOutputChunk(chunk, SourceThroughputKind::ASOF_JOIN_ROWS, "estimate", true, "joined_row");
 	return chunk.size() > 0 ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
 }
 

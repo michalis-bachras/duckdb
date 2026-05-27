@@ -24,6 +24,7 @@
 #include "duckdb/common/winapi.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/source_throughput.hpp"
 #include "duckdb/main/pipeline_dvfs_profiler.hpp"
 #include "duckdb/main/profiling_node.hpp"
 #include "duckdb/main/profiling_utils.hpp"
@@ -91,11 +92,20 @@ struct OperatorInformation {
 struct PipelineTaskProfilingInfo {
 	idx_t task_id = 0;
 	idx_t pipeline_id = 0;
+	string task_signature_key;
 	uint64_t thread_id = 0;
 	int start_cpu = -1;
 	int end_cpu = -1;
 	uint64_t start_ns = 0;
 	uint64_t end_ns = 0;
+	string source_tuple_kind = "unknown";
+	string source_tuple_confidence = "unknown";
+	idx_t source_tuples_touched = 0;
+	idx_t source_chunks_touched = 0;
+	idx_t source_native_units_touched = 0;
+	string source_native_unit;
+	bool adaptive_morsel_candidate = false;
+	double estimated_tuples_per_task_s = 0;
 };
 
 //! Coarse pipeline-level timing information emitted into the existing JSON query profile.
@@ -130,6 +140,24 @@ struct PipelineProfilingInfo {
 	uint64_t start_ns = 0;
 	uint64_t tasks_done_ns = 0;
 	uint64_t finish_done_ns = 0;
+
+	bool throughput_enabled = false;
+	string source_tuple_kind = "unknown";
+	string source_tuple_confidence = "unknown";
+	idx_t source_tuples_touched = 0;
+	idx_t source_chunks_touched = 0;
+	idx_t source_native_units_touched = 0;
+	string source_native_unit;
+	bool adaptive_morsel_candidate = false;
+	uint64_t throughput_task_duration_ns = 0;
+	idx_t throughput_task_count = 0;
+	string task_signature_key;
+	double estimated_tuples_per_task_s = 0;
+	double last_task_tuples_per_s = 0;
+	double throughput_ewma_alpha = 0.8;
+	idx_t throughput_sample_count = 0;
+	idx_t throughput_sample_tuples = 0;
+	uint64_t throughput_sample_ns = 0;
 
 	bool dvfs_metrics_enabled = false;
 	bool dvfs_measurement_stopped = false;
@@ -259,7 +287,9 @@ public:
 	DUCKDB_API void RecordPipelineProfileTasksDone(idx_t pipeline_id);
 	DUCKDB_API void RecordPipelineProfileFinishDone(idx_t pipeline_id);
 	DUCKDB_API idx_t RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu);
-	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu);
+	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu,
+	                                      const SourceThroughputCounters &source_throughput,
+	                                      const SourceThroughputEstimate &throughput_estimate);
 
 	DUCKDB_API string QueryTreeToString() const;
 	DUCKDB_API void QueryTreeToStream(std::ostream &str) const;
