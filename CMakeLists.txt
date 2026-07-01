@@ -627,6 +627,10 @@ if(NOT MSVC)
   endif()
   if(TREAT_WARNINGS_AS_ERRORS)
     set(CXX_EXTRA "${CXX_EXTRA} -Werror")
+    if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+      # Xcode 26 libc++ emits deprecated char_traits warnings through bundled fmt headers.
+      set(CXX_EXTRA "${CXX_EXTRA} -Wno-error=deprecated-declarations")
+    endif()
   endif()
   if (FORCE_DEBUG)
     set(CXX_EXTRA "${CXX_EXTRA} -Wall ${CXX_EXTRA_DEBUG}")
@@ -908,5 +912,4 @@ if(EXISTS ${CMAKE_CONFIG_TEMPLATE} AND EXISTS ${CMAKE_CONFIG_VERSION_TEMPLATE})
           "${PROJECT_BINARY_DIR}/DuckDBConfigVersion.cmake"
     DESTINATION "${INSTALL_CMAKE_DIR}")
 endif()
-
 
