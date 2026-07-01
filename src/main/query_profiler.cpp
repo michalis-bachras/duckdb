@@ -350,6 +350,7 @@ idx_t QueryProfiler::RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_
 
 void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu,
                                           const SourceThroughputCounters &source_throughput,
+                                          idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
                                           const SourceThroughputEstimate &throughput_estimate) {
 	if (!task_id) {
 		return;
@@ -362,6 +363,7 @@ void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu,
 	auto &task_profile = pipeline_task_profiles[entry->second];
 	task_profile.end_cpu = end_cpu;
 	task_profile.end_ns = PipelineDVFSProfiler::TimestampNs();
+	auto duration_ns = task_profile.end_ns >= task_profile.start_ns ? task_profile.end_ns - task_profile.start_ns : 0;
 	auto profile = GetPipelineProfile(task_profile.pipeline_id);
 	if (!profile) {
 		return;
@@ -374,9 +376,17 @@ void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu,
 	task_profile.source_native_units_touched = counters.native_units_touched;
 	task_profile.source_native_unit = counters.native_unit;
 	task_profile.adaptive_morsel_candidate = counters.adaptive_morsel_candidate;
+	task_profile.pipeline_input_tuples = pipeline_input_tuples;
+	task_profile.pipeline_input_chunks = pipeline_input_chunks;
+
+	if (pipeline_input_tuples > 0 || pipeline_input_chunks > 0) {
+		profile->pipeline_input_tuples += pipeline_input_tuples;
+		profile->pipeline_input_chunks += pipeline_input_chunks;
+		profile->pipeline_input_task_count++;
+		profile->pipeline_input_task_duration_ns += duration_ns;
+	}
 
 	if (profile->throughput_enabled && counters.reported) {
-		auto duration_ns = task_profile.end_ns >= task_profile.start_ns ? task_profile.end_ns - task_profile.start_ns : 0;
 		profile->throughput_task_duration_ns += duration_ns;
 		profile->throughput_task_count++;
 		MergeSourceThroughputCounters(*profile, counters);
@@ -1091,6 +1101,17 @@ static void PipelineProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *result_o
 		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_native_unit", profile.source_native_unit.c_str());
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "adaptive_morsel_candidate",
 		                        profile.adaptive_morsel_candidate ? 1 : 0);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_input_tuples", profile.pipeline_input_tuples);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_input_chunks", profile.pipeline_input_chunks);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_input_task_count",
+		                        profile.pipeline_input_task_count);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_input_task_duration_ns",
+		                        profile.pipeline_input_task_duration_ns);
+		if (profile.pipeline_input_task_duration_ns > 0) {
+			yyjson_mut_obj_add_real(doc, pipeline_obj, "pipeline_input_tuples_per_s",
+			                        SourceTuplesPerTaskSecond(profile.pipeline_input_tuples,
+			                                                  profile.pipeline_input_task_duration_ns));
+		}
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_task_count", profile.throughput_task_count);
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_task_duration_ns",
 		                        profile.throughput_task_duration_ns);
@@ -1223,9 +1244,15 @@ static void PipelineTaskProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *resu
 		yyjson_mut_obj_add_str(doc, task_obj, "source_native_unit", profile.source_native_unit.c_str());
 		yyjson_mut_obj_add_uint(doc, task_obj, "adaptive_morsel_candidate",
 		                        profile.adaptive_morsel_candidate ? 1 : 0);
+		yyjson_mut_obj_add_uint(doc, task_obj, "pipeline_input_tuples", profile.pipeline_input_tuples);
+		yyjson_mut_obj_add_uint(doc, task_obj, "pipeline_input_chunks", profile.pipeline_input_chunks);
 		yyjson_mut_obj_add_str(doc, task_obj, "task_signature_key", profile.task_signature_key.c_str());
 		yyjson_mut_obj_add_real(doc, task_obj, "estimated_tuples_per_task_s",
 		                        profile.estimated_tuples_per_task_s);
+		if (duration_ns > 0) {
+			yyjson_mut_obj_add_real(doc, task_obj, "pipeline_input_tuples_per_s",
+			                        SourceTuplesPerTaskSecond(profile.pipeline_input_tuples, duration_ns));
+		}
 		if (duration_ns > 0) {
 			yyjson_mut_obj_add_real(doc, task_obj, "source_tuples_per_task_s",
 			                        SourceTuplesPerTaskSecond(profile.source_tuples_touched, duration_ns));

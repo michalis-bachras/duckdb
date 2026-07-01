@@ -21,6 +21,7 @@
 namespace duckdb {
 
 class Executor;
+class EnergyAttributionQueryHandle;
 class MetaPipeline;
 class PipelineExecutor;
 class Pipeline;
@@ -121,9 +122,14 @@ public:
 	bool IsOrderDependent() const;
 
 	//! Record a PipelineTask execution interval for external per-core DVFS analysis.
+	idx_t GetProfilerPipelineId() const;
+	void SetEnergyAttributionPipeline(shared_ptr<EnergyAttributionQueryHandle> query_handle, idx_t pipeline_id);
+	EnergyAttributionQueryHandle *GetEnergyAttributionQueryState() const;
+	shared_ptr<EnergyAttributionQueryHandle> GetEnergyAttributionQueryHandle() const;
+	idx_t GetEnergyAttributionPipelineId() const;
 	idx_t RecordProfilerTaskStart(uint64_t thread_id, int start_cpu);
 	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
-	                           uint64_t task_duration_ns);
+	                           idx_t pipeline_input_tuples, idx_t pipeline_input_chunks, uint64_t task_duration_ns);
 
 	//! Registers a new batch index for a pipeline executor - returns the current minimum batch index
 	idx_t RegisterNewBatchIndex();
@@ -150,6 +156,9 @@ private:
 	optional_ptr<PhysicalOperator> sink;
 	//! The per-query pipeline profile id, if query profiling is enabled.
 	idx_t profiler_pipeline_id = 0;
+	//! Opaque per-query energy attribution state and pipeline id.
+	shared_ptr<EnergyAttributionQueryHandle> energy_attribution_query_handle;
+	idx_t energy_attribution_pipeline_id = 0;
 
 	//! The global source state
 	unique_ptr<GlobalSourceState> source_state;

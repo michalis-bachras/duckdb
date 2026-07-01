@@ -4,9 +4,11 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/tree_renderer/text_tree_renderer.hpp"
 #include "duckdb/execution/executor.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_profiler.hpp"
@@ -42,6 +44,14 @@ static int PipelineTaskCurrentCPU() {
 #endif
 }
 
+static bool PipelineTaskProfilingRequested(Pipeline &pipeline) {
+	if (!pipeline.GetProfilerPipelineId()) {
+		return false;
+	}
+	const auto &settings = ClientConfig::GetConfig(pipeline.GetClientContext()).pipeline_profiling;
+	return settings.task_trace || settings.throughput;
+}
+
 PipelineTask::PipelineTask(Pipeline &pipeline_p, shared_ptr<Event> event_p)
     : ExecutorTask(pipeline_p.executor, std::move(event_p)), pipeline(pipeline_p) {
 }
@@ -57,14 +67,48 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 }
 
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
-	auto task_start_ns = PipelineDVFSProfiler::TimestampNs();
-	auto profiler_task_id = pipeline.RecordProfilerTaskStart(PipelineTaskThreadId(), PipelineTaskCurrentCPU());
+	const bool energy_attribution_active = pipeline.GetEnergyAttributionQueryState() != nullptr;
+	const bool profiler_task_requested = PipelineTaskProfilingRequested(pipeline);
+	uint64_t task_start_ns = 0;
+	if (profiler_task_requested) {
+		task_start_ns = PipelineDVFSProfiler::TimestampNs();
+	}
+	int start_cpu = -1;
+	if (energy_attribution_active || profiler_task_requested) {
+		start_cpu = PipelineTaskCurrentCPU();
+	}
+	idx_t profiler_task_id = 0;
+	if (profiler_task_requested) {
+		profiler_task_id = pipeline.RecordProfilerTaskStart(PipelineTaskThreadId(), start_cpu);
+	}
+	EnergySegmentScope energy_scope(pipeline, start_cpu);
 	auto finish_profiler_task = [&]() {
 		auto empty_counters = SourceThroughputCounters();
-		const auto &counters = pipeline_executor ? pipeline_executor->GetSourceThroughputCounters() : empty_counters;
-		auto task_end_ns = PipelineDVFSProfiler::TimestampNs();
-		auto task_duration_ns = task_end_ns >= task_start_ns ? task_end_ns - task_start_ns : 0;
-		pipeline.RecordProfilerTaskEnd(profiler_task_id, PipelineTaskCurrentCPU(), counters, task_duration_ns);
+		const auto &counters = profiler_task_id && pipeline_executor ? pipeline_executor->GetSourceThroughputCounters()
+		                                                              : empty_counters;
+		idx_t pipeline_input_tuples = 0;
+		idx_t pipeline_input_chunks = 0;
+		if ((energy_attribution_active || profiler_task_id) && pipeline_executor) {
+			const auto &pipeline_input = pipeline_executor->GetPipelineInputCounters();
+			pipeline_input_tuples = pipeline_input.tuples;
+			pipeline_input_chunks = pipeline_input.chunks;
+		}
+		if (energy_attribution_active) {
+			energy_scope.SetWork(pipeline_input_tuples, pipeline_input_chunks);
+		}
+		int end_cpu = -1;
+		if (energy_attribution_active || profiler_task_id) {
+			end_cpu = PipelineTaskCurrentCPU();
+		}
+		if (energy_attribution_active) {
+			energy_scope.SetEndCPUHint(end_cpu);
+		}
+		if (profiler_task_id) {
+			auto task_end_ns = PipelineDVFSProfiler::TimestampNs();
+			auto task_duration_ns = task_end_ns >= task_start_ns ? task_end_ns - task_start_ns : 0;
+			pipeline.RecordProfilerTaskEnd(profiler_task_id, end_cpu, counters, pipeline_input_tuples,
+			                               pipeline_input_chunks, task_duration_ns);
+		}
 	};
 
 	if (!pipeline_executor) {
@@ -302,10 +346,15 @@ void Pipeline::Ready() {
 }
 
 void Pipeline::RegisterProfilerPipeline() {
-	if (profiler_pipeline_id || !source || !sink) {
+	if (!source || !sink) {
 		return;
 	}
-	profiler_pipeline_id = QueryProfiler::Get(GetClientContext()).RegisterPipelineProfile(*source, operators, sink);
+	if (!profiler_pipeline_id) {
+		profiler_pipeline_id = QueryProfiler::Get(GetClientContext()).RegisterPipelineProfile(*source, operators, sink);
+	}
+	if (!energy_attribution_query_handle) {
+		EnergyAttributionManager::AttachPipeline(GetClientContext(), *this, profiler_pipeline_id);
+	}
 }
 
 void Pipeline::RecordProfilerStart(idx_t task_count, idx_t source_max_threads,
@@ -328,6 +377,27 @@ void Pipeline::RecordProfilerFinishDone() {
 	}
 }
 
+idx_t Pipeline::GetProfilerPipelineId() const {
+	return profiler_pipeline_id;
+}
+
+void Pipeline::SetEnergyAttributionPipeline(shared_ptr<EnergyAttributionQueryHandle> query_handle, idx_t pipeline_id) {
+	energy_attribution_query_handle = std::move(query_handle);
+	energy_attribution_pipeline_id = pipeline_id;
+}
+
+EnergyAttributionQueryHandle *Pipeline::GetEnergyAttributionQueryState() const {
+	return energy_attribution_query_handle.get();
+}
+
+shared_ptr<EnergyAttributionQueryHandle> Pipeline::GetEnergyAttributionQueryHandle() const {
+	return energy_attribution_query_handle;
+}
+
+idx_t Pipeline::GetEnergyAttributionPipelineId() const {
+	return energy_attribution_pipeline_id;
+}
+
 idx_t Pipeline::RecordProfilerTaskStart(uint64_t thread_id, int start_cpu) {
 	if (!profiler_pipeline_id) {
 		return 0;
@@ -336,6 +406,7 @@ idx_t Pipeline::RecordProfilerTaskStart(uint64_t thread_id, int start_cpu) {
 }
 
 void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
+                                     idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
                                      uint64_t task_duration_ns) {
 	if (!task_id) {
 		return;
@@ -346,6 +417,7 @@ void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThr
 		throughput_estimate = source_throughput_estimator.Update(source_throughput, task_duration_ns);
 	}
 	QueryProfiler::Get(GetClientContext()).RecordPipelineTaskEnd(task_id, end_cpu, source_throughput,
+	                                                             pipeline_input_tuples, pipeline_input_chunks,
 	                                                             throughput_estimate);
 }
 

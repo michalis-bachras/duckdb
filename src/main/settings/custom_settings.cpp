@@ -11,6 +11,7 @@
 
 #include "duckdb/main/settings.hpp"
 
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/common/enums/access_mode.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
@@ -571,6 +572,287 @@ Value CustomProfilingSettingsSetting::GetSetting(const ClientContext &context) {
 	default:
 		throw InternalException("Invalid custom profiler settings type");
 	}
+}
+
+//===----------------------------------------------------------------------===//
+// Energy Attribution
+//===----------------------------------------------------------------------===//
+void EnergyAttributionEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto &config = ClientConfig::GetConfig(context);
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	auto enabled = BooleanValue::Get(value);
+	config.energy_attribution.enabled = enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionEnableSetting::ResetLocal(ClientContext &context) {
+	auto &config = ClientConfig::GetConfig(context);
+	config.energy_attribution.enabled = ClientConfig().energy_attribution.enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.enabled);
+}
+
+void EnergyAttributionOutputDirSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).energy_attribution.output_dir = input.ToString();
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionOutputDirSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.output_dir = ClientConfig().energy_attribution.output_dir;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionOutputDirSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).energy_attribution.output_dir);
+}
+
+void EnergyAttributionRaplEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.rapl_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionRaplEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.rapl_enabled =
+	    ClientConfig().energy_attribution.rapl_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionRaplEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.rapl_enabled);
+}
+
+void EnergyAttributionPerfCountersEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.perf_counters_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionPerfCountersEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.perf_counters_enabled =
+	    ClientConfig().energy_attribution.perf_counters_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionPerfCountersEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.perf_counters_enabled);
+}
+
+void EnergyAttributionExportEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.export_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionExportEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.export_enabled =
+	    ClientConfig().energy_attribution.export_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionExportEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.export_enabled);
+}
+
+void EnergyAttributionDebugExportEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.debug_export_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionDebugExportEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.debug_export_enabled =
+	    ClientConfig().energy_attribution.debug_export_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionDebugExportEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.debug_export_enabled);
+}
+
+void EnergyAttributionClosedSegmentsExportEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.closed_segments_export_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionClosedSegmentsExportEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.closed_segments_export_enabled =
+	    ClientConfig().energy_attribution.closed_segments_export_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionClosedSegmentsExportEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.closed_segments_export_enabled);
+}
+
+void EnergyAttributionOverheadDetailEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.overhead_detail_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionOverheadDetailEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.overhead_detail_enabled =
+	    ClientConfig().energy_attribution.overhead_detail_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionOverheadDetailEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.overhead_detail_enabled);
+}
+
+void EnergyAttributionPipelineSignaturesEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.pipeline_signatures_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionPipelineSignaturesEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.pipeline_signatures_enabled =
+	    ClientConfig().energy_attribution.pipeline_signatures_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionPipelineSignaturesEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.pipeline_signatures_enabled);
+}
+
+void EnergyAttributionMetadataCacheEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.metadata_cache_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionMetadataCacheEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.metadata_cache_enabled =
+	    ClientConfig().energy_attribution.metadata_cache_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionMetadataCacheEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.metadata_cache_enabled);
+}
+
+void EnergyAttributionMigrationCheckEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.migration_check_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionMigrationCheckEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.migration_check_enabled =
+	    ClientConfig().energy_attribution.migration_check_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionMigrationCheckEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.migration_check_enabled);
+}
+
+void EnergyAttributionProfileUpdateEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.profile_update_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionProfileUpdateEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.profile_update_enabled =
+	    ClientConfig().energy_attribution.profile_update_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionProfileUpdateEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.profile_update_enabled);
+}
+
+void EnergyAttributionPeriodicEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.periodic_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionPeriodicEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.periodic_enabled =
+	    ClientConfig().energy_attribution.periodic_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionPeriodicEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.periodic_enabled);
+}
+
+void EnergyAttributionPeriodMsSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto period_ms = input.GetValue<int64_t>();
+	if (period_ms <= 0) {
+		throw ParserException("energy_attribution_period_ms must be greater than zero");
+	}
+	ClientConfig::GetConfig(context).energy_attribution.period_ms = static_cast<uint64_t>(period_ms);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionPeriodMsSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.period_ms = ClientConfig().energy_attribution.period_ms;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionPeriodMsSetting::GetSetting(const ClientContext &context) {
+	return Value::BIGINT(NumericCast<int64_t>(ClientConfig::GetConfig(context).energy_attribution.period_ms));
+}
+
+void EnergyAttributionBasePowerPathSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).energy_attribution.base_power_path = input.ToString();
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionBasePowerPathSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.base_power_path =
+	    ClientConfig().energy_attribution.base_power_path;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionBasePowerPathSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).energy_attribution.base_power_path);
+}
+
+void EnergyAttributionCounterProfileSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = StringUtil::Lower(input.ToString());
+	if (value.empty()) {
+		value = ClientConfig().energy_attribution.counter_profile;
+	}
+	ClientConfig::GetConfig(context).energy_attribution.counter_profile = value;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionCounterProfileSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.counter_profile =
+	    ClientConfig().energy_attribution.counter_profile;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionCounterProfileSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).energy_attribution.counter_profile);
+}
+
+void EnergyAttributionFailPolicySetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = StringUtil::Lower(input.ToString());
+	if (value != "warn" && value != "silent") {
+		throw ParserException("energy_attribution_fail_policy must be 'warn' or 'silent'");
+	}
+	ClientConfig::GetConfig(context).energy_attribution.fail_policy = value;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionFailPolicySetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.fail_policy = ClientConfig().energy_attribution.fail_policy;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionFailPolicySetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).energy_attribution.fail_policy);
 }
 
 //===----------------------------------------------------------------------===//

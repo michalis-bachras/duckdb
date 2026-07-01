@@ -54,6 +54,11 @@ private:
 	idx_t maximum_to_process;
 };
 
+struct PipelineInputCounters {
+	idx_t tuples = 0;
+	idx_t chunks = 0;
+};
+
 //! The Pipeline class represents an execution pipeline
 class PipelineExecutor {
 public:
@@ -80,6 +85,7 @@ public:
 	void SetTaskForInterrupts(weak_ptr<Task> current_task);
 	void ResetSourceThroughputCounters();
 	const SourceThroughputCounters &GetSourceThroughputCounters() const;
+	const PipelineInputCounters &GetPipelineInputCounters() const;
 
 private:
 	//! The pipeline to process
@@ -102,7 +108,9 @@ private:
 	InterruptState interrupt_state;
 	//! Per-task source-side tuples touched by this pipeline executor.
 	SourceThroughputCounters source_throughput_counters;
+	PipelineInputCounters pipeline_input_counters;
 	bool collect_source_throughput = false;
+	bool collect_pipeline_input = false;
 
 	//! The final chunk used for moving data into the sink
 	DataChunk final_chunk;

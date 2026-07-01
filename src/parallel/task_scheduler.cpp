@@ -1,6 +1,7 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 
 #include "duckdb/common/chrono.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -21,6 +22,7 @@
 #include <windows.h>
 #elif defined(__GNUC__)
 #include <sched.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #if defined(__GLIBC__)
 #include <pthread.h>
@@ -400,13 +402,44 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 }
 
 #ifndef DUCKDB_NO_THREADS
-static void ThreadExecuteTasks(TaskScheduler *scheduler, atomic<bool> *marker) {
+static int64_t SchedulerThreadTID() {
+#ifdef __linux__
+	return static_cast<int64_t>(syscall(SYS_gettid));
+#else
+	return static_cast<int64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+#endif
+}
+
+static void SetCurrentThreadAffinity(int cpu_id) {
+#if defined(__GLIBC__)
+	if (cpu_id < 0) {
+		return;
+	}
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	CPU_SET(cpu_id, &cpuset);
+	sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+#else
+	(void)cpu_id;
+#endif
+}
+
+static void ThreadExecuteTasks(TaskScheduler *scheduler, atomic<bool> *marker, idx_t worker_id, int intended_cpu) {
+	SetCurrentThreadAffinity(intended_cpu);
+	auto &db = scheduler->GetDatabase();
+	auto linux_tid = SchedulerThreadTID();
+	EnergyAttributionManager::RegisterSchedulerWorker(db, static_cast<uint64_t>(worker_id), linux_tid, intended_cpu);
 	scheduler->ExecuteForever(marker);
+	EnergyAttributionManager::UnregisterSchedulerWorker(db, static_cast<uint64_t>(worker_id), linux_tid);
 }
 #endif
 
 int32_t TaskScheduler::NumberOfThreads() {
 	return current_thread_count.load();
+}
+
+DatabaseInstance &TaskScheduler::GetDatabase() {
+	return db;
 }
 
 idx_t TaskScheduler::GetNumberOfTasks() const {
@@ -504,6 +537,23 @@ void TaskScheduler::RelaunchThreads() {
 }
 
 #ifndef DUCKDB_NO_THREADS
+static vector<int> GetAffinityCPUs() {
+	vector<int> cpus;
+#if defined(__GLIBC__)
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	if (sched_getaffinity(0, sizeof(cpu_set_t), &cpuset) != 0) {
+		return cpus;
+	}
+	for (int cpu_id = 0; cpu_id < CPU_SETSIZE; cpu_id++) {
+		if (CPU_ISSET(cpu_id, &cpuset)) {
+			cpus.push_back(cpu_id);
+		}
+	}
+#endif
+	return cpus;
+}
+
 static void SetThreadAffinity(thread &thread, const int &cpu_id) {
 #if defined(__GLIBC__)
 	cpu_set_t cpuset;
@@ -531,6 +581,19 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n, bool destroy) {
 	}
 
 	if (threads.size() == new_thread_count) {
+		static constexpr idx_t THREAD_PIN_THRESHOLD = 64;
+		const auto pin_threads =
+		    pin_thread_mode == ThreadPinMode::ON ||
+		    (pin_thread_mode == ThreadPinMode::AUTO && std::thread::hardware_concurrency() > THREAD_PIN_THRESHOLD);
+		if (pin_threads) {
+			auto affinity_cpus = GetAffinityCPUs();
+			if (!affinity_cpus.empty()) {
+				for (idx_t thread_idx = 0; thread_idx < threads.size(); thread_idx++) {
+					auto cpu_idx = thread_idx % affinity_cpus.size();
+					SetThreadAffinity(*threads[thread_idx]->internal_thread, affinity_cpus[cpu_idx]);
+				}
+			}
+		}
 		current_thread_count = NumericCast<int32_t>(threads.size() + external_threads);
 		return;
 	}
@@ -557,14 +620,21 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n, bool destroy) {
 		const auto pin_threads =
 		    pin_thread_mode == ThreadPinMode::ON ||
 		    (pin_thread_mode == ThreadPinMode::AUTO && std::thread::hardware_concurrency() > THREAD_PIN_THRESHOLD);
+		auto affinity_cpus = pin_threads ? GetAffinityCPUs() : vector<int>();
 		for (idx_t i = 0; i < create_new_threads; i++) {
 			// launch a thread and assign it a cancellation marker
 			auto marker = unique_ptr<atomic<bool>>(new atomic<bool>(true));
 			unique_ptr<thread> worker_thread;
 			try {
-				worker_thread = make_uniq<thread>(ThreadExecuteTasks, this, marker.get());
-				if (pin_threads) {
-					SetThreadAffinity(*worker_thread, NumericCast<int>(threads.size()));
+				auto worker_id = threads.size();
+				int intended_cpu = -1;
+				if (pin_threads && !affinity_cpus.empty()) {
+					auto cpu_idx = threads.size() % affinity_cpus.size();
+					intended_cpu = affinity_cpus[cpu_idx];
+				}
+				worker_thread = make_uniq<thread>(ThreadExecuteTasks, this, marker.get(), worker_id, intended_cpu);
+				if (pin_threads && !affinity_cpus.empty()) {
+					SetThreadAffinity(*worker_thread, intended_cpu);
 				}
 			} catch (std::exception &ex) {
 				// thread constructor failed - this can happen when the system has too many threads allocated

@@ -2,6 +2,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
 #include "duckdb/execution/operator/helper/physical_set.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
@@ -77,6 +78,8 @@ DatabaseInstance::DatabaseInstance() : db_validity(*this) {
 }
 
 DatabaseInstance::~DatabaseInstance() {
+	EnergyAttributionManager::ShutdownDatabaseRuntime(*this);
+
 	// destroy all attached databases
 	if (db_manager) {
 		db_manager->ResetDatabases();

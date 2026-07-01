@@ -414,6 +414,176 @@ struct CustomProfilingSettingsSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct EnergyAttributionEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_enable";
+	static constexpr const char *Description = "Enable prototype RAPL/perf_event pipeline energy attribution";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionOutputDirSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "energy_attribution_output_dir";
+	static constexpr const char *Description = "Directory for energy attribution debug CSV files";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionRaplEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_rapl_enable";
+	static constexpr const char *Description = "Enable RAPL package-energy reads for energy attribution";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionPerfCountersEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_perf_counters_enable";
+	static constexpr const char *Description = "Enable perf_event counters for energy attribution segments";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionExportEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_export_enable";
+	static constexpr const char *Description = "Enable CSV/JSON debug exports for energy attribution";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionDebugExportEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_debug_export_enable";
+	static constexpr const char *Description = "Enable high-volume periodic window and segment CSV exports";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionClosedSegmentsExportEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_closed_segments_export_enable";
+	static constexpr const char *Description = "Enable high-volume periodic closed-segment CSV export";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionOverheadDetailEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_overhead_detail_enable";
+	static constexpr const char *Description = "Enable fine-grained periodic energy attribution overhead instrumentation";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionPipelineSignaturesEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_pipeline_signatures_enable";
+	static constexpr const char *Description = "Enable full pipeline signature rendering for energy attribution";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionMetadataCacheEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_metadata_cache_enable";
+	static constexpr const char *Description = "Enable cached CPU topology and frequency metadata for energy attribution";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionMigrationCheckEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_migration_check_enable";
+	static constexpr const char *Description = "Enable end-of-segment CPU migration checks for energy attribution";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionProfileUpdateEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_profile_update_enable";
+	static constexpr const char *Description = "Enable attribution/profile construction when energy attribution exports are disabled";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionPeriodicEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_periodic_enable";
+	static constexpr const char *Description = "Enable background periodic RAPL windows for energy attribution";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionPeriodMsSetting {
+	using RETURN_TYPE = int64_t;
+	static constexpr const char *Name = "energy_attribution_period_ms";
+	static constexpr const char *Description = "Background energy attribution accounting period in milliseconds";
+	static constexpr const char *InputType = "BIGINT";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionBasePowerPathSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "energy_attribution_base_power_path";
+	static constexpr const char *Description = "CSV calibration file for idle/base package power";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionCounterProfileSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "energy_attribution_counter_profile";
+	static constexpr const char *Description = "perf_event counter profile for energy attribution";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionFailPolicySetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "energy_attribution_fail_policy";
+	static constexpr const char *Description = "Failure policy for unavailable RAPL/perf events: warn or silent";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct CustomUserAgentSetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "custom_user_agent";

@@ -105,6 +105,8 @@ struct PipelineTaskProfilingInfo {
 	idx_t source_native_units_touched = 0;
 	string source_native_unit;
 	bool adaptive_morsel_candidate = false;
+	idx_t pipeline_input_tuples = 0;
+	idx_t pipeline_input_chunks = 0;
 	double estimated_tuples_per_task_s = 0;
 };
 
@@ -149,6 +151,10 @@ struct PipelineProfilingInfo {
 	idx_t source_native_units_touched = 0;
 	string source_native_unit;
 	bool adaptive_morsel_candidate = false;
+	idx_t pipeline_input_tuples = 0;
+	idx_t pipeline_input_chunks = 0;
+	idx_t pipeline_input_task_count = 0;
+	uint64_t pipeline_input_task_duration_ns = 0;
 	uint64_t throughput_task_duration_ns = 0;
 	idx_t throughput_task_count = 0;
 	string task_signature_key;
@@ -289,6 +295,7 @@ public:
 	DUCKDB_API idx_t RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu);
 	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu,
 	                                      const SourceThroughputCounters &source_throughput,
+	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
 	                                      const SourceThroughputEstimate &throughput_estimate);
 
 	DUCKDB_API string QueryTreeToString() const;

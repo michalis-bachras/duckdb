@@ -1,6 +1,7 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 
 #include "duckdb/common/limits.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -14,7 +15,10 @@ namespace duckdb {
 PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_p)
     : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p) {
 	D_ASSERT(pipeline.source_state);
-	collect_source_throughput = ClientConfig::GetConfig(context_p).pipeline_profiling.throughput;
+	const auto &config = ClientConfig::GetConfig(context_p);
+	collect_source_throughput = config.pipeline_profiling.throughput;
+	collect_pipeline_input =
+	    EnergyAttributionManager::Enabled(context_p) || config.pipeline_profiling.task_trace || config.pipeline_profiling.throughput;
 	if (pipeline.sink) {
 		local_sink_state = pipeline.sink->GetLocalSinkState(context);
 		required_partition_info = pipeline.sink->RequiredPartitionInfo();
@@ -487,11 +491,20 @@ void PipelineExecutor::SetTaskForInterrupts(weak_ptr<Task> current_task) {
 }
 
 void PipelineExecutor::ResetSourceThroughputCounters() {
-	source_throughput_counters = SourceThroughputCounters();
+	if (collect_source_throughput) {
+		source_throughput_counters = SourceThroughputCounters();
+	}
+	if (collect_pipeline_input) {
+		pipeline_input_counters = PipelineInputCounters();
+	}
 }
 
 const SourceThroughputCounters &PipelineExecutor::GetSourceThroughputCounters() const {
 	return source_throughput_counters;
+}
+
+const PipelineInputCounters &PipelineExecutor::GetPipelineInputCounters() const {
+	return pipeline_input_counters;
 }
 
 SourceResultType PipelineExecutor::GetData(DataChunk &chunk, OperatorSourceInput &input) {
@@ -539,6 +552,10 @@ SourceResultType PipelineExecutor::FetchFromSource(DataChunk &result) {
 	OperatorSourceInput source_input {*pipeline.source_state, *local_source_state, interrupt_state,
 	                                  collect_source_throughput ? &source_throughput_counters : nullptr};
 	auto res = GetData(result, source_input);
+	if (collect_pipeline_input && result.size() > 0) {
+		pipeline_input_counters.tuples += result.size();
+		pipeline_input_counters.chunks++;
+	}
 
 	// Ensures sources only return empty results when Blocking or Finished
 	D_ASSERT(res != SourceResultType::BLOCKED || result.size() == 0);

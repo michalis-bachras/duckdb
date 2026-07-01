@@ -44,6 +44,26 @@ struct PipelineProfilingSettings {
 	}
 };
 
+struct EnergyAttributionSettings {
+	bool enabled = false;
+	bool rapl_enabled = true;
+	bool perf_counters_enabled = true;
+	bool export_enabled = true;
+	bool debug_export_enabled = false;
+	bool closed_segments_export_enabled = false;
+	bool overhead_detail_enabled = false;
+	bool pipeline_signatures_enabled = true;
+	bool metadata_cache_enabled = true;
+	bool migration_check_enabled = true;
+	bool profile_update_enabled = true;
+	bool periodic_enabled = false;
+	uint64_t period_ms = 100;
+	string output_dir;
+	string base_power_path;
+	string counter_profile = "generic";
+	string fail_policy = "warn";
+};
+
 struct ClientConfig {
 	//! If the query profiler is enabled or not.
 	bool enable_profiler = false;
@@ -61,6 +81,8 @@ struct ClientConfig {
 	LogicalTypeId profiler_settings_type = LogicalTypeId::VARCHAR;
 	//! Optional pipeline-level profiling extensions controlled by custom_profiling_settings.
 	PipelineProfilingSettings pipeline_profiling;
+	//! Prototype Linux RAPL/perf_event pipeline energy attribution.
+	EnergyAttributionSettings energy_attribution;
 
 	//! Allows suppressing profiler output, even if enabled. We turn on the profiler on all test runs but don't want
 	//! to output anything

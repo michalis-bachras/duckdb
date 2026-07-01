@@ -8,6 +8,7 @@
 #include "duckdb/common/progress_bar/progress_bar.hpp"
 #include "duckdb/common/serializer/buffered_file_writer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -236,6 +237,7 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 	transaction.SetActiveQuery(db->GetDatabaseManager().GetNewQueryNumber());
 	LogQueryInternal(lock, query);
 	active_query->query = query;
+	EnergyAttributionManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
 
 	query_progress.Initialize();
 	// Notify any registered state of query begin
@@ -290,6 +292,7 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	} // LCOV_EXCL_STOP
 
 	client_data->profiler->EndQuery();
+	EnergyAttributionManager::EndQuery(*this);
 
 	// Refresh the logger
 	logger->Flush();
