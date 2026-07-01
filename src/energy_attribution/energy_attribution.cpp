@@ -841,10 +841,6 @@ struct PerfEventSpec {
 static long PerfEventOpen(struct perf_event_attr *hw_event, pid_t pid, int cpu, int group_fd, unsigned long flags) {
 	return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
-
-static uint64_t LLCacheReadMissConfig() {
-	return PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
-}
 #endif
 
 class PerfEventGroup {
