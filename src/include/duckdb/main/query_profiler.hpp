@@ -293,8 +293,7 @@ public:
 	DUCKDB_API void RecordPipelineProfileTasksDone(idx_t pipeline_id);
 	DUCKDB_API void RecordPipelineProfileFinishDone(idx_t pipeline_id);
 	DUCKDB_API idx_t RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu);
-	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu,
-	                                      const SourceThroughputCounters &source_throughput,
+	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
 	                                      const SourceThroughputEstimate &throughput_estimate);
 

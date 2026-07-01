@@ -183,8 +183,8 @@ struct PeriodicPipelineProfileKey {
 	int64_t uncore_freq_hz = 0;
 
 	bool operator==(const PeriodicPipelineProfileKey &other) const {
-		return query_id == other.query_id && pipeline_id == other.pipeline_id &&
-		       core_freq_hz == other.core_freq_hz && uncore_freq_hz == other.uncore_freq_hz;
+		return query_id == other.query_id && pipeline_id == other.pipeline_id && core_freq_hz == other.core_freq_hz &&
+		       uncore_freq_hz == other.uncore_freq_hz;
 	}
 };
 
@@ -272,8 +272,8 @@ static bool ReadFileToString(const string &path, string &result) {
 	std::stringstream buffer;
 	buffer << input.rdbuf();
 	result = buffer.str();
-	while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ' ||
-	                          result.back() == '\t')) {
+	while (!result.empty() &&
+	       (result.back() == '\n' || result.back() == '\r' || result.back() == ' ' || result.back() == '\t')) {
 		result.pop_back();
 	}
 	return true;
@@ -843,8 +843,7 @@ static long PerfEventOpen(struct perf_event_attr *hw_event, pid_t pid, int cpu, 
 }
 
 static uint64_t LLCacheReadMissConfig() {
-	return PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) |
-	       (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
+	return PERF_COUNT_HW_CACHE_LL | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16);
 }
 #endif
 
@@ -891,8 +890,7 @@ public:
 			int fd = NumericCast<int>(PerfEventOpen(&attr, static_cast<pid_t>(tid), -1, group_fd, 0));
 			if (fd < 0) {
 				if (specs[i].required && group_fd == -1) {
-					status = StringUtil::Format("perf_event_open(%s) failed: %s", specs[i].name,
-					                            std::strerror(errno));
+					status = StringUtil::Format("perf_event_open(%s) failed: %s", specs[i].name, std::strerror(errno));
 					Close();
 					return false;
 				}
@@ -940,7 +938,8 @@ public:
 		memset(buffer, 0, sizeof(buffer));
 		auto bytes = read(leader_fd, buffer, sizeof(buffer));
 		if (bytes < static_cast<ssize_t>(sizeof(uint64_t) * 3)) {
-			snapshot.status = StringUtil::Format("perf read failed: %s", bytes < 0 ? std::strerror(errno) : "short read");
+			snapshot.status =
+			    StringUtil::Format("perf read failed: %s", bytes < 0 ? std::strerror(errno) : "short read");
 			return snapshot;
 		}
 		auto nr = buffer[0];
@@ -1212,8 +1211,8 @@ static thread_local EnergyThreadState g_thread_energy_state;
 
 static EnergyThreadSegmentBuffer *GetThreadSegmentBuffer(QueryEnergyState &query, int64_t tid) {
 	auto &thread_state = g_thread_energy_state;
-	if (thread_state.buffer && thread_state.buffer_query == &query &&
-	    thread_state.buffer_query_id == query.query_id && thread_state.buffer_query_start_ns == query.start_ns) {
+	if (thread_state.buffer && thread_state.buffer_query == &query && thread_state.buffer_query_id == query.query_id &&
+	    thread_state.buffer_query_start_ns == query.start_ns) {
 		return thread_state.buffer;
 	}
 	auto buffer = make_shared_ptr<EnergyThreadSegmentBuffer>();
@@ -1462,9 +1461,9 @@ static vector<SocketEnergyWindow> BuildSocketWindows(QueryEnergyState &state, co
 		window.socket_id = end.socket_id;
 		window.start_ns = state.start_ns;
 		window.end_ns = end_ns;
-		window.duration_s = end_ns > state.start_ns ? static_cast<double>(end_ns - state.start_ns) /
-		                                                  static_cast<double>(NSEC_PER_SEC)
-		                                            : 0;
+		window.duration_s = end_ns > state.start_ns
+		                        ? static_cast<double>(end_ns - state.start_ns) / static_cast<double>(NSEC_PER_SEC)
+		                        : 0;
 		window.rapl_start_uj = start_entry->second.energy_uj;
 		window.rapl_end_uj = end.energy_uj;
 		window.rapl_valid = start_entry->second.valid && end.valid;
@@ -1473,12 +1472,11 @@ static vector<SocketEnergyWindow> BuildSocketWindows(QueryEnergyState &state, co
 		window.core_freq_hz = AverageCoreFreqForSocket(segments, window.socket_id);
 		window.uncore_freq_hz = AverageUncoreFreqForSocket(segments, window.socket_id);
 		double base_power_w = 0;
-			window.base_power_valid =
-			    LookupBasePower(state.base_power_entries, window.socket_id, window.core_freq_hz, window.uncore_freq_hz, 0,
-			                    base_power_w);
-			window.base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
-			window.total_base_energy_j = window.base_energy_j;
-			window.active_package_energy_j = std::max(0.0, window.package_energy_j - window.base_energy_j);
+		window.base_power_valid = LookupBasePower(state.base_power_entries, window.socket_id, window.core_freq_hz,
+		                                          window.uncore_freq_hz, 0, base_power_w);
+		window.base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
+		window.total_base_energy_j = window.base_energy_j;
+		window.active_package_energy_j = std::max(0.0, window.package_energy_j - window.base_energy_j);
 		if (!window.rapl_valid) {
 			window.status = "rapl_unavailable";
 		} else if (!window.base_power_valid) {
@@ -1503,14 +1501,14 @@ static vector<SocketEnergyWindow> BuildSocketWindows(QueryEnergyState &state, co
 		window.socket_id = entry->first;
 		window.start_ns = state.start_ns;
 		window.end_ns = end_ns;
-		window.duration_s = end_ns > state.start_ns ? static_cast<double>(end_ns - state.start_ns) /
-		                                                  static_cast<double>(NSEC_PER_SEC)
-		                                            : 0;
-			window.core_freq_hz = AverageCoreFreqForSocket(segments, window.socket_id);
-			window.uncore_freq_hz = AverageUncoreFreqForSocket(segments, window.socket_id);
-			window.status = "rapl_unavailable";
-			window.total_base_energy_j = window.base_energy_j;
-			windows.push_back(window);
+		window.duration_s = end_ns > state.start_ns
+		                        ? static_cast<double>(end_ns - state.start_ns) / static_cast<double>(NSEC_PER_SEC)
+		                        : 0;
+		window.core_freq_hz = AverageCoreFreqForSocket(segments, window.socket_id);
+		window.uncore_freq_hz = AverageUncoreFreqForSocket(segments, window.socket_id);
+		window.status = "rapl_unavailable";
+		window.total_base_energy_j = window.base_energy_j;
+		windows.push_back(window);
 	}
 	return windows;
 }
@@ -1595,8 +1593,8 @@ static void AttributeSegments(vector<AttributedSegment> &segments, vector<Socket
 			}
 			segment.base_time_weight = duration;
 			segment.base_time_denominator_s = time_sum;
-			segment.attributed_base_energy_j = window.busy_base_energy_j * segment.base_time_weight /
-			                                   segment.base_time_denominator_s;
+			segment.attributed_base_energy_j =
+			    window.busy_base_energy_j * segment.base_time_weight / segment.base_time_denominator_s;
 			window.summed_attributed_base_energy_j += segment.attributed_base_energy_j;
 		}
 		window.active_conservation_error_j = window.active_package_energy_j - window.summed_attributed_active_energy_j;
@@ -1605,8 +1603,8 @@ static void AttributeSegments(vector<AttributedSegment> &segments, vector<Socket
 }
 
 static string ProfileKey(const EnergySegmentRecord &record) {
-	return record.pipeline_signature + "|" + StringUtil::Format("%.0f|%.0f|%d", record.core_freq_hz,
-	                                                             record.uncore_freq_hz, record.smt_occupancy);
+	return record.pipeline_signature + "|" +
+	       StringUtil::Format("%.0f|%.0f|%d", record.core_freq_hz, record.uncore_freq_hz, record.smt_occupancy);
 }
 
 static string EfficiencyProfileKey(const EnergySegmentRecord &record) {
@@ -1713,16 +1711,15 @@ static void WriteSegmentsCSV(const string &path, const vector<AttributedSegment>
 	       "hardware_state_stable,migrated,counter_status\n";
 	for (idx_t i = 0; i < segments.size(); i++) {
 		const auto &r = segments[i].record;
-		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << ","
-		    << r.socket_id << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
-		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id
-		    << "," << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << ","
-		    << r.start_ns << "," << r.end_ns << "," << r.duration_s << "," << r.work_units << "," << r.tuples
-		    << "," << r.chunks << "," << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy
-		    << "," << r.cycles << "," << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << ","
-		    << r.cache_misses << "," << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid
-		    << "," << r.counters_scaled << "," << r.hardware_state_stable << "," << r.migrated << ","
-		    << CsvEscape(r.counter_status) << "\n";
+		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << "," << r.socket_id
+		    << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
+		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id << ","
+		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << "," << r.start_ns << ","
+		    << r.end_ns << "," << r.duration_s << "," << r.work_units << "," << r.tuples << "," << r.chunks << ","
+		    << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy << "," << r.cycles << ","
+		    << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << "," << r.cache_misses << ","
+		    << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid << "," << r.counters_scaled << ","
+		    << r.hardware_state_stable << "," << r.migrated << "," << CsvEscape(r.counter_status) << "\n";
 	}
 }
 
@@ -1743,17 +1740,16 @@ static void WriteClosedSegmentsCSV(const string &path, vector<EnergySegmentRecor
 		const auto &r = segments[i];
 		auto duration = SegmentDuration(r);
 		auto throughput = duration > 0 ? static_cast<double>(r.work_units) / duration : 0;
-		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << ","
-		    << r.socket_id << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
-		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id
-		    << "," << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << ","
-		    << r.start_ns << "," << r.end_ns << "," << duration << "," << r.work_units << "," << r.tuples
-		    << "," << r.chunks << "," << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy
-		    << "," << r.cycles << "," << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << ","
-		    << r.cache_misses << "," << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid
-		    << "," << r.counters_scaled << "," << r.hardware_state_stable << "," << r.migrated << ","
-		    << CsvEscape(r.counter_status) << "," << SegmentFrequencyRatio(r) << "," << SegmentCorrectedCycles(r)
-		    << "," << throughput << "\n";
+		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << "," << r.socket_id
+		    << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
+		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id << ","
+		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << "," << r.start_ns << ","
+		    << r.end_ns << "," << duration << "," << r.work_units << "," << r.tuples << "," << r.chunks << ","
+		    << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy << "," << r.cycles << ","
+		    << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << "," << r.cache_misses << ","
+		    << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid << "," << r.counters_scaled << ","
+		    << r.hardware_state_stable << "," << r.migrated << "," << CsvEscape(r.counter_status) << ","
+		    << SegmentFrequencyRatio(r) << "," << SegmentCorrectedCycles(r) << "," << throughput << "\n";
 	}
 }
 
@@ -1769,13 +1765,12 @@ static void WriteSocketWindowsCSV(const string &path, const vector<SocketEnergyW
 		const auto &w = windows[i];
 		double summed_charged_energy = w.summed_attributed_active_energy_j + w.summed_attributed_base_energy_j;
 		double package_conservation_error = w.package_energy_j - summed_charged_energy;
-		out << w.window_id << "," << w.socket_id << "," << w.start_ns << "," << w.end_ns << "," << w.duration_s
-		    << "," << w.rapl_start_uj << "," << w.rapl_end_uj << "," << w.package_energy_j << ","
-		    << w.core_freq_hz << "," << w.uncore_freq_hz << "," << w.base_energy_j << ","
-		    << w.active_package_energy_j << "," << w.summed_attributed_active_energy_j << ","
-		    << w.active_conservation_error_j << "," << w.summed_attributed_base_energy_j << ","
-		    << w.base_conservation_error_j << "," << summed_charged_energy << "," << package_conservation_error << ","
-		    << w.rapl_valid << "," << w.base_power_valid << ","
+		out << w.window_id << "," << w.socket_id << "," << w.start_ns << "," << w.end_ns << "," << w.duration_s << ","
+		    << w.rapl_start_uj << "," << w.rapl_end_uj << "," << w.package_energy_j << "," << w.core_freq_hz << ","
+		    << w.uncore_freq_hz << "," << w.base_energy_j << "," << w.active_package_energy_j << ","
+		    << w.summed_attributed_active_energy_j << "," << w.active_conservation_error_j << ","
+		    << w.summed_attributed_base_energy_j << "," << w.base_conservation_error_j << "," << summed_charged_energy
+		    << "," << package_conservation_error << "," << w.rapl_valid << "," << w.base_power_valid << ","
 		    << w.used_time_fallback << "," << CsvEscape(w.status) << "," << w.segment_count << ","
 		    << w.total_base_energy_j << "," << w.busy_wall_time_s << "," << w.idle_gap_wall_time_s << ","
 		    << w.busy_base_energy_j << "," << w.idle_gap_base_energy_j << "\n";
@@ -1799,12 +1794,12 @@ static void WriteAttributedSegmentsCSV(const string &path, const vector<Attribut
 		double charged_power = duration > 0 ? charged_total_energy / duration : 0;
 		out << s.record.segment_id << "," << s.record.query_id << "," << s.record.pipeline_id << ","
 		    << CsvEscape(s.record.pipeline_signature) << "," << s.record.socket_id << "," << s.record.physical_core_id
-		    << "," << s.record.logical_cpu_id << "," << duration << "," << s.record.work_units
-		    << "," << s.frequency_ratio << "," << s.corrected_cycles << "," << s.activity_weight << ","
-		    << s.weight_denominator << "," << s.attributed_active_energy_j << "," << s.base_time_weight << ","
-		    << s.base_time_denominator_s << "," << s.attributed_base_energy_j << "," << charged_total_energy << ","
-		    << s.throughput << "," << cycles_per_work << "," << active_power << "," << charged_power << ","
-		    << CsvEscape(s.attribution_status) << "\n";
+		    << "," << s.record.logical_cpu_id << "," << duration << "," << s.record.work_units << ","
+		    << s.frequency_ratio << "," << s.corrected_cycles << "," << s.activity_weight << "," << s.weight_denominator
+		    << "," << s.attributed_active_energy_j << "," << s.base_time_weight << "," << s.base_time_denominator_s
+		    << "," << s.attributed_base_energy_j << "," << charged_total_energy << "," << s.throughput << ","
+		    << cycles_per_work << "," << active_power << "," << charged_power << "," << CsvEscape(s.attribution_status)
+		    << "\n";
 	}
 }
 
@@ -1821,9 +1816,9 @@ static void WriteProfilesCSV(const string &path, const vector<PipelineProfileAgg
 		double charged_energy = p.active_energy_j + p.base_energy_j;
 		double charged_power = p.duration_s > 0 ? charged_energy / p.duration_s : 0;
 		out << CsvEscape(p.pipeline_signature) << "," << p.core_freq_hz << "," << p.uncore_freq_hz << ","
-		    << p.smt_occupancy << "," << p.samples << "," << throughput << "," << cycles_per_work << ","
-		    << active_power << "," << charged_power << "," << p.work_units << "," << p.duration_s << ","
-		    << p.active_energy_j << "," << p.base_energy_j << "," << charged_energy << "\n";
+		    << p.smt_occupancy << "," << p.samples << "," << throughput << "," << cycles_per_work << "," << active_power
+		    << "," << charged_power << "," << p.work_units << "," << p.duration_s << "," << p.active_energy_j << ","
+		    << p.base_energy_j << "," << charged_energy << "\n";
 	}
 }
 
@@ -1858,28 +1853,24 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 		double corrected_cycles_per_row = p.total_input_rows > 0 ? p.corrected_cycles / p.total_input_rows : 0;
 		double input_corrected_cycles_per_row =
 		    p.total_input_rows > 0 ? p.input_corrected_cycles / p.total_input_rows : 0;
-		double energy_only_charged_energy =
-		    p.energy_only_active_energy_j + p.energy_only_base_time_share_energy_j;
-		double elapsed_s = p.end_ns > p.start_ns ? static_cast<double>(p.end_ns - p.start_ns) /
-		                                           static_cast<double>(NSEC_PER_SEC)
-		                                         : 0;
+		double energy_only_charged_energy = p.energy_only_active_energy_j + p.energy_only_base_time_share_energy_j;
+		double elapsed_s =
+		    p.end_ns > p.start_ns ? static_cast<double>(p.end_ns - p.start_ns) / static_cast<double>(NSEC_PER_SEC) : 0;
 		out << p.query_id << ",";
 		if (include_query_lifecycle) {
 			out << p.start_ns << "," << p.end_ns << "," << elapsed_s << ",";
 		}
 		out << p.pipeline_id << "," << CsvEscape(p.pipeline_signature) << "," << p.core_freq_hz << ","
-		    << p.uncore_freq_hz << "," << p.smt_occupancy << "," << p.sample_count << ","
-		    << p.valid_input_sample_count << "," << p.energy_only_sample_count << ","
-		    << p.total_input_rows << "," << p.total_input_chunks << "," << p.total_duration_s << ","
-		    << p.input_duration_s << "," << total_throughput << "," << input_throughput << ","
-		    << p.attributed_active_energy_j << "," << p.input_attributed_active_energy_j << ","
-		    << p.base_time_share_energy_j << "," << p.input_base_time_share_energy_j << ","
-		    << charged_total_energy << "," << input_charged_total_energy << "," << active_power << ","
-		    << charged_power << "," << active_throughput_per_watt << "," << charged_throughput_per_watt << ","
-		    << active_energy_per_row << "," << charged_energy_per_row << "," << p.corrected_cycles << ","
-		    << corrected_cycles_per_row << "," << input_corrected_cycles_per_row << ","
-		    << p.energy_only_duration_s << "," << p.energy_only_active_energy_j << ","
-		    << p.energy_only_base_time_share_energy_j << "," << energy_only_charged_energy << "\n";
+		    << p.uncore_freq_hz << "," << p.smt_occupancy << "," << p.sample_count << "," << p.valid_input_sample_count
+		    << "," << p.energy_only_sample_count << "," << p.total_input_rows << "," << p.total_input_chunks << ","
+		    << p.total_duration_s << "," << p.input_duration_s << "," << total_throughput << "," << input_throughput
+		    << "," << p.attributed_active_energy_j << "," << p.input_attributed_active_energy_j << ","
+		    << p.base_time_share_energy_j << "," << p.input_base_time_share_energy_j << "," << charged_total_energy
+		    << "," << input_charged_total_energy << "," << active_power << "," << charged_power << ","
+		    << active_throughput_per_watt << "," << charged_throughput_per_watt << "," << active_energy_per_row << ","
+		    << charged_energy_per_row << "," << p.corrected_cycles << "," << corrected_cycles_per_row << ","
+		    << input_corrected_cycles_per_row << "," << p.energy_only_duration_s << "," << p.energy_only_active_energy_j
+		    << "," << p.energy_only_base_time_share_energy_j << "," << energy_only_charged_energy << "\n";
 	}
 }
 
@@ -1911,15 +1902,15 @@ static void WriteValidationSummary(const string &path, const vector<SocketEnergy
 		const auto &w = windows[i];
 		double summed_charged_energy = w.summed_attributed_active_energy_j + w.summed_attributed_base_energy_j;
 		double package_conservation_error = w.package_energy_j - summed_charged_energy;
-		out << "    {\"socket_id\": " << w.socket_id << ", \"active_package_energy_j\": "
-		    << w.active_package_energy_j << ", \"attributed_active_energy_j\": "
-		    << w.summed_attributed_active_energy_j << ", \"active_conservation_error_j\": "
-		    << w.active_conservation_error_j << ", \"base_energy_j\": " << w.base_energy_j
+		out << "    {\"socket_id\": " << w.socket_id << ", \"active_package_energy_j\": " << w.active_package_energy_j
+		    << ", \"attributed_active_energy_j\": " << w.summed_attributed_active_energy_j
+		    << ", \"active_conservation_error_j\": " << w.active_conservation_error_j
+		    << ", \"base_energy_j\": " << w.base_energy_j
 		    << ", \"attributed_base_energy_j\": " << w.summed_attributed_base_energy_j
 		    << ", \"base_conservation_error_j\": " << w.base_conservation_error_j
 		    << ", \"charged_energy_j\": " << summed_charged_energy
-		    << ", \"package_conservation_error_j\": " << package_conservation_error << ", \"time_fallback\": "
-		    << (w.used_time_fallback ? "true" : "false") << "}";
+		    << ", \"package_conservation_error_j\": " << package_conservation_error
+		    << ", \"time_fallback\": " << (w.used_time_fallback ? "true" : "false") << "}";
 		if (i + 1 < windows.size()) {
 			out << ",";
 		}
@@ -1964,10 +1955,9 @@ static void FinalizeAndWrite(QueryEnergyState &state) {
 		buffer->Drain(raw_segments);
 	}
 	FillPipelineSignatures(pipeline_signatures, raw_segments, state.settings.pipeline_signatures_enabled);
-	std::sort(raw_segments.begin(), raw_segments.end(), [](const EnergySegmentRecord &lhs,
-	                                                       const EnergySegmentRecord &rhs) {
-		return lhs.segment_id < rhs.segment_id;
-	});
+	std::sort(
+	    raw_segments.begin(), raw_segments.end(),
+	    [](const EnergySegmentRecord &lhs, const EnergySegmentRecord &rhs) { return lhs.segment_id < rhs.segment_id; });
 	vector<AttributedSegment> segments;
 	for (idx_t i = 0; i < raw_segments.size(); i++) {
 		AttributedSegment attributed;
@@ -1986,13 +1976,13 @@ static void FinalizeAndWrite(QueryEnergyState &state) {
 		return;
 	}
 	auto output_segments = segments;
-	std::sort(output_segments.begin(), output_segments.end(), [](const AttributedSegment &lhs,
-	                                                             const AttributedSegment &rhs) {
-		if (lhs.record.start_ns != rhs.record.start_ns) {
-			return lhs.record.start_ns < rhs.record.start_ns;
-		}
-		return lhs.record.segment_id < rhs.record.segment_id;
-	});
+	std::sort(output_segments.begin(), output_segments.end(),
+	          [](const AttributedSegment &lhs, const AttributedSegment &rhs) {
+		          if (lhs.record.start_ns != rhs.record.start_ns) {
+			          return lhs.record.start_ns < rhs.record.start_ns;
+		          }
+		          return lhs.record.segment_id < rhs.record.segment_id;
+	          });
 	EnsureDirectoryRecursive(state.output_dir);
 	WriteSegmentsCSV(state.output_dir + "/energy_segments.csv", output_segments);
 	WriteSocketWindowsCSV(state.output_dir + "/socket_energy_windows.csv", windows);
@@ -2018,9 +2008,9 @@ static EnergySegmentRecord SliceSegmentRecord(const EnergySegmentRecord &record,
 	                        ? static_cast<double>(slice_end_ns - slice_start_ns) / static_cast<double>(NSEC_PER_SEC)
 	                        : 0;
 	auto original_duration_ns = record.end_ns > record.start_ns ? record.end_ns - record.start_ns : 0;
-	double fraction = original_duration_ns > 0
-	                      ? static_cast<double>(slice_end_ns - slice_start_ns) / static_cast<double>(original_duration_ns)
-	                      : 0;
+	double fraction = original_duration_ns > 0 ? static_cast<double>(slice_end_ns - slice_start_ns) /
+	                                                 static_cast<double>(original_duration_ns)
+	                                           : 0;
 	result.work_units = ScaleByFraction(record.work_units, fraction);
 	result.tuples = ScaleByFraction(record.tuples, fraction);
 	result.chunks = ScaleByFraction(record.chunks, fraction);
@@ -2449,17 +2439,17 @@ public:
 	}
 
 private:
-		static bool SettingsMatch(const EnergyAttributionSettings &lhs, const EnergyAttributionSettings &rhs) {
-				return lhs.enabled == rhs.enabled && lhs.rapl_enabled == rhs.rapl_enabled &&
-				       lhs.perf_counters_enabled == rhs.perf_counters_enabled && lhs.export_enabled == rhs.export_enabled &&
-				       lhs.debug_export_enabled == rhs.debug_export_enabled &&
-				       lhs.closed_segments_export_enabled == rhs.closed_segments_export_enabled &&
-				       lhs.overhead_detail_enabled == rhs.overhead_detail_enabled &&
-				       lhs.pipeline_signatures_enabled == rhs.pipeline_signatures_enabled &&
-			       lhs.metadata_cache_enabled == rhs.metadata_cache_enabled &&
-			       lhs.migration_check_enabled == rhs.migration_check_enabled &&
-			       lhs.profile_update_enabled == rhs.profile_update_enabled &&
-			       lhs.periodic_enabled == rhs.periodic_enabled && lhs.period_ms == rhs.period_ms &&
+	static bool SettingsMatch(const EnergyAttributionSettings &lhs, const EnergyAttributionSettings &rhs) {
+		return lhs.enabled == rhs.enabled && lhs.rapl_enabled == rhs.rapl_enabled &&
+		       lhs.perf_counters_enabled == rhs.perf_counters_enabled && lhs.export_enabled == rhs.export_enabled &&
+		       lhs.debug_export_enabled == rhs.debug_export_enabled &&
+		       lhs.closed_segments_export_enabled == rhs.closed_segments_export_enabled &&
+		       lhs.overhead_detail_enabled == rhs.overhead_detail_enabled &&
+		       lhs.pipeline_signatures_enabled == rhs.pipeline_signatures_enabled &&
+		       lhs.metadata_cache_enabled == rhs.metadata_cache_enabled &&
+		       lhs.migration_check_enabled == rhs.migration_check_enabled &&
+		       lhs.profile_update_enabled == rhs.profile_update_enabled &&
+		       lhs.periodic_enabled == rhs.periodic_enabled && lhs.period_ms == rhs.period_ms &&
 		       lhs.output_dir == rhs.output_dir && lhs.base_power_path == rhs.base_power_path &&
 		       lhs.counter_profile == rhs.counter_profile && lhs.fail_policy == rhs.fail_policy;
 	}
@@ -2619,9 +2609,8 @@ private:
 
 	void DecrementActiveQueryCount() {
 		auto count = active_query_count.load(std::memory_order_relaxed);
-		while (count > 0 &&
-		       !active_query_count.compare_exchange_weak(count, count - 1, std::memory_order_relaxed,
-		                                                 std::memory_order_relaxed)) {
+		while (count > 0 && !active_query_count.compare_exchange_weak(count, count - 1, std::memory_order_relaxed,
+		                                                              std::memory_order_relaxed)) {
 		}
 	}
 
@@ -2698,45 +2687,45 @@ private:
 		}
 		if (have_closed_record) {
 			queued_closed_segment_records.push_back(std::move(closed_record));
-			}
 		}
+	}
 
-		PeriodicRuntimeOverheadRecord *DetailOverhead(PeriodicRuntimeOverheadRecord *overhead) const {
-			return settings.overhead_detail_enabled ? overhead : nullptr;
+	PeriodicRuntimeOverheadRecord *DetailOverhead(PeriodicRuntimeOverheadRecord *overhead) const {
+		return settings.overhead_detail_enabled ? overhead : nullptr;
+	}
+
+	static uint64_t DetailTimestamp(PeriodicRuntimeOverheadRecord *overhead) {
+		return overhead ? TimestampNs() : 0;
+	}
+
+	static void DetailAddSince(PeriodicRuntimeOverheadRecord *overhead, uint64_t PeriodicRuntimeOverheadRecord::*field,
+	                           uint64_t start_ns) {
+		if (!overhead || start_ns == 0) {
+			return;
 		}
+		overhead->*field += DurationNs(TimestampNs(), start_ns);
+	}
 
-		static uint64_t DetailTimestamp(PeriodicRuntimeOverheadRecord *overhead) {
-			return overhead ? TimestampNs() : 0;
+	void DrainQueuedRecords(vector<EnergySegmentRecord> &segments, vector<EnergySegmentRecord> &closed_segments,
+	                        vector<EnergySegmentRecord> &queue_segments,
+	                        vector<EnergySegmentRecord> &queue_closed_segments,
+	                        PeriodicRuntimeOverheadRecord *overhead = nullptr,
+	                        PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
+		queue_segments.clear();
+		queue_closed_segments.clear();
+		{
+			auto lock_wait_start_ns = DetailTimestamp(detail_overhead);
+			lock_guard<mutex> guard(queue_lock);
+			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::queue_lock_wait_ns, lock_wait_start_ns);
+			auto swap_start_ns = DetailTimestamp(detail_overhead);
+			queue_segments.swap(queued_segment_records);
+			queue_closed_segments.swap(queued_closed_segment_records);
+			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::queue_swap_ns, swap_start_ns);
 		}
-
-		static void DetailAddSince(PeriodicRuntimeOverheadRecord *overhead,
-		                           uint64_t PeriodicRuntimeOverheadRecord::*field, uint64_t start_ns) {
-			if (!overhead || start_ns == 0) {
-				return;
-			}
-			overhead->*field += DurationNs(TimestampNs(), start_ns);
+		if (overhead) {
+			overhead->queued_segment_count += queue_segments.size();
+			overhead->closed_segment_count += queue_closed_segments.size();
 		}
-
-		void DrainQueuedRecords(vector<EnergySegmentRecord> &segments, vector<EnergySegmentRecord> &closed_segments,
-		                        vector<EnergySegmentRecord> &queue_segments,
-		                        vector<EnergySegmentRecord> &queue_closed_segments,
-		                        PeriodicRuntimeOverheadRecord *overhead = nullptr,
-		                        PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
-			queue_segments.clear();
-			queue_closed_segments.clear();
-			{
-				auto lock_wait_start_ns = DetailTimestamp(detail_overhead);
-				lock_guard<mutex> guard(queue_lock);
-				DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::queue_lock_wait_ns, lock_wait_start_ns);
-				auto swap_start_ns = DetailTimestamp(detail_overhead);
-				queue_segments.swap(queued_segment_records);
-				queue_closed_segments.swap(queued_closed_segment_records);
-				DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::queue_swap_ns, swap_start_ns);
-			}
-			if (overhead) {
-				overhead->queued_segment_count += queue_segments.size();
-				overhead->closed_segment_count += queue_closed_segments.size();
-			}
 		segments.insert(segments.end(), std::make_move_iterator(queue_segments.begin()),
 		                std::make_move_iterator(queue_segments.end()));
 		closed_segments.insert(closed_segments.end(), std::make_move_iterator(queue_closed_segments.begin()),
@@ -2809,121 +2798,121 @@ private:
 		return slice;
 	}
 
-		void SnapshotWorkerSegmentLocked(PeriodicWorkerSegmentState &worker_state, uint64_t end_ns,
-		                                 const EnergySegmentRecord *end_record,
-		                                 vector<EnergySegmentRecord> &target,
-		                                 PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
-			if (!worker_state.active || end_ns <= worker_state.last_boundary_ns) {
-				return;
-			}
-			auto query = worker_state.query;
-			PerfCounters counters;
-			if (query && query->settings.perf_counters_enabled && worker_state.last_perf.valid) {
-				auto perf_start_ns = DetailTimestamp(detail_overhead);
-				auto end_perf = ReadWorkerPerfSnapshotLocked(worker_state, query->settings);
-				DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::snapshot_perf_read_ns, perf_start_ns);
-				counters = DeltaPerfCounters(worker_state.last_perf, end_perf);
-				worker_state.last_perf = end_perf;
-			} else if (query && query->settings.perf_counters_enabled) {
-				counters.status = worker_state.last_perf.status.empty() ? worker_state.perf_status : worker_state.last_perf.status;
-			} else {
-				counters.status = "perf disabled";
-			}
-
-			auto record_build_start_ns = DetailTimestamp(detail_overhead);
-			auto slice = BuildPeriodicSliceRecord(worker_state.record, worker_state.last_boundary_ns, end_ns, counters,
-			                                      end_record);
-			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::snapshot_record_build_ns,
-			               record_build_start_ns);
-			target.push_back(std::move(slice));
-			AddPerfCounters(worker_state.accumulated_counters, counters);
-			worker_state.last_boundary_ns = end_ns;
+	void SnapshotWorkerSegmentLocked(PeriodicWorkerSegmentState &worker_state, uint64_t end_ns,
+	                                 const EnergySegmentRecord *end_record, vector<EnergySegmentRecord> &target,
+	                                 PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
+		if (!worker_state.active || end_ns <= worker_state.last_boundary_ns) {
+			return;
+		}
+		auto query = worker_state.query;
+		PerfCounters counters;
+		if (query && query->settings.perf_counters_enabled && worker_state.last_perf.valid) {
+			auto perf_start_ns = DetailTimestamp(detail_overhead);
+			auto end_perf = ReadWorkerPerfSnapshotLocked(worker_state, query->settings);
+			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::snapshot_perf_read_ns, perf_start_ns);
+			counters = DeltaPerfCounters(worker_state.last_perf, end_perf);
+			worker_state.last_perf = end_perf;
+		} else if (query && query->settings.perf_counters_enabled) {
+			counters.status =
+			    worker_state.last_perf.status.empty() ? worker_state.perf_status : worker_state.last_perf.status;
+		} else {
+			counters.status = "perf disabled";
 		}
 
-		void SnapshotActiveWorkerSegments(uint64_t now_ns,
-		                                  const vector<shared_ptr<PeriodicWorkerSegmentState>> &worker_states,
-		                                  vector<EnergySegmentRecord> &target,
-		                                  PeriodicRuntimeOverheadRecord *overhead = nullptr,
-		                                  PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
-			auto before = target.size();
-			for (idx_t i = 0; i < worker_states.size(); i++) {
-				if (!worker_states[i]) {
-					continue;
-				}
-				auto &worker_state = *worker_states[i];
-				if (!worker_state.active_atomic.load(std::memory_order_acquire)) {
-					if (detail_overhead) {
-						detail_overhead->worker_snapshot_skipped_inactive++;
-					}
-					continue;
-				}
-				auto lock_wait_start_ns = DetailTimestamp(detail_overhead);
-				lock_guard<mutex> worker_guard(worker_state.lock);
-				DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::worker_lock_wait_ns,
-				               lock_wait_start_ns);
-				auto lock_hold_start_ns = DetailTimestamp(detail_overhead);
+		auto record_build_start_ns = DetailTimestamp(detail_overhead);
+		auto slice =
+		    BuildPeriodicSliceRecord(worker_state.record, worker_state.last_boundary_ns, end_ns, counters, end_record);
+		DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::snapshot_record_build_ns,
+		               record_build_start_ns);
+		target.push_back(std::move(slice));
+		AddPerfCounters(worker_state.accumulated_counters, counters);
+		worker_state.last_boundary_ns = end_ns;
+	}
+
+	void SnapshotActiveWorkerSegments(uint64_t now_ns,
+	                                  const vector<shared_ptr<PeriodicWorkerSegmentState>> &worker_states,
+	                                  vector<EnergySegmentRecord> &target,
+	                                  PeriodicRuntimeOverheadRecord *overhead = nullptr,
+	                                  PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
+		auto before = target.size();
+		for (idx_t i = 0; i < worker_states.size(); i++) {
+			if (!worker_states[i]) {
+				continue;
+			}
+			auto &worker_state = *worker_states[i];
+			if (!worker_state.active_atomic.load(std::memory_order_acquire)) {
 				if (detail_overhead) {
-					detail_overhead->worker_snapshot_count++;
+					detail_overhead->worker_snapshot_skipped_inactive++;
 				}
-				SnapshotWorkerSegmentLocked(worker_state, now_ns, nullptr, target, detail_overhead);
-				DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::snapshot_lock_hold_ns,
-				               lock_hold_start_ns);
+				continue;
 			}
-			if (overhead) {
-				overhead->segments_drained += target.size() - before;
+			auto lock_wait_start_ns = DetailTimestamp(detail_overhead);
+			lock_guard<mutex> worker_guard(worker_state.lock);
+			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::worker_lock_wait_ns, lock_wait_start_ns);
+			auto lock_hold_start_ns = DetailTimestamp(detail_overhead);
+			if (detail_overhead) {
+				detail_overhead->worker_snapshot_count++;
 			}
+			SnapshotWorkerSegmentLocked(worker_state, now_ns, nullptr, target, detail_overhead);
+			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::snapshot_lock_hold_ns, lock_hold_start_ns);
 		}
+		if (overhead) {
+			overhead->segments_drained += target.size() - before;
+		}
+	}
 
-		void AddClosedSegmentObservations(vector<EnergySegmentRecord> &records,
-		                                  PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
-			if (records.empty()) {
-				return;
-			}
-			auto phase_start_ns = DetailTimestamp(detail_overhead);
-			scratch_pipeline_profile_updates.clear();
-			scratch_query_profile_updates.clear();
-			scratch_pipeline_profile_updates.reserve(records.size());
-			scratch_query_profile_updates.reserve(records.size());
-			for (idx_t i = 0; i < records.size(); i++) {
+	void AddClosedSegmentObservations(vector<EnergySegmentRecord> &records,
+	                                  PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
+		if (records.empty()) {
+			return;
+		}
+		auto phase_start_ns = DetailTimestamp(detail_overhead);
+		scratch_pipeline_profile_updates.clear();
+		scratch_query_profile_updates.clear();
+		scratch_pipeline_profile_updates.reserve(records.size());
+		scratch_query_profile_updates.reserve(records.size());
+		for (idx_t i = 0; i < records.size(); i++) {
 			const auto &record = records[i];
 			auto pipeline_key = BuildPeriodicPipelineProfileKey(record);
-				AddThroughputObservationToEfficiencyAggregate(scratch_pipeline_profile_updates[pipeline_key], record, true);
-				AddThroughputObservationToEfficiencyAggregate(scratch_query_profile_updates[record.query_id], record, false);
-			}
-			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_local_aggregate_ns,
-			               phase_start_ns);
-			phase_start_ns = DetailTimestamp(detail_overhead);
-			if (settings.closed_segments_export_enabled) {
-				closed_segment_records.reserve(closed_segment_records.size() + records.size());
-				closed_segment_records.insert(closed_segment_records.end(), std::make_move_iterator(records.begin()),
-				                              std::make_move_iterator(records.end()));
-			}
-			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_store_ns, phase_start_ns);
-			phase_start_ns = DetailTimestamp(detail_overhead);
-			for (auto entry = scratch_pipeline_profile_updates.begin(); entry != scratch_pipeline_profile_updates.end();
-			     ++entry) {
-				MergeEfficiencyAggregate(pipeline_profiles[entry->first], entry->second);
-			}
-			for (auto entry = scratch_query_profile_updates.begin(); entry != scratch_query_profile_updates.end(); ++entry) {
-				MergeEfficiencyAggregate(query_profiles[entry->first], entry->second);
-			}
-			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_merge_ns, phase_start_ns);
+			AddThroughputObservationToEfficiencyAggregate(scratch_pipeline_profile_updates[pipeline_key], record, true);
+			AddThroughputObservationToEfficiencyAggregate(scratch_query_profile_updates[record.query_id], record,
+			                                              false);
 		}
-
-		void AddPendingSegmentRecordsToWindowsLocked(PeriodicRuntimeOverheadRecord *overhead = nullptr,
-		                                             PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
-			if (pending_segment_records.empty()) {
-				return;
-			}
-			AddSegmentRecordsToWindowsLocked(pending_segment_records, true, overhead, detail_overhead);
+		DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_local_aggregate_ns,
+		               phase_start_ns);
+		phase_start_ns = DetailTimestamp(detail_overhead);
+		if (settings.closed_segments_export_enabled) {
+			closed_segment_records.reserve(closed_segment_records.size() + records.size());
+			closed_segment_records.insert(closed_segment_records.end(), std::make_move_iterator(records.begin()),
+			                              std::make_move_iterator(records.end()));
 		}
+		DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_store_ns, phase_start_ns);
+		phase_start_ns = DetailTimestamp(detail_overhead);
+		for (auto entry = scratch_pipeline_profile_updates.begin(); entry != scratch_pipeline_profile_updates.end();
+		     ++entry) {
+			MergeEfficiencyAggregate(pipeline_profiles[entry->first], entry->second);
+		}
+		for (auto entry = scratch_query_profile_updates.begin(); entry != scratch_query_profile_updates.end();
+		     ++entry) {
+			MergeEfficiencyAggregate(query_profiles[entry->first], entry->second);
+		}
+		DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_merge_ns, phase_start_ns);
+	}
 
-		void AddSegmentRecordsToWindowsLocked(vector<EnergySegmentRecord> &records, bool rebuild_pending,
-		                                      PeriodicRuntimeOverheadRecord *overhead = nullptr,
-		                                      PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
-			if (records.empty()) {
-				return;
-			}
+	void AddPendingSegmentRecordsToWindowsLocked(PeriodicRuntimeOverheadRecord *overhead = nullptr,
+	                                             PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
+		if (pending_segment_records.empty()) {
+			return;
+		}
+		AddSegmentRecordsToWindowsLocked(pending_segment_records, true, overhead, detail_overhead);
+	}
+
+	void AddSegmentRecordsToWindowsLocked(vector<EnergySegmentRecord> &records, bool rebuild_pending,
+	                                      PeriodicRuntimeOverheadRecord *overhead = nullptr,
+	                                      PeriodicRuntimeOverheadRecord *detail_overhead = nullptr) {
+		if (records.empty()) {
+			return;
+		}
 		if (rebuild_pending) {
 			scratch_remaining_segment_records.clear();
 			scratch_remaining_segment_records.reserve(records.size());
@@ -2935,29 +2924,28 @@ private:
 				overhead->segments_sliced += added;
 			}
 			if (added == 0 && record.end_ns > last_sample_ns) {
-					if (rebuild_pending) {
-						scratch_remaining_segment_records.push_back(std::move(record));
-					} else {
-						auto append_start_ns = DetailTimestamp(detail_overhead);
-						pending_segment_records.push_back(std::move(record));
-						DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::pending_append_ns,
-						               append_start_ns);
-					}
+				if (rebuild_pending) {
+					scratch_remaining_segment_records.push_back(std::move(record));
+				} else {
+					auto append_start_ns = DetailTimestamp(detail_overhead);
+					pending_segment_records.push_back(std::move(record));
+					DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::pending_append_ns, append_start_ns);
 				}
 			}
+		}
 		if (rebuild_pending) {
 			pending_segment_records.clear();
 			pending_segment_records.swap(scratch_remaining_segment_records);
 		}
 	}
 
-		void SampleOnce() {
-			auto wall_start_ns = TimestampNs();
-			auto cpu_start_ns = ThreadCpuNs();
-			PeriodicRuntimeOverheadRecord overhead;
-			auto detail_overhead = DetailOverhead(&overhead);
-			InitializeRuntimeOverhead(overhead, "periodic_sample", wall_start_ns);
-			auto now_ns = TimestampNs();
+	void SampleOnce() {
+		auto wall_start_ns = TimestampNs();
+		auto cpu_start_ns = ThreadCpuNs();
+		PeriodicRuntimeOverheadRecord overhead;
+		auto detail_overhead = DetailOverhead(&overhead);
+		InitializeRuntimeOverhead(overhead, "periodic_sample", wall_start_ns);
+		auto now_ns = TimestampNs();
 		if (settings.rapl_enabled) {
 			auto phase_start_ns = TimestampNs();
 			rapl.Read(scratch_rapl_snapshots);
@@ -2973,61 +2961,61 @@ private:
 		scratch_worker_states.clear();
 		CopyActiveWorkerStates(scratch_worker_states);
 		scratch_sampled_segments.clear();
-			scratch_closed_segments.clear();
-			auto phase_start_ns = TimestampNs();
-			auto subphase_start_ns = TimestampNs();
-			SnapshotActiveWorkerSegments(now_ns, scratch_worker_states, scratch_sampled_segments, &overhead,
-			                             detail_overhead);
-			overhead.snapshot_active_workers_ns += DurationNs(TimestampNs(), subphase_start_ns);
-			subphase_start_ns = TimestampNs();
-			DrainQueuedRecords(scratch_sampled_segments, scratch_closed_segments, scratch_queue_segments,
-			                   scratch_queue_closed_segments, &overhead, detail_overhead);
-			overhead.queue_drain_ns += DurationNs(TimestampNs(), subphase_start_ns);
-			overhead.segments_drained += scratch_closed_segments.size();
-			subphase_start_ns = TimestampNs();
-			AddClosedSegmentObservations(scratch_closed_segments, detail_overhead);
-			overhead.closed_segment_profile_ns += DurationNs(TimestampNs(), subphase_start_ns);
-			overhead.drain_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
-			phase_start_ns = TimestampNs();
-			BuildPendingWindowSocketIndexLocked();
-			AddSegmentRecordsToWindowsLocked(scratch_sampled_segments, false, &overhead, detail_overhead);
-			AddPendingSegmentRecordsToWindowsLocked(&overhead, detail_overhead);
-			overhead.slice_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
+		scratch_closed_segments.clear();
+		auto phase_start_ns = TimestampNs();
+		auto subphase_start_ns = TimestampNs();
+		SnapshotActiveWorkerSegments(now_ns, scratch_worker_states, scratch_sampled_segments, &overhead,
+		                             detail_overhead);
+		overhead.snapshot_active_workers_ns += DurationNs(TimestampNs(), subphase_start_ns);
+		subphase_start_ns = TimestampNs();
+		DrainQueuedRecords(scratch_sampled_segments, scratch_closed_segments, scratch_queue_segments,
+		                   scratch_queue_closed_segments, &overhead, detail_overhead);
+		overhead.queue_drain_ns += DurationNs(TimestampNs(), subphase_start_ns);
+		overhead.segments_drained += scratch_closed_segments.size();
+		subphase_start_ns = TimestampNs();
+		AddClosedSegmentObservations(scratch_closed_segments, detail_overhead);
+		overhead.closed_segment_profile_ns += DurationNs(TimestampNs(), subphase_start_ns);
+		overhead.drain_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
+		phase_start_ns = TimestampNs();
+		BuildPendingWindowSocketIndexLocked();
+		AddSegmentRecordsToWindowsLocked(scratch_sampled_segments, false, &overhead, detail_overhead);
+		AddPendingSegmentRecordsToWindowsLocked(&overhead, detail_overhead);
+		overhead.slice_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
 		phase_start_ns = TimestampNs();
 		FinalizeReadyWindows(false, &overhead);
 		overhead.finalize_windows_ns += DurationNs(TimestampNs(), phase_start_ns);
 		FinishRuntimeOverhead(overhead, cpu_start_ns);
 	}
 
-		void ShutdownFinalize() {
-			auto wall_start_ns = TimestampNs();
-			auto cpu_start_ns = ThreadCpuNs();
-			PeriodicRuntimeOverheadRecord overhead;
-			auto detail_overhead = DetailOverhead(&overhead);
-			InitializeRuntimeOverhead(overhead, "shutdown_finalize", wall_start_ns);
-			auto now_ns = TimestampNs();
+	void ShutdownFinalize() {
+		auto wall_start_ns = TimestampNs();
+		auto cpu_start_ns = ThreadCpuNs();
+		PeriodicRuntimeOverheadRecord overhead;
+		auto detail_overhead = DetailOverhead(&overhead);
+		InitializeRuntimeOverhead(overhead, "shutdown_finalize", wall_start_ns);
+		auto now_ns = TimestampNs();
 		scratch_worker_states.clear();
 		CopyActiveWorkerStates(scratch_worker_states);
 		scratch_sampled_segments.clear();
-			scratch_closed_segments.clear();
-			auto phase_start_ns = TimestampNs();
-			auto subphase_start_ns = TimestampNs();
-			SnapshotActiveWorkerSegments(now_ns, scratch_worker_states, scratch_sampled_segments, &overhead,
-			                             detail_overhead);
-			overhead.snapshot_active_workers_ns += DurationNs(TimestampNs(), subphase_start_ns);
-			subphase_start_ns = TimestampNs();
-			DrainQueuedRecords(scratch_sampled_segments, scratch_closed_segments, scratch_queue_segments,
-			                   scratch_queue_closed_segments, &overhead, detail_overhead);
-			overhead.queue_drain_ns += DurationNs(TimestampNs(), subphase_start_ns);
-			overhead.segments_drained += scratch_closed_segments.size();
-			subphase_start_ns = TimestampNs();
-			AddClosedSegmentObservations(scratch_closed_segments, detail_overhead);
-			overhead.closed_segment_profile_ns += DurationNs(TimestampNs(), subphase_start_ns);
-			overhead.drain_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
-			phase_start_ns = TimestampNs();
-			BuildPendingWindowSocketIndexLocked();
-			AddSegmentRecordsToWindowsLocked(scratch_sampled_segments, false, &overhead, detail_overhead);
-			AddPendingSegmentRecordsToWindowsLocked(&overhead, detail_overhead);
+		scratch_closed_segments.clear();
+		auto phase_start_ns = TimestampNs();
+		auto subphase_start_ns = TimestampNs();
+		SnapshotActiveWorkerSegments(now_ns, scratch_worker_states, scratch_sampled_segments, &overhead,
+		                             detail_overhead);
+		overhead.snapshot_active_workers_ns += DurationNs(TimestampNs(), subphase_start_ns);
+		subphase_start_ns = TimestampNs();
+		DrainQueuedRecords(scratch_sampled_segments, scratch_closed_segments, scratch_queue_segments,
+		                   scratch_queue_closed_segments, &overhead, detail_overhead);
+		overhead.queue_drain_ns += DurationNs(TimestampNs(), subphase_start_ns);
+		overhead.segments_drained += scratch_closed_segments.size();
+		subphase_start_ns = TimestampNs();
+		AddClosedSegmentObservations(scratch_closed_segments, detail_overhead);
+		overhead.closed_segment_profile_ns += DurationNs(TimestampNs(), subphase_start_ns);
+		overhead.drain_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
+		phase_start_ns = TimestampNs();
+		BuildPendingWindowSocketIndexLocked();
+		AddSegmentRecordsToWindowsLocked(scratch_sampled_segments, false, &overhead, detail_overhead);
+		AddPendingSegmentRecordsToWindowsLocked(&overhead, detail_overhead);
 		overhead.slice_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
 		phase_start_ns = TimestampNs();
 		FinalizeReadyWindows(true, &overhead);
@@ -3204,9 +3192,8 @@ private:
 			window.uncore_freq_hz = ReadUncoreFrequencyHz(window.socket_id);
 		}
 		double base_power_w = 0;
-		window.base_power_valid =
-		    LookupBasePower(base_power_entries, window.socket_id, window.core_freq_hz, window.uncore_freq_hz, 0,
-		                    base_power_w);
+		window.base_power_valid = LookupBasePower(base_power_entries, window.socket_id, window.core_freq_hz,
+		                                          window.uncore_freq_hz, 0, base_power_w);
 		window.base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
 		window.total_base_energy_j = window.base_energy_j;
 		window.active_package_energy_j = std::max(0.0, window.package_energy_j - window.base_energy_j);
@@ -3292,16 +3279,16 @@ private:
 		}
 		double summed_charged_energy = w.summed_attributed_active_energy_j + w.summed_attributed_base_energy_j;
 		double package_conservation_error = w.package_energy_j - summed_charged_energy;
-		window_out << w.window_id << "," << w.socket_id << "," << w.start_ns << "," << w.end_ns << ","
-		           << w.duration_s << "," << w.rapl_start_uj << "," << w.rapl_end_uj << "," << w.package_energy_j
-		           << "," << w.core_freq_hz << "," << w.uncore_freq_hz << "," << w.base_energy_j << ","
+		window_out << w.window_id << "," << w.socket_id << "," << w.start_ns << "," << w.end_ns << "," << w.duration_s
+		           << "," << w.rapl_start_uj << "," << w.rapl_end_uj << "," << w.package_energy_j << ","
+		           << w.core_freq_hz << "," << w.uncore_freq_hz << "," << w.base_energy_j << ","
 		           << w.active_package_energy_j << "," << w.summed_attributed_active_energy_j << ","
 		           << w.active_conservation_error_j << "," << w.summed_attributed_base_energy_j << ","
-		           << w.base_conservation_error_j << "," << summed_charged_energy << ","
-		           << package_conservation_error << "," << w.rapl_valid << "," << w.base_power_valid << ","
-		           << w.used_time_fallback << "," << CsvEscape(w.status) << "," << w.segment_count << ","
-		           << w.total_base_energy_j << "," << w.busy_wall_time_s << "," << w.idle_gap_wall_time_s << ","
-		           << w.busy_base_energy_j << "," << w.idle_gap_base_energy_j << "\n";
+		           << w.base_conservation_error_j << "," << summed_charged_energy << "," << package_conservation_error
+		           << "," << w.rapl_valid << "," << w.base_power_valid << "," << w.used_time_fallback << ","
+		           << CsvEscape(w.status) << "," << w.segment_count << "," << w.total_base_energy_j << ","
+		           << w.busy_wall_time_s << "," << w.idle_gap_wall_time_s << "," << w.busy_base_energy_j << ","
+		           << w.idle_gap_base_energy_j << "\n";
 	}
 
 	void AppendSegmentsLocked(const vector<AttributedSegment> &segments) {
@@ -3377,7 +3364,7 @@ private:
 		std::sort(query_result.begin(), query_result.end(),
 		          [](const PipelineEfficiencyAggregate &lhs, const PipelineEfficiencyAggregate &rhs) {
 			          return lhs.query_id < rhs.query_id;
-	          });
+		          });
 		WriteEfficiencyProfilesCSV(output_dir + "/period_pipeline_profiles.csv", pipeline_result);
 		WriteEfficiencyProfilesCSV(output_dir + "/period_query_profiles.csv", query_result, true);
 		if (settings.closed_segments_export_enabled) {
@@ -3420,21 +3407,20 @@ private:
 		       "worker_snapshot_skipped_inactive,queued_segment_count,closed_segment_count\n";
 		for (idx_t i = 0; i < runtime_overhead.size(); i++) {
 			const auto &r = runtime_overhead[i];
-			out << r.sample_id << "," << CsvEscape(r.event) << "," << r.start_ns << "," << r.end_ns << ","
-			    << r.wall_ns << "," << r.cpu_ns << "," << r.lock_wait_ns << "," << r.lock_hold_ns << ","
-			    << r.rapl_read_ns << "," << r.create_windows_ns << "," << r.drain_segments_ns << ","
-			    << r.slice_segments_ns << "," << r.finalize_windows_ns << "," << r.attribute_segments_ns << ","
-			    << r.profile_update_ns << "," << r.csv_append_ns << "," << r.windows_created << ","
-			    << r.windows_finalized << "," << r.segments_drained << "," << r.segments_sliced << ","
-			    << r.segments_attributed << "," << r.active_queries << "," << r.registered_workers << ","
-			    << r.tracked_queries << "," << r.pending_windows << "," << r.observed_query_activity << ","
-				    << r.snapshot_active_workers_ns << "," << r.queue_drain_ns << ","
-			    << r.closed_segment_profile_ns << "," << r.closed_segment_local_aggregate_ns << ","
-			    << r.closed_segment_store_ns << "," << r.closed_segment_merge_ns << "," << r.worker_lock_wait_ns << ","
-			    << r.snapshot_perf_read_ns << "," << r.snapshot_record_build_ns << ","
-			    << r.snapshot_lock_hold_ns << "," << r.pending_append_ns << "," << r.queue_lock_wait_ns << ","
-			    << r.queue_swap_ns << "," << r.worker_snapshot_count << "," << r.worker_snapshot_skipped_inactive << ","
-			    << r.queued_segment_count << "," << r.closed_segment_count << "\n";
+			out << r.sample_id << "," << CsvEscape(r.event) << "," << r.start_ns << "," << r.end_ns << "," << r.wall_ns
+			    << "," << r.cpu_ns << "," << r.lock_wait_ns << "," << r.lock_hold_ns << "," << r.rapl_read_ns << ","
+			    << r.create_windows_ns << "," << r.drain_segments_ns << "," << r.slice_segments_ns << ","
+			    << r.finalize_windows_ns << "," << r.attribute_segments_ns << "," << r.profile_update_ns << ","
+			    << r.csv_append_ns << "," << r.windows_created << "," << r.windows_finalized << ","
+			    << r.segments_drained << "," << r.segments_sliced << "," << r.segments_attributed << ","
+			    << r.active_queries << "," << r.registered_workers << "," << r.tracked_queries << ","
+			    << r.pending_windows << "," << r.observed_query_activity << "," << r.snapshot_active_workers_ns << ","
+			    << r.queue_drain_ns << "," << r.closed_segment_profile_ns << "," << r.closed_segment_local_aggregate_ns
+			    << "," << r.closed_segment_store_ns << "," << r.closed_segment_merge_ns << "," << r.worker_lock_wait_ns
+			    << "," << r.snapshot_perf_read_ns << "," << r.snapshot_record_build_ns << "," << r.snapshot_lock_hold_ns
+			    << "," << r.pending_append_ns << "," << r.queue_lock_wait_ns << "," << r.queue_swap_ns << ","
+			    << r.worker_snapshot_count << "," << r.worker_snapshot_skipped_inactive << "," << r.queued_segment_count
+			    << "," << r.closed_segment_count << "\n";
 		}
 	}
 
@@ -3454,12 +3440,12 @@ private:
 		    periodic_overhead.count == 0 ? 0 : periodic_overhead.total_wall_ns / periodic_overhead.count;
 		auto periodic_avg_cpu_ns =
 		    periodic_overhead.count == 0 ? 0 : periodic_overhead.total_cpu_ns / periodic_overhead.count;
-		double cpu_duty_cycle =
-		    run_duration_ns == 0 ? 0 : static_cast<double>(all_overhead.total_cpu_ns) / static_cast<double>(run_duration_ns);
-		double periodic_cpu_duty_cycle = run_duration_ns == 0
-		                                     ? 0
-		                                     : static_cast<double>(periodic_overhead.total_cpu_ns) /
-		                                           static_cast<double>(run_duration_ns);
+		double cpu_duty_cycle = run_duration_ns == 0 ? 0
+		                                             : static_cast<double>(all_overhead.total_cpu_ns) /
+		                                                   static_cast<double>(run_duration_ns);
+		double periodic_cpu_duty_cycle = run_duration_ns == 0 ? 0
+		                                                      : static_cast<double>(periodic_overhead.total_cpu_ns) /
+		                                                            static_cast<double>(run_duration_ns);
 		std::ofstream out((output_dir + "/period_validation_summary.json").c_str());
 		out << "{\n";
 		out << "  \"window_count\": " << finalized_window_count << ",\n";
@@ -3467,13 +3453,13 @@ private:
 		out << "  \"active_conservation_error_j\": " << total_active_conservation_error_j << ",\n";
 		out << "  \"base_conservation_error_j\": " << total_base_conservation_error_j << ",\n";
 		out << "  \"package_conservation_gap_j\": " << total_package_gap_j << ",\n";
-			out << "  \"base_power_loaded\": " << (base_power_loaded ? "true" : "false") << ",\n";
-			out << "  \"period_ms\": " << period_ms << ",\n";
-			out << "  \"debug_export_enabled\": " << (settings.debug_export_enabled ? "true" : "false") << ",\n";
-			out << "  \"closed_segments_export_enabled\": "
-			    << (settings.closed_segments_export_enabled ? "true" : "false") << ",\n";
-			out << "  \"closed_segment_record_count\": " << closed_segment_records.size() << ",\n";
-			out << "  \"runtime_overhead_event_count\": " << all_overhead.count << ",\n";
+		out << "  \"base_power_loaded\": " << (base_power_loaded ? "true" : "false") << ",\n";
+		out << "  \"period_ms\": " << period_ms << ",\n";
+		out << "  \"debug_export_enabled\": " << (settings.debug_export_enabled ? "true" : "false") << ",\n";
+		out << "  \"closed_segments_export_enabled\": " << (settings.closed_segments_export_enabled ? "true" : "false")
+		    << ",\n";
+		out << "  \"closed_segment_record_count\": " << closed_segment_records.size() << ",\n";
+		out << "  \"runtime_overhead_event_count\": " << all_overhead.count << ",\n";
 		out << "  \"runtime_overhead_periodic_sample_count\": " << periodic_overhead.count << ",\n";
 		out << "  \"runtime_overhead_total_wall_ns\": " << all_overhead.total_wall_ns << ",\n";
 		out << "  \"runtime_overhead_total_cpu_ns\": " << all_overhead.total_cpu_ns << ",\n";
@@ -3490,8 +3476,7 @@ private:
 		out << "  \"runtime_overhead_periodic_max_cpu_ns\": " << periodic_overhead.max_cpu_ns << ",\n";
 		out << "  \"runtime_overhead_periodic_cpu_duty_cycle\": " << periodic_cpu_duty_cycle << ",\n";
 		out << "  \"runtime_overhead_periodic_windows_finalized\": " << periodic_overhead.windows_finalized << ",\n";
-		out << "  \"runtime_overhead_periodic_segments_attributed\": " << periodic_overhead.segments_attributed
-		    << "\n";
+		out << "  \"runtime_overhead_periodic_segments_attributed\": " << periodic_overhead.segments_attributed << "\n";
 		out << "}\n";
 	}
 
@@ -3543,18 +3528,18 @@ private:
 	vector<EnergySegmentRecord> scratch_queue_segments;
 	vector<EnergySegmentRecord> scratch_queue_closed_segments;
 	vector<RaplSnapshot> scratch_rapl_snapshots;
-		std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
-		    scratch_pipeline_profile_updates;
-		std::unordered_map<uint64_t, PipelineEfficiencyAggregate> scratch_query_profile_updates;
+	std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
+	    scratch_pipeline_profile_updates;
+	std::unordered_map<uint64_t, PipelineEfficiencyAggregate> scratch_query_profile_updates;
 	std::deque<PeriodicPendingWindow> pending_windows;
 	std::unordered_map<int, vector<PeriodicPendingWindow *>> scratch_pending_windows_by_socket;
 	std::atomic<idx_t> pending_window_count {0};
 	vector<EnergySegmentRecord> pending_segment_records;
 	vector<EnergySegmentRecord> scratch_remaining_segment_records;
 	vector<EnergySegmentRecord> closed_segment_records;
-		std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
-		    pipeline_profiles;
-		std::unordered_map<uint64_t, PipelineEfficiencyAggregate> query_profiles;
+	std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
+	    pipeline_profiles;
+	std::unordered_map<uint64_t, PipelineEfficiencyAggregate> query_profiles;
 	vector<PeriodicRuntimeOverheadRecord> runtime_overhead;
 	std::ofstream window_out;
 	std::ofstream segment_out;
@@ -3685,7 +3670,8 @@ void EnergyAttributionManager::EndQuery(ClientContext &context) {
 	}
 }
 
-void EnergyAttributionManager::AttachPipeline(ClientContext &context, Pipeline &pipeline, uint64_t profiler_pipeline_id) {
+void EnergyAttributionManager::AttachPipeline(ClientContext &context, Pipeline &pipeline,
+                                              uint64_t profiler_pipeline_id) {
 	if (!EnergyAttributionManager::Enabled(context)) {
 		return;
 	}
@@ -3701,7 +3687,8 @@ void EnergyAttributionManager::AttachPipeline(ClientContext &context, Pipeline &
 	if (!query) {
 		return;
 	}
-	auto pipeline_id = profiler_pipeline_id ? profiler_pipeline_id : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&pipeline));
+	auto pipeline_id =
+	    profiler_pipeline_id ? profiler_pipeline_id : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&pipeline));
 	if (query->settings.pipeline_signatures_enabled) {
 		RegisterPipelineSignature(*query, pipeline_id, pipeline.ToString());
 	}
@@ -3805,9 +3792,9 @@ EnergySegmentScope::~EnergySegmentScope() {
 			record.end_physical_core_id = topology.physical_core_id;
 		}
 	}
-	record.duration_s = record.end_ns > record.start_ns ? static_cast<double>(record.end_ns - record.start_ns) /
-	                                                           static_cast<double>(NSEC_PER_SEC)
-	                                                     : 0;
+	record.duration_s = record.end_ns > record.start_ns
+	                        ? static_cast<double>(record.end_ns - record.start_ns) / static_cast<double>(NSEC_PER_SEC)
+	                        : 0;
 	record.migrated = record.logical_cpu_id != record.end_logical_cpu_id || record.socket_id != record.end_socket_id ||
 	                  record.physical_core_id != record.end_physical_core_id;
 	record.hardware_state_stable = !record.migrated && record.socket_id >= 0 && record.physical_core_id >= 0;

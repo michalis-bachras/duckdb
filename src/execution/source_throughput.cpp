@@ -199,8 +199,7 @@ double SourceTuplesPerTaskSecond(idx_t tuples, uint64_t duration_ns) {
 
 const SourceThroughputEstimate &SourceThroughputEstimator::Update(const SourceThroughputCounters &counters,
                                                                   uint64_t duration_ns) {
-	if (!counters.reported || !counters.adaptive_morsel_candidate || counters.tuples_touched == 0 ||
-	    duration_ns == 0) {
+	if (!counters.reported || !counters.adaptive_morsel_candidate || counters.tuples_touched == 0 || duration_ns == 0) {
 		return estimate;
 	}
 	auto task_throughput = SourceTuplesPerTaskSecond(counters.tuples_touched, duration_ns);

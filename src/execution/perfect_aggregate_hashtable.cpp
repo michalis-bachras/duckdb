@@ -12,8 +12,8 @@ PerfectAggregateHashTable::PerfectAggregateHashTable(ClientContext &context, All
                                                      vector<AggregateObject> aggregate_objects_p,
                                                      vector<Value> group_minima_p, vector<idx_t> required_bits_p)
     : BaseAggregateHashTable(context, allocator, aggregate_objects_p, std::move(payload_types_p)),
-      addresses(LogicalType::POINTER), required_bits(std::move(required_bits_p)), total_required_bits(0),
-      count(0), group_minima(std::move(group_minima_p)), sel(STANDARD_VECTOR_SIZE),
+      addresses(LogicalType::POINTER), required_bits(std::move(required_bits_p)), total_required_bits(0), count(0),
+      group_minima(std::move(group_minima_p)), sel(STANDARD_VECTOR_SIZE),
       aggregate_allocator(make_uniq<ArenaAllocator>(allocator)) {
 	for (auto &group_bits : required_bits) {
 		total_required_bits += group_bits;

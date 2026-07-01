@@ -168,6 +168,8 @@ enum class DestroyBufferUpon : uint8_t;
 
 enum class DistinctType : uint8_t;
 
+enum class EnergySegmentRole : uint8_t;
+
 enum class ErrorType : uint16_t;
 
 enum class ExceptionFormatValueType : uint8_t;
@@ -417,6 +419,8 @@ enum class SinkResultType : uint8_t;
 enum class SortKeyType : uint8_t;
 
 enum class SourceResultType : uint8_t;
+
+enum class SourceThroughputKind : uint8_t;
 
 enum class StarExpressionType : uint8_t;
 
@@ -708,6 +712,9 @@ const char* EnumUtil::ToChars<DestroyBufferUpon>(DestroyBufferUpon value);
 
 template<>
 const char* EnumUtil::ToChars<DistinctType>(DistinctType value);
+
+template<>
+const char* EnumUtil::ToChars<EnergySegmentRole>(EnergySegmentRole value);
 
 template<>
 const char* EnumUtil::ToChars<ErrorType>(ErrorType value);
@@ -1085,6 +1092,9 @@ template<>
 const char* EnumUtil::ToChars<SourceResultType>(SourceResultType value);
 
 template<>
+const char* EnumUtil::ToChars<SourceThroughputKind>(SourceThroughputKind value);
+
+template<>
 const char* EnumUtil::ToChars<StarExpressionType>(StarExpressionType value);
 
 template<>
@@ -1417,6 +1427,9 @@ DestroyBufferUpon EnumUtil::FromString<DestroyBufferUpon>(const char *value);
 
 template<>
 DistinctType EnumUtil::FromString<DistinctType>(const char *value);
+
+template<>
+EnergySegmentRole EnumUtil::FromString<EnergySegmentRole>(const char *value);
 
 template<>
 ErrorType EnumUtil::FromString<ErrorType>(const char *value);
@@ -1792,6 +1805,9 @@ SortKeyType EnumUtil::FromString<SortKeyType>(const char *value);
 
 template<>
 SourceResultType EnumUtil::FromString<SourceResultType>(const char *value);
+
+template<>
+SourceThroughputKind EnumUtil::FromString<SourceThroughputKind>(const char *value);
 
 template<>
 StarExpressionType EnumUtil::FromString<StarExpressionType>(const char *value);

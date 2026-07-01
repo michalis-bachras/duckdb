@@ -337,8 +337,8 @@ static vector<int> ParseCPUList(const string &value) {
 	vector<int> cpus;
 	idx_t pos = 0;
 	while (pos < value.size()) {
-		while (pos < value.size() && (value[pos] == ',' || value[pos] == ' ' || value[pos] == '\n' ||
-		                              value[pos] == '\t')) {
+		while (pos < value.size() &&
+		       (value[pos] == ',' || value[pos] == ' ' || value[pos] == '\n' || value[pos] == '\t')) {
 			pos++;
 		}
 		if (pos >= value.size()) {
@@ -725,7 +725,8 @@ static void AddPerfGroupSnapshotDelta(const PipelinePerfGroupInfo &group, const 
 		min_running_pct = std::min(min_running_pct, running_pct);
 		cpu_counters.min_running_pct = running_pct;
 	}
-	auto values_read = MinValue<idx_t>(MinValue<idx_t>(start.values.size(), end.values.size()), group.counter_ids.size());
+	auto values_read =
+	    MinValue<idx_t>(MinValue<idx_t>(start.values.size(), end.values.size()), group.counter_ids.size());
 	bool has_value = false;
 	for (idx_t i = 0; i < values_read; i++) {
 		if (end.values[i] < start.values[i]) {
@@ -748,9 +749,8 @@ static void AddPerfGroupSnapshotDelta(const PipelinePerfGroupInfo &group, const 
 }
 
 static void AddRaplPerfGroupSnapshotDelta(const PipelineRaplPerfGroupInfo &group,
-                                          const PipelinePerfGroupSnapshot &start,
-                                          const PipelinePerfGroupSnapshot &end, PipelineProfilingInfo &profile,
-                                          double &min_running_pct) {
+                                          const PipelinePerfGroupSnapshot &start, const PipelinePerfGroupSnapshot &end,
+                                          PipelineProfilingInfo &profile, double &min_running_pct) {
 	if (!start.valid || !end.valid || end.time_enabled < start.time_enabled || end.time_running < start.time_running) {
 		return;
 	}
@@ -934,6 +934,5 @@ void PipelineDVFSProfiler::Close() {
 	pipeline_perf_groups.clear();
 	pipeline_rapl_perf_groups.clear();
 }
-
 
 } // namespace duckdb

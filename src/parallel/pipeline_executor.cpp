@@ -17,8 +17,8 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 	D_ASSERT(pipeline.source_state);
 	const auto &config = ClientConfig::GetConfig(context_p);
 	collect_source_throughput = config.pipeline_profiling.throughput;
-	collect_pipeline_input =
-	    EnergyAttributionManager::Enabled(context_p) || config.pipeline_profiling.task_trace || config.pipeline_profiling.throughput;
+	collect_pipeline_input = EnergyAttributionManager::Enabled(context_p) || config.pipeline_profiling.task_trace ||
+	                         config.pipeline_profiling.throughput;
 	if (pipeline.sink) {
 		local_sink_state = pipeline.sink->GetLocalSinkState(context);
 		required_partition_info = pipeline.sink->RequiredPartitionInfo();

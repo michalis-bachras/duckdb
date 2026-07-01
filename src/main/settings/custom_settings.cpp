@@ -616,8 +616,7 @@ void EnergyAttributionRaplEnableSetting::SetLocal(ClientContext &context, const 
 }
 
 void EnergyAttributionRaplEnableSetting::ResetLocal(ClientContext &context) {
-	ClientConfig::GetConfig(context).energy_attribution.rapl_enabled =
-	    ClientConfig().energy_attribution.rapl_enabled;
+	ClientConfig::GetConfig(context).energy_attribution.rapl_enabled = ClientConfig().energy_attribution.rapl_enabled;
 	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
 }
 

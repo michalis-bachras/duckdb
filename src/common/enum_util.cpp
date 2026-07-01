@@ -103,6 +103,7 @@
 #include "duckdb/common/types/variant_value.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/types/vector_buffer.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/index/art/art_scanner.hpp"
 #include "duckdb/execution/index/art/iterator.hpp"
@@ -114,6 +115,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_table_scan_enum.hpp"
 #include "duckdb/execution/reservoir_sample.hpp"
+#include "duckdb/execution/source_throughput.hpp"
 #include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/function/copy_function.hpp"
@@ -1590,6 +1592,30 @@ const char* EnumUtil::ToChars<DistinctType>(DistinctType value) {
 template<>
 DistinctType EnumUtil::FromString<DistinctType>(const char *value) {
 	return static_cast<DistinctType>(StringUtil::StringToEnum(GetDistinctTypeValues(), 2, "DistinctType", value));
+}
+
+const StringUtil::EnumStringLiteral *GetEnergySegmentRoleValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(EnergySegmentRole::ASSIGNED_MANDATORY), "ASSIGNED_MANDATORY" },
+		{ static_cast<uint32_t>(EnergySegmentRole::ASSIGNED_OPTIONAL), "ASSIGNED_OPTIONAL" },
+		{ static_cast<uint32_t>(EnergySegmentRole::SAME_QUERY_SUCCESSOR), "SAME_QUERY_SUCCESSOR" },
+		{ static_cast<uint32_t>(EnergySegmentRole::FALLBACK_SIBLING), "FALLBACK_SIBLING" },
+		{ static_cast<uint32_t>(EnergySegmentRole::FALLBACK_SOCKET), "FALLBACK_SOCKET" },
+		{ static_cast<uint32_t>(EnergySegmentRole::FALLBACK_GLOBAL), "FALLBACK_GLOBAL" },
+		{ static_cast<uint32_t>(EnergySegmentRole::EXPLORATION_PROBE), "EXPLORATION_PROBE" },
+		{ static_cast<uint32_t>(EnergySegmentRole::UNKNOWN), "UNKNOWN" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<EnergySegmentRole>(EnergySegmentRole value) {
+	return StringUtil::EnumToString(GetEnergySegmentRoleValues(), 8, "EnergySegmentRole", static_cast<uint32_t>(value));
+}
+
+template<>
+EnergySegmentRole EnumUtil::FromString<EnergySegmentRole>(const char *value) {
+	return static_cast<EnergySegmentRole>(StringUtil::StringToEnum(GetEnergySegmentRoleValues(), 8, "EnergySegmentRole", value));
 }
 
 const StringUtil::EnumStringLiteral *GetErrorTypeValues() {
@@ -4650,6 +4676,50 @@ const char* EnumUtil::ToChars<SourceResultType>(SourceResultType value) {
 template<>
 SourceResultType EnumUtil::FromString<SourceResultType>(const char *value) {
 	return static_cast<SourceResultType>(StringUtil::StringToEnum(GetSourceResultTypeValues(), 3, "SourceResultType", value));
+}
+
+const StringUtil::EnumStringLiteral *GetSourceThroughputKindValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(SourceThroughputKind::UNKNOWN), "UNKNOWN" },
+		{ static_cast<uint32_t>(SourceThroughputKind::MIXED_SOURCE_TUPLES), "MIXED_SOURCE_TUPLES" },
+		{ static_cast<uint32_t>(SourceThroughputKind::NO_SOURCE_SCAN), "NO_SOURCE_SCAN" },
+		{ static_cast<uint32_t>(SourceThroughputKind::SINGLE_AGGREGATE_ROW), "SINGLE_AGGREGATE_ROW" },
+		{ static_cast<uint32_t>(SourceThroughputKind::BASE_TABLE_ROWS), "BASE_TABLE_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::INDEX_ROWIDS), "INDEX_ROWIDS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::TABLE_SCAN_ROWS), "TABLE_SCAN_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::MATERIALIZED_ROWS), "MATERIALIZED_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::PERFECT_HASH_GROUPS), "PERFECT_HASH_GROUPS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::AGGREGATE_GROUPS), "AGGREGATE_GROUPS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::PARTITIONED_AGGREGATE_GROUPS), "PARTITIONED_AGGREGATE_GROUPS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::WINDOW_ROWS), "WINDOW_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::SORTED_ROWS), "SORTED_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::TOP_N_HEAP_ROWS), "TOP_N_HEAP_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::HASH_JOIN_BUILD_ROWS), "HASH_JOIN_BUILD_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::HASH_JOIN_PROBE_ROWS), "HASH_JOIN_PROBE_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::NESTED_LOOP_JOIN_BUILD_ROWS), "NESTED_LOOP_JOIN_BUILD_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::BLOCKWISE_NL_JOIN_BUILD_ROWS), "BLOCKWISE_NL_JOIN_BUILD_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::PIECEWISE_MERGE_JOIN_BUILD_ROWS), "PIECEWISE_MERGE_JOIN_BUILD_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::IE_JOIN_ROWS), "IE_JOIN_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::ASOF_JOIN_ROWS), "ASOF_JOIN_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::POSITIONAL_JOIN_ROWS), "POSITIONAL_JOIN_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::LIMIT_MATERIALIZED_ROWS), "LIMIT_MATERIALIZED_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::LIMIT_PERCENT_MATERIALIZED_ROWS), "LIMIT_PERCENT_MATERIALIZED_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::RESERVOIR_SAMPLE_ROWS), "RESERVOIR_SAMPLE_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::RECURSIVE_CTE_ROWS), "RECURSIVE_CTE_ROWS" },
+		{ static_cast<uint32_t>(SourceThroughputKind::DUMMY_ROW), "DUMMY_ROW" },
+		{ static_cast<uint32_t>(SourceThroughputKind::EMPTY_RESULT), "EMPTY_RESULT" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<SourceThroughputKind>(SourceThroughputKind value) {
+	return StringUtil::EnumToString(GetSourceThroughputKindValues(), 28, "SourceThroughputKind", static_cast<uint32_t>(value));
+}
+
+template<>
+SourceThroughputKind EnumUtil::FromString<SourceThroughputKind>(const char *value) {
+	return static_cast<SourceThroughputKind>(StringUtil::StringToEnum(GetSourceThroughputKindValues(), 28, "SourceThroughputKind", value));
 }
 
 const StringUtil::EnumStringLiteral *GetStarExpressionTypeValues() {

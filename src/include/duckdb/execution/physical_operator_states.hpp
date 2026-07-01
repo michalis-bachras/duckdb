@@ -174,8 +174,7 @@ struct OperatorSinkInput {
 
 struct OperatorSourceInput {
 	OperatorSourceInput(GlobalSourceState &global_state_p, LocalSourceState &local_state_p,
-	                    InterruptState &interrupt_state_p,
-	                    SourceThroughputCounters *source_throughput_p = nullptr)
+	                    InterruptState &interrupt_state_p, SourceThroughputCounters *source_throughput_p = nullptr)
 	    : global_state(global_state_p), local_state(local_state_p), interrupt_state(interrupt_state_p),
 	      source_throughput(source_throughput_p) {
 	}
@@ -185,9 +184,8 @@ struct OperatorSourceInput {
 	InterruptState &interrupt_state;
 	SourceThroughputCounters *source_throughput;
 
-	void ReportSourceTuplesTouched(idx_t tuples, const string &kind, const string &confidence,
-	                               bool adaptive_candidate, idx_t chunks = 0, idx_t native_units = 0,
-	                               const string &native_unit = string()) {
+	void ReportSourceTuplesTouched(idx_t tuples, const string &kind, const string &confidence, bool adaptive_candidate,
+	                               idx_t chunks = 0, idx_t native_units = 0, const string &native_unit = string()) {
 		if (source_throughput) {
 			source_throughput->AddTuples(tuples, kind, confidence, adaptive_candidate, chunks, native_units,
 			                             native_unit);
@@ -204,8 +202,7 @@ struct OperatorSourceInput {
 	void ReportSourceOutputChunk(const DataChunk &chunk, const string &kind, const string &confidence,
 	                             bool adaptive_candidate, const string &native_unit) {
 		if (chunk.size() > 0) {
-			ReportSourceTuplesTouched(chunk.size(), kind, confidence, adaptive_candidate, 1, chunk.size(),
-			                          native_unit);
+			ReportSourceTuplesTouched(chunk.size(), kind, confidence, adaptive_candidate, 1, chunk.size(), native_unit);
 		}
 	}
 

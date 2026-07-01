@@ -554,6 +554,125 @@
         "custom_implementation": true
     },
     {
+        "name": "energy_attribution_base_power_path",
+        "description": "CSV calibration file for idle/base package power",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_closed_segments_export_enable",
+        "description": "Enable high-volume periodic closed-segment CSV export",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_counter_profile",
+        "description": "perf_event counter profile for energy attribution",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_debug_export_enable",
+        "description": "Enable high-volume periodic window and segment CSV exports",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_enable",
+        "description": "Enable prototype RAPL/perf_event pipeline energy attribution",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_export_enable",
+        "description": "Enable CSV/JSON debug exports for energy attribution",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_fail_policy",
+        "description": "Failure policy for unavailable RAPL/perf events: warn or silent",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_metadata_cache_enable",
+        "description": "Enable cached CPU topology and frequency metadata for energy attribution",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_migration_check_enable",
+        "description": "Enable end-of-segment CPU migration checks for energy attribution",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_output_dir",
+        "description": "Directory for energy attribution debug CSV files",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_overhead_detail_enable",
+        "description": "Enable fine-grained periodic energy attribution overhead instrumentation",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_perf_counters_enable",
+        "description": "Enable perf_event counters for energy attribution segments",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_period_ms",
+        "description": "Background energy attribution accounting period in milliseconds",
+        "type": "BIGINT",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_periodic_enable",
+        "description": "Enable background periodic RAPL windows for energy attribution",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_pipeline_signatures_enable",
+        "description": "Enable full pipeline signature rendering for energy attribution",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_profile_update_enable",
+        "description": "Enable attribution/profile construction when energy attribution exports are disabled",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "energy_attribution_rapl_enable",
+        "description": "Enable RAPL package-energy reads for energy attribution",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
         "name": "errors_as_json",
         "description": "Output error messages as structured JSON instead of as a raw string",
         "type": "BOOLEAN",

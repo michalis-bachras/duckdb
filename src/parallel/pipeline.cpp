@@ -84,8 +84,8 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	EnergySegmentScope energy_scope(pipeline, start_cpu);
 	auto finish_profiler_task = [&]() {
 		auto empty_counters = SourceThroughputCounters();
-		const auto &counters = profiler_task_id && pipeline_executor ? pipeline_executor->GetSourceThroughputCounters()
-		                                                              : empty_counters;
+		const auto &counters =
+		    profiler_task_id && pipeline_executor ? pipeline_executor->GetSourceThroughputCounters() : empty_counters;
 		idx_t pipeline_input_tuples = 0;
 		idx_t pipeline_input_chunks = 0;
 		if ((energy_attribution_active || profiler_task_id) && pipeline_executor) {
@@ -416,9 +416,9 @@ void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThr
 		lock_guard<mutex> guard(source_throughput_lock);
 		throughput_estimate = source_throughput_estimator.Update(source_throughput, task_duration_ns);
 	}
-	QueryProfiler::Get(GetClientContext()).RecordPipelineTaskEnd(task_id, end_cpu, source_throughput,
-	                                                             pipeline_input_tuples, pipeline_input_chunks,
-	                                                             throughput_estimate);
+	QueryProfiler::Get(GetClientContext())
+	    .RecordPipelineTaskEnd(task_id, end_cpu, source_throughput, pipeline_input_tuples, pipeline_input_chunks,
+	                           throughput_estimate);
 }
 
 void Pipeline::AddDependency(shared_ptr<Pipeline> &pipeline) {
