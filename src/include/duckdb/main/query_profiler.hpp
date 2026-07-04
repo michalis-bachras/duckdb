@@ -262,6 +262,7 @@ public:
 	DUCKDB_API void Start(const string &query);
 	DUCKDB_API void Reset();
 	DUCKDB_API void StartQuery(const string &query, bool is_explain_analyze = false, bool start_at_optimizer = false);
+	DUCKDB_API void StartRequestMetadataQuery(const string &query);
 	DUCKDB_API void EndQuery();
 	//! Finalize query metrics for output; safe to call multiple times.
 	DUCKDB_API void FinalizeMetrics();
@@ -296,6 +297,7 @@ public:
 	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
 	                                      const SourceThroughputEstimate &throughput_estimate);
+	DUCKDB_API vector<PipelineProfilingInfo> GetPipelineProfilesSnapshot() const;
 
 	DUCKDB_API string QueryTreeToString() const;
 	DUCKDB_API void QueryTreeToStream(std::ostream &str) const;
@@ -377,6 +379,8 @@ private:
 	bool is_explain_analyze;
 	//! Whether root metrics have been finalized for output
 	bool metrics_finalized;
+	//! Whether the profiler was started only to collect request metadata pipeline profiles.
+	bool request_metadata_pipeline_profiles;
 
 public:
 	const TreeMap &GetTreeMap() const {

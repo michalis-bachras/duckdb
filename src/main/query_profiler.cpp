@@ -14,6 +14,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/profiling_utils.hpp"
 #include "duckdb/main/profiling_info.hpp"
+#include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/storage/buffer/buffer_pool.hpp"
 #include "yyjson.hpp"
 #include "yyjson_utils.hpp"
@@ -28,7 +29,8 @@ namespace duckdb {
 
 QueryProfiler::QueryProfiler(ClientContext &context_p)
     : context(context_p), running(false), query_requires_profiling(false), next_pipeline_profile_id(1),
-      next_pipeline_task_profile_id(1), is_explain_analyze(false), metrics_finalized(false) {
+      next_pipeline_task_profile_id(1), is_explain_analyze(false), metrics_finalized(false),
+      request_metadata_pipeline_profiles(false) {
 }
 
 bool QueryProfiler::IsEnabled() const {
@@ -118,6 +120,7 @@ void QueryProfiler::Reset() {
 	running = false;
 	query_metrics.Reset();
 	metrics_finalized = false;
+	request_metadata_pipeline_profiles = false;
 }
 
 PipelineProfilingInfo *QueryProfiler::GetPipelineProfile(idx_t pipeline_id) {
@@ -213,14 +216,19 @@ idx_t QueryProfiler::RegisterPipelineProfile(const PhysicalOperator &source,
                                              const vector<reference<PhysicalOperator>> &operators,
                                              optional_ptr<PhysicalOperator> sink) {
 	lock_guard<std::mutex> guard(lock);
-	if (!running || !IsEnabled()) {
+	auto profiler_enabled = IsEnabled();
+	auto request_metadata_enabled =
+	    request_metadata_pipeline_profiles || QueryRequestMetadataManager::HasActiveMetadata(context);
+	if (!running || (!profiler_enabled && !request_metadata_enabled)) {
 		return 0;
 	}
 	auto &pipeline_settings = ClientConfig::GetConfig(context).pipeline_profiling;
-	if (!pipeline_settings.IsAnyEnabled()) {
+	if (!pipeline_settings.IsAnyEnabled() && !request_metadata_enabled) {
 		return 0;
 	}
-	pipeline_dvfs_profiler.Initialize(pipeline_settings);
+	if (pipeline_settings.IsAnyEnabled()) {
+		pipeline_dvfs_profiler.Initialize(pipeline_settings);
+	}
 
 	PipelineProfilingInfo profile;
 	profile.pipeline_id = next_pipeline_profile_id++;
@@ -420,6 +428,15 @@ void QueryProfiler::StartQuery(const string &query, bool is_explain_analyze_p, b
 	Start(query);
 }
 
+void QueryProfiler::StartRequestMetadataQuery(const string &query) {
+	lock_guard<std::mutex> guard(lock);
+	if (running || IsEnabled() || !QueryRequestMetadataManager::HasActiveMetadata(context)) {
+		return;
+	}
+	Start(query);
+	request_metadata_pipeline_profiles = true;
+}
+
 bool QueryProfiler::OperatorRequiresProfiling(const PhysicalOperatorType op_type) {
 	const auto &config = ClientConfig::GetConfig(context);
 	if (config.profiling_coverage == ProfilingCoverage::ALL) {
@@ -486,11 +503,15 @@ void QueryProfiler::StartExplainAnalyze() {
 
 void QueryProfiler::EndQuery() {
 	unique_lock<std::mutex> guard(lock);
-	if (!IsEnabled() || !running) {
+	auto profiler_enabled = IsEnabled();
+	auto request_metadata_only = request_metadata_pipeline_profiles && !profiler_enabled;
+	if (!running || (!profiler_enabled && !request_metadata_pipeline_profiles)) {
 		return;
 	}
 
-	FinalizeMetricsInternal();
+	if (profiler_enabled) {
+		FinalizeMetricsInternal();
+	}
 	running = false;
 	pipeline_dvfs_profiler.Reset();
 	bool emit_output = false;
@@ -502,8 +523,13 @@ void QueryProfiler::EndQuery() {
 	}
 
 	is_explain_analyze = false;
+	request_metadata_pipeline_profiles = false;
 
 	guard.unlock();
+
+	if (request_metadata_only) {
+		return;
+	}
 
 	// To log is inexpensive, whether to log or not depends on whether logging is active
 	ToLog();
@@ -519,6 +545,11 @@ void QueryProfiler::EndQuery() {
 			WriteToFile(save_location.c_str(), tree);
 		}
 	}
+}
+
+vector<PipelineProfilingInfo> QueryProfiler::GetPipelineProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(lock);
+	return pipeline_profiles;
 }
 
 void QueryProfiler::FinalizeMetrics() {

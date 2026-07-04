@@ -22,6 +22,7 @@
 #include "duckdb/main/error_manager.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/main/stream_query_result.hpp"
@@ -237,6 +238,8 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 	transaction.SetActiveQuery(db->GetDatabaseManager().GetNewQueryNumber());
 	LogQueryInternal(lock, query);
 	active_query->query = query;
+	QueryRequestMetadataManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
+	QueryProfiler::Get(*this).StartRequestMetadataQuery(query);
 	EnergyAttributionManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
 
 	query_progress.Initialize();
@@ -292,6 +295,7 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	} // LCOV_EXCL_STOP
 
 	client_data->profiler->EndQuery();
+	QueryRequestMetadataManager::EndQuery(*this);
 	EnergyAttributionManager::EndQuery(*this);
 
 	// Refresh the logger
