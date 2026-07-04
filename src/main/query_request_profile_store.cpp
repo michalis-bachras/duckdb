@@ -142,6 +142,8 @@ struct PipelineProfileAggregate {
 static std::mutex g_profile_store_lock;
 static std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> g_query_profiles;
 static std::unordered_map<PipelineProfileKey, PipelineProfileAggregate, PipelineProfileKeyHash> g_pipeline_profiles;
+static vector<QueryRequestSampleSnapshot> g_query_samples;
+static vector<QueryRequestPipelineInstanceSnapshot> g_pipeline_instances;
 
 static uint64_t DurationNs(uint64_t end_ns, uint64_t start_ns) {
 	if (end_ns <= start_ns) {
@@ -220,6 +222,22 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 	    (static_cast<double>(lateness_ns) / 1000000000.0) * static_cast<double>(metadata.sla_penalty_per_s);
 
 	lock_guard<std::mutex> guard(g_profile_store_lock);
+	QueryRequestSampleSnapshot query_sample;
+	query_sample.db_query_id = metadata.db_query_id;
+	query_sample.request_id = metadata.request_id;
+	query_sample.template_id = metadata.template_id;
+	query_sample.scale_factor = metadata.scale_factor;
+	query_sample.sla_tag = metadata.sla_tag;
+	query_sample.sla_penalty_per_s = metadata.sla_penalty_per_s;
+	query_sample.query_start_ns = metadata.query_start_ns;
+	query_sample.query_end_ns = query_end_ns;
+	query_sample.runtime_ns = runtime_ns;
+	query_sample.deadline_ns = metadata.deadline_ns;
+	query_sample.lateness_ns = lateness_ns;
+	query_sample.sla_cost = sla_cost;
+	query_sample.deadline_met = lateness_ns == 0;
+	g_query_samples.push_back(std::move(query_sample));
+
 	QueryProfileKey query_key;
 	query_key.template_id = metadata.template_id;
 	query_key.scale_factor = metadata.scale_factor;
@@ -253,14 +271,43 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		pipeline_profile.planned_input_rows.Add(static_cast<double>(profile.planned_input_rows));
 		pipeline_profile.planned_input_chunks_equiv.Add(static_cast<double>(profile.planned_input_chunks_equiv));
 		pipeline_profile.task_count.Add(static_cast<double>(profile.task_count));
+		QueryRequestPipelineInstanceSnapshot pipeline_instance;
+		pipeline_instance.db_query_id = metadata.db_query_id;
+		pipeline_instance.request_id = metadata.request_id;
+		pipeline_instance.template_id = metadata.template_id;
+		pipeline_instance.scale_factor = metadata.scale_factor;
+		pipeline_instance.pipeline_id = profile.pipeline_id;
+		pipeline_instance.pipeline_signature_hash = signature_hash;
+		pipeline_instance.pipeline_signature = signature;
+		pipeline_instance.operator_type_sequence = profile.operator_type_sequence;
+		pipeline_instance.source_type = profile.source_type;
+		pipeline_instance.sink_type = profile.sink_type;
+		pipeline_instance.source_input_kind = profile.source_input_kind;
+		pipeline_instance.source_input_confidence = profile.source_input_confidence;
+		pipeline_instance.planned_input_native_unit = profile.planned_input_native_unit;
+		pipeline_instance.task_count = profile.task_count;
+		pipeline_instance.source_max_threads = profile.source_max_threads;
+		pipeline_instance.planned_input_rows = profile.planned_input_rows;
+		pipeline_instance.planned_input_chunks_equiv = profile.planned_input_chunks_equiv;
+		pipeline_instance.source_estimated_cardinality = profile.source_estimated_cardinality;
+		pipeline_instance.sink_estimated_cardinality = profile.sink_estimated_cardinality;
+		pipeline_instance.start_ns = profile.start_ns;
+		pipeline_instance.tasks_done_ns = profile.tasks_done_ns;
+		pipeline_instance.finish_done_ns = profile.finish_done_ns;
 		if (profile.start_ns > 0 && profile.tasks_done_ns >= profile.start_ns) {
-			pipeline_profile.task_runtime_ns.Add(static_cast<double>(profile.tasks_done_ns - profile.start_ns));
-			pipeline_profile.downstream_suffix_ns.Add(
-			    static_cast<double>(DurationNs(query_end_ns, profile.tasks_done_ns)));
+			auto task_runtime_ns = profile.tasks_done_ns - profile.start_ns;
+			auto downstream_suffix_ns = DurationNs(query_end_ns, profile.tasks_done_ns);
+			pipeline_profile.task_runtime_ns.Add(static_cast<double>(task_runtime_ns));
+			pipeline_profile.downstream_suffix_ns.Add(static_cast<double>(downstream_suffix_ns));
+			pipeline_instance.task_runtime_ns = task_runtime_ns;
+			pipeline_instance.downstream_suffix_ns = downstream_suffix_ns;
 		}
 		if (profile.start_ns > 0 && profile.finish_done_ns >= profile.start_ns) {
-			pipeline_profile.lifecycle_runtime_ns.Add(static_cast<double>(profile.finish_done_ns - profile.start_ns));
+			auto lifecycle_runtime_ns = profile.finish_done_ns - profile.start_ns;
+			pipeline_profile.lifecycle_runtime_ns.Add(static_cast<double>(lifecycle_runtime_ns));
+			pipeline_instance.lifecycle_runtime_ns = lifecycle_runtime_ns;
 		}
+		g_pipeline_instances.push_back(std::move(pipeline_instance));
 	}
 }
 
@@ -294,6 +341,80 @@ bool QueryRequestProfileStore::TryGetPipelineEstimate(uint64_t template_id, uint
 	return true;
 }
 
+vector<QueryRequestProfileSnapshot> QueryRequestProfileStore::GetQueryProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(g_profile_store_lock);
+	vector<QueryRequestProfileSnapshot> result;
+	result.reserve(g_query_profiles.size());
+	for (const auto &entry : g_query_profiles) {
+		QueryRequestProfileSnapshot snapshot;
+		snapshot.template_id = entry.second.template_id;
+		snapshot.scale_factor = entry.second.scale_factor;
+		PopulateQueryEstimate(entry.second, snapshot.estimate);
+		result.push_back(std::move(snapshot));
+	}
+	std::sort(result.begin(), result.end(), [](const QueryRequestProfileSnapshot &left,
+	                                           const QueryRequestProfileSnapshot &right) {
+		if (left.template_id != right.template_id) {
+			return left.template_id < right.template_id;
+		}
+		return left.scale_factor < right.scale_factor;
+	});
+	return result;
+}
+
+vector<QueryRequestPipelineProfileSnapshot> QueryRequestProfileStore::GetPipelineProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(g_profile_store_lock);
+	vector<QueryRequestPipelineProfileSnapshot> result;
+	result.reserve(g_pipeline_profiles.size());
+	for (const auto &entry : g_pipeline_profiles) {
+		QueryRequestPipelineProfileSnapshot snapshot;
+		snapshot.template_id = entry.second.template_id;
+		snapshot.scale_factor = entry.second.scale_factor;
+		PopulatePipelineEstimate(entry.second, snapshot.estimate);
+		result.push_back(std::move(snapshot));
+	}
+	std::sort(result.begin(), result.end(), [](const QueryRequestPipelineProfileSnapshot &left,
+	                                           const QueryRequestPipelineProfileSnapshot &right) {
+		if (left.template_id != right.template_id) {
+			return left.template_id < right.template_id;
+		}
+		if (left.scale_factor != right.scale_factor) {
+			return left.scale_factor < right.scale_factor;
+		}
+		return left.estimate.pipeline_signature_hash < right.estimate.pipeline_signature_hash;
+	});
+	return result;
+}
+
+vector<QueryRequestSampleSnapshot> QueryRequestProfileStore::GetQuerySamplesSnapshot() const {
+	lock_guard<std::mutex> guard(g_profile_store_lock);
+	auto result = g_query_samples;
+	std::sort(result.begin(), result.end(), [](const QueryRequestSampleSnapshot &left,
+	                                           const QueryRequestSampleSnapshot &right) {
+		if (left.db_query_id != right.db_query_id) {
+			return left.db_query_id < right.db_query_id;
+		}
+		return left.request_id < right.request_id;
+	});
+	return result;
+}
+
+vector<QueryRequestPipelineInstanceSnapshot> QueryRequestProfileStore::GetPipelineInstancesSnapshot() const {
+	lock_guard<std::mutex> guard(g_profile_store_lock);
+	auto result = g_pipeline_instances;
+	std::sort(result.begin(), result.end(), [](const QueryRequestPipelineInstanceSnapshot &left,
+	                                           const QueryRequestPipelineInstanceSnapshot &right) {
+		if (left.db_query_id != right.db_query_id) {
+			return left.db_query_id < right.db_query_id;
+		}
+		if (left.pipeline_id != right.pipeline_id) {
+			return left.pipeline_id < right.pipeline_id;
+		}
+		return left.pipeline_signature_hash < right.pipeline_signature_hash;
+	});
+	return result;
+}
+
 idx_t QueryRequestProfileStore::QueryProfileCount() const {
 	lock_guard<std::mutex> guard(g_profile_store_lock);
 	return g_query_profiles.size();
@@ -308,6 +429,8 @@ void QueryRequestProfileStore::Clear() {
 	lock_guard<std::mutex> guard(g_profile_store_lock);
 	g_query_profiles.clear();
 	g_pipeline_profiles.clear();
+	g_query_samples.clear();
+	g_pipeline_instances.clear();
 }
 
 } // namespace duckdb

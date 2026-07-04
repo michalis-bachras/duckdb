@@ -150,6 +150,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_LOCAL(EnergyAttributionPipelineSignaturesEnableSetting),
     DUCKDB_LOCAL(EnergyAttributionProfileUpdateEnableSetting),
     DUCKDB_LOCAL(EnergyAttributionRaplEnableSetting),
+    DUCKDB_LOCAL(QueryRequestProfilingEnableSetting),
     DUCKDB_SETTING(ErrorsAsJSONSetting),
     DUCKDB_SETTING(ExperimentalMetadataReuseSetting),
     DUCKDB_SETTING_CALLBACK(ExplainOutputSetting),

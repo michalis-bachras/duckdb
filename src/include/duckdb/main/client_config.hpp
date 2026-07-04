@@ -81,6 +81,8 @@ struct ClientConfig {
 	LogicalTypeId profiler_settings_type = LogicalTypeId::VARCHAR;
 	//! Optional pipeline-level profiling extensions controlled by custom_profiling_settings.
 	PipelineProfilingSettings pipeline_profiling;
+	//! Optional request/template/pipeline profile store for scheduler research.
+	bool query_request_profiling_enabled = false;
 	//! Prototype Linux RAPL/perf_event pipeline energy attribution.
 	EnergyAttributionSettings energy_attribution;
 

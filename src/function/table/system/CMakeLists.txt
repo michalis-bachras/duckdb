@@ -17,6 +17,7 @@ add_library_unity(
   duckdb_indexes.cpp
   duckdb_memory.cpp
   duckdb_optimizers.cpp
+  duckdb_query_request_profiles.cpp
   duckdb_schemas.cpp
   duckdb_secrets.cpp
   duckdb_prepared_statements.cpp

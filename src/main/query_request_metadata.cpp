@@ -8,6 +8,7 @@
 #include "duckdb/main/query_request_metadata.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
@@ -114,6 +115,10 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 }
 
 } // namespace
+
+bool QueryRequestMetadataManager::Enabled(ClientContext &context) {
+	return ClientConfig::GetConfig(context).query_request_profiling_enabled;
+}
 
 void QueryRequestMetadataManager::BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query) {
 	auto metadata = ParseQueryRequestMetadata(query);

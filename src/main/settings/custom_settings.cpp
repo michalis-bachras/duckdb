@@ -1812,6 +1812,23 @@ Value ProfilingCoverageSetting::GetSetting(const ClientContext &context) {
 }
 
 //===----------------------------------------------------------------------===//
+// Query Request Profiling
+//===----------------------------------------------------------------------===//
+void QueryRequestProfilingEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).query_request_profiling_enabled = BooleanValue::Get(value);
+}
+
+void QueryRequestProfilingEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).query_request_profiling_enabled =
+	    ClientConfig().query_request_profiling_enabled;
+}
+
+Value QueryRequestProfilingEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).query_request_profiling_enabled);
+}
+
+//===----------------------------------------------------------------------===//
 // Progress Bar Time
 //===----------------------------------------------------------------------===//
 void ProgressBarTimeSetting::SetLocal(ClientContext &context, const Value &input) {

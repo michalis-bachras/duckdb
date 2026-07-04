@@ -91,6 +91,10 @@ struct DuckDBPreparedStatementsFun {
 	static void RegisterFunction(BuiltinFunctions &set);
 };
 
+struct DuckDBQueryRequestProfilesFun {
+	static void RegisterFunction(BuiltinFunctions &set);
+};
+
 struct DuckDBFunctionsFun {
 	static void RegisterFunction(BuiltinFunctions &set);
 };

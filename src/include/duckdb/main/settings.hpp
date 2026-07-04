@@ -1009,6 +1009,17 @@ struct EnergyAttributionRaplEnableSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct QueryRequestProfilingEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_request_profiling_enable";
+	static constexpr const char *Description =
+	    "Enable request metadata parsing and bounded query/pipeline profile aggregation";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct ErrorsAsJSONSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "errors_as_json";

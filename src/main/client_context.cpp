@@ -238,8 +238,10 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 	transaction.SetActiveQuery(db->GetDatabaseManager().GetNewQueryNumber());
 	LogQueryInternal(lock, query);
 	active_query->query = query;
-	QueryRequestMetadataManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
-	QueryProfiler::Get(*this).StartRequestMetadataQuery(query);
+	if (QueryRequestMetadataManager::Enabled(*this)) {
+		QueryRequestMetadataManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
+		QueryProfiler::Get(*this).StartRequestMetadataQuery(query);
+	}
 	EnergyAttributionManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
 
 	query_progress.Initialize();
@@ -295,7 +297,9 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	} // LCOV_EXCL_STOP
 
 	client_data->profiler->EndQuery();
-	QueryRequestMetadataManager::EndQuery(*this);
+	if (QueryRequestMetadataManager::Enabled(*this)) {
+		QueryRequestMetadataManager::EndQuery(*this);
+	}
 	EnergyAttributionManager::EndQuery(*this);
 
 	// Refresh the logger

@@ -102,6 +102,26 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 
 	REQUIRE(store.QueryProfileCount() == 1);
 	REQUIRE(store.PipelineProfileCount() == 1);
+	auto query_samples = store.GetQuerySamplesSnapshot();
+	REQUIRE(query_samples.size() == 2);
+	REQUIRE(query_samples[0].db_query_id == 1001);
+	REQUIRE(query_samples[0].request_id == 1);
+	REQUIRE(query_samples[0].template_id == 101);
+	REQUIRE(query_samples[0].scale_factor == 10);
+	REQUIRE(query_samples[0].runtime_ns == 10000);
+	REQUIRE(query_samples[0].lateness_ns == 2000);
+	REQUIRE(query_samples[0].sla_cost > 0);
+
+	auto pipeline_instances = store.GetPipelineInstancesSnapshot();
+	REQUIRE(pipeline_instances.size() == 2);
+	REQUIRE(pipeline_instances[0].db_query_id == 1001);
+	REQUIRE(pipeline_instances[0].request_id == 1);
+	REQUIRE(pipeline_instances[0].pipeline_id == 7);
+	REQUIRE(pipeline_instances[0].pipeline_signature_hash == signature_hash);
+	REQUIRE(pipeline_instances[0].operator_type_sequence == "TABLE_SCAN>PROJECTION>HASH_GROUP_BY");
+	REQUIRE(pipeline_instances[0].task_runtime_ns == 700);
+	REQUIRE(pipeline_instances[0].lifecycle_runtime_ns == 900);
+	REQUIRE(pipeline_instances[0].downstream_suffix_ns == 8300);
 
 	QueryRequestProfileEstimate query_estimate;
 	REQUIRE(store.TryGetQueryEstimate(101, 10, query_estimate));
@@ -140,6 +160,25 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	store.Clear();
 }
 
+TEST_CASE("Query request profile store is disabled by default for metadata comments", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE metadata_disabled_t AS SELECT i FROM range(1000) tbl(i)"));
+
+	auto result = con.Query(MetadataQuery(1, 6, 10, "SELECT count(*) FROM metadata_disabled_t"));
+	REQUIRE(CHECK_COLUMN(result, 0, {1000}));
+	REQUIRE(store.QueryProfileCount() == 0);
+	REQUIRE(store.PipelineProfileCount() == 0);
+
+	auto query_profiles = con.Query("SELECT count(*) FROM duckdb_debug_query_request_profiles()");
+	REQUIRE(CHECK_COLUMN(query_profiles, 0, {0}));
+	auto pipeline_profiles = con.Query("SELECT count(*) FROM duckdb_debug_query_request_pipeline_profiles()");
+	REQUIRE(CHECK_COLUMN(pipeline_profiles, 0, {0}));
+}
+
 TEST_CASE("Query request profile store records repeated metadata queries", "[api]") {
 	auto &store = QueryRequestProfileStore::Get();
 	store.Clear();
@@ -151,6 +190,7 @@ TEST_CASE("Query request profile store records repeated metadata queries", "[api
 	REQUIRE_NO_FAIL(con.Query("SELECT count(*) FROM metadata_profile_t"));
 	REQUIRE(store.QueryProfileCount() == 0);
 	REQUIRE(store.PipelineProfileCount() == 0);
+	REQUIRE_NO_FAIL(con.Query("SET query_request_profiling_enable=true"));
 
 	string body = "SELECT g, count(*), sum(i) FROM metadata_profile_t GROUP BY g ORDER BY g";
 	for (idx_t i = 0; i < 3; i++) {
@@ -166,6 +206,27 @@ TEST_CASE("Query request profile store records repeated metadata queries", "[api
 	REQUIRE(query_estimate.mean_runtime_ns > 0);
 	REQUIRE(query_estimate.p90_runtime_ns > 0);
 	REQUIRE(store.PipelineProfileCount() > 0);
+
+	auto query_profiles =
+	    con.Query("SELECT template_id, scale_factor, sample_count FROM duckdb_debug_query_request_profiles()");
+	REQUIRE(CHECK_COLUMN(query_profiles, 0, {Value::UBIGINT(6)}));
+	REQUIRE(CHECK_COLUMN(query_profiles, 1, {Value::UBIGINT(10)}));
+	REQUIRE(CHECK_COLUMN(query_profiles, 2, {Value::UBIGINT(3)}));
+	auto pipeline_profiles = con.Query("SELECT count(*) FROM duckdb_debug_query_request_pipeline_profiles()");
+	REQUIRE(CHECK_COLUMN(pipeline_profiles, 0, {Value::BIGINT(static_cast<int64_t>(store.PipelineProfileCount()))}));
+	auto query_samples =
+	    con.Query("SELECT template_id, scale_factor, count(*) FROM duckdb_debug_query_request_samples() "
+	              "GROUP BY template_id, scale_factor");
+	REQUIRE(CHECK_COLUMN(query_samples, 0, {Value::UBIGINT(6)}));
+	REQUIRE(CHECK_COLUMN(query_samples, 1, {Value::UBIGINT(10)}));
+	REQUIRE(CHECK_COLUMN(query_samples, 2, {Value::BIGINT(3)}));
+	auto pipeline_instances =
+	    con.Query("SELECT count(*), count(DISTINCT db_query_id), count(DISTINCT pipeline_id) "
+	              "FROM duckdb_debug_query_request_pipeline_instances()");
+	REQUIRE(CHECK_COLUMN(pipeline_instances, 0, {Value::BIGINT(static_cast<int64_t>(
+	                                                 store.GetPipelineInstancesSnapshot().size()))}));
+	REQUIRE(CHECK_COLUMN(pipeline_instances, 1, {Value::BIGINT(3)}));
+	REQUIRE(CHECK_COLUMN(pipeline_instances, 2, {Value::BIGINT(static_cast<int64_t>(store.PipelineProfileCount()))}));
 
 	store.Clear();
 }
@@ -188,6 +249,12 @@ TEST_CASE("Query request profile store records concurrent metadata queries", "[a
 	for (idx_t thread_idx = 0; thread_idx < THREAD_COUNT; thread_idx++) {
 		threads.emplace_back([&db, &error_lock, &errors, thread_idx]() {
 			Connection con(db);
+			auto set_result = con.Query("SET query_request_profiling_enable=true");
+			if (set_result->HasError()) {
+				lock_guard<mutex> guard(error_lock);
+				errors.push_back(set_result->GetError());
+				return;
+			}
 			auto template_id = thread_idx % 2 == 0 ? 11 : 12;
 			string body = "SELECT g, count(*), sum(i) FROM concurrent_metadata_profile_t GROUP BY g ORDER BY g";
 			for (idx_t repetition = 0; repetition < QUERY_REPETITIONS; repetition++) {

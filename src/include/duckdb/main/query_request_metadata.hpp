@@ -28,6 +28,7 @@ struct QueryRequestMetadata {
 
 class QueryRequestMetadataManager {
 public:
+	static bool Enabled(ClientContext &context);
 	static void BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query);
 	static void EndQuery(ClientContext &context);
 	static bool HasActiveMetadata(ClientContext &context);
