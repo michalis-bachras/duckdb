@@ -22,6 +22,7 @@
 #include "duckdb/main/error_manager.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/query_admission_controller.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
@@ -84,6 +85,8 @@ public:
 	unique_ptr<Executor> executor;
 	//! The progress bar
 	unique_ptr<ProgressBar> progress_bar;
+	//! Optional SLA workload admission slot. Releasing this admits another waiting query.
+	unique_ptr<QueryAdmissionHandle> admission_handle;
 
 public:
 	void SetOpenResult(BaseQueryResult &result) {
@@ -238,9 +241,17 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 	transaction.SetActiveQuery(db->GetDatabaseManager().GetNewQueryNumber());
 	LogQueryInternal(lock, query);
 	active_query->query = query;
-	if (QueryRequestMetadataManager::Enabled(*this)) {
+	if (QueryRequestMetadataManager::NeedsMetadata(*this)) {
 		QueryRequestMetadataManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
-		QueryProfiler::Get(*this).StartRequestMetadataQuery(query);
+		QueryRequestMetadata metadata;
+		if (QueryRequestMetadataManager::TryGetActive(*this, metadata) && config.query_admission_max_active > 0) {
+			active_query->admission_handle =
+			    db_inst.GetQueryAdmissionController().Acquire(*this, metadata, config.query_admission_max_active);
+			QueryRequestMetadataManager::RefreshQueryStart(*this);
+		}
+		if (QueryRequestMetadataManager::ProfilingEnabled(*this)) {
+			QueryProfiler::Get(*this).StartRequestMetadataQuery(query);
+		}
 	}
 	EnergyAttributionManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
 
@@ -297,7 +308,7 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	} // LCOV_EXCL_STOP
 
 	client_data->profiler->EndQuery();
-	if (QueryRequestMetadataManager::Enabled(*this)) {
+	if (QueryRequestMetadataManager::NeedsMetadata(*this)) {
 		QueryRequestMetadataManager::EndQuery(*this);
 	}
 	EnergyAttributionManager::EndQuery(*this);

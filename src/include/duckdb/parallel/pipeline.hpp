@@ -185,7 +185,8 @@ private:
 	void ScheduleSequentialTask(shared_ptr<Event> &event);
 	bool LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads);
 
-	bool ScheduleParallel(shared_ptr<Event> &event);
+	bool ScheduleParallel(shared_ptr<Event> &event, string &parallel_blocker, idx_t &effective_max_threads,
+	                      idx_t &source_max_threads, idx_t &scheduler_threads);
 };
 
 } // namespace duckdb

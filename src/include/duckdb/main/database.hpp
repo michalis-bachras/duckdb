@@ -35,6 +35,7 @@ struct DatabaseCacheEntry;
 class LogManager;
 class ExternalFileCache;
 class ResultSetManager;
+class QueryAdmissionController;
 
 class DatabaseInstance : public enable_shared_from_this<DatabaseInstance> {
 	friend class DuckDB;
@@ -60,6 +61,7 @@ public:
 	DUCKDB_API ExtensionManager &GetExtensionManager();
 	DUCKDB_API ValidChecker &GetValidChecker();
 	DUCKDB_API LogManager &GetLogManager() const;
+	DUCKDB_API QueryAdmissionController &GetQueryAdmissionController();
 
 	DUCKDB_API const duckdb_ext_api_v1 GetExtensionAPIV1();
 
@@ -97,6 +99,7 @@ private:
 	unique_ptr<LogManager> log_manager;
 	unique_ptr<ExternalFileCache> external_file_cache;
 	unique_ptr<ResultSetManager> result_set_manager;
+	unique_ptr<QueryAdmissionController> query_admission_controller;
 
 	duckdb_ext_api_v1 (*create_api_v1)();
 };

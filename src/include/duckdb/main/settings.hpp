@@ -917,6 +917,17 @@ struct EnergyAttributionMetadataCacheEnableSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct EnergyAttributionLifecyclePhasesEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_lifecycle_phases_enable";
+	static constexpr const char *Description =
+	    "Enable optional energy attribution for pipeline initialize/prepare-finish/finish lifecycle tasks";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct EnergyAttributionMigrationCheckEnableSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "energy_attribution_migration_check_enable";
@@ -1014,6 +1025,38 @@ struct QueryRequestProfilingEnableSetting {
 	static constexpr const char *Name = "query_request_profiling_enable";
 	static constexpr const char *Description =
 	    "Enable request metadata parsing and bounded query/pipeline profile aggregation";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QueryAdmissionMaxActiveSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "query_admission_max_active";
+	static constexpr const char *Description =
+	    "Maximum number of SLA-tagged workload queries admitted at once; zero disables admission control";
+	static constexpr const char *InputType = "UBIGINT";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QueryActivationSchedulerEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_activation_scheduler_enable";
+	static constexpr const char *Description =
+	    "Enable prototype per-query pipeline activation scheduling for SLA-tagged workload queries";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QueryActivationDebugEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_activation_debug_enable";
+	static constexpr const char *Description = "Enable debug logging for query admission and activation scheduler state";
 	static constexpr const char *InputType = "BOOLEAN";
 	static void SetLocal(ClientContext &context, const Value &parameter);
 	static void ResetLocal(ClientContext &context);

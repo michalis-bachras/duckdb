@@ -27,8 +27,10 @@ class PhysicalOperator;
 class PipelineExecutor;
 class OperatorState;
 class QueryProfiler;
+class QueryActivationScheduler;
 class ThreadContext;
 class Task;
+enum class QueryActivationEventKind : uint8_t;
 
 struct PipelineEventStack;
 struct ProducerToken;
@@ -96,6 +98,10 @@ public:
 		return *producer;
 	}
 	void AddEvent(shared_ptr<Event> event);
+	void ScheduleEvent(shared_ptr<Event> event);
+	void ScheduleEventNow(shared_ptr<Event> event);
+	void RegisterActivationEvent(Event &event, idx_t group_id, QueryActivationEventKind kind, idx_t pipeline_id = 0);
+	void NotifyEventFinished(Event &event);
 
 	void AddRecursiveCTE(PhysicalOperator &rec_cte);
 	void ReschedulePipelines(const vector<shared_ptr<MetaPipeline>> &pipelines, vector<shared_ptr<Event>> &events);
@@ -167,6 +173,8 @@ private:
 	vector<shared_ptr<Event>> events;
 	//! The query profiler
 	shared_ptr<QueryProfiler> profiler;
+	//! Optional prototype per-query pipeline activation gate.
+	unique_ptr<QueryActivationScheduler> activation_scheduler;
 	//! Task error manager
 	TaskErrorManager error_manager;
 
@@ -176,6 +184,10 @@ private:
 	idx_t total_pipelines;
 	//! Whether or not execution is cancelled
 	bool cancelled;
+	//! Activation group id generator for the optional prototype activation gate.
+	idx_t next_activation_group_id;
+	//! Lifecycle attribution group id generator for shared pipeline lifecycle phases.
+	idx_t next_energy_lifecycle_group_id;
 
 	//! The last pending execution result (if any)
 	PendingExecutionResult execution_result;

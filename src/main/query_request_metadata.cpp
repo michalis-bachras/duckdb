@@ -116,8 +116,14 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 
 } // namespace
 
-bool QueryRequestMetadataManager::Enabled(ClientContext &context) {
+bool QueryRequestMetadataManager::ProfilingEnabled(ClientContext &context) {
 	return ClientConfig::GetConfig(context).query_request_profiling_enabled;
+}
+
+bool QueryRequestMetadataManager::NeedsMetadata(ClientContext &context) {
+	const auto &config = ClientConfig::GetConfig(context);
+	return config.query_request_profiling_enabled || config.query_admission_max_active > 0 ||
+	       config.query_activation_scheduler_enabled || config.query_activation_debug_enabled;
 }
 
 void QueryRequestMetadataManager::BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query) {
@@ -132,6 +138,15 @@ void QueryRequestMetadataManager::BeginQuery(ClientContext &context, uint64_t db
 	g_active_request_metadata[&context] = std::move(metadata);
 }
 
+void QueryRequestMetadataManager::RefreshQueryStart(ClientContext &context) {
+	lock_guard<std::mutex> guard(g_request_metadata_lock);
+	auto entry = g_active_request_metadata.find(&context);
+	if (entry == g_active_request_metadata.end() || !entry->second.valid) {
+		return;
+	}
+	entry->second.query_start_ns = TimestampNs();
+}
+
 void QueryRequestMetadataManager::EndQuery(ClientContext &context) {
 	QueryRequestMetadata metadata;
 	{
@@ -142,6 +157,9 @@ void QueryRequestMetadataManager::EndQuery(ClientContext &context) {
 		}
 		metadata = entry->second;
 		g_active_request_metadata.erase(entry);
+	}
+	if (!ProfilingEnabled(context)) {
+		return;
 	}
 	auto query_end_ns = TimestampNs();
 	auto pipeline_profiles = QueryProfiler::Get(context).GetPipelineProfilesSnapshot();

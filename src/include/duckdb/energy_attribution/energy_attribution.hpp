@@ -8,11 +8,14 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/vector.hpp"
 
 namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
+class EnergySegmentScope;
+class Event;
 class Pipeline;
 struct EnergyAttributionSettings;
 
@@ -47,6 +50,13 @@ enum class EnergySegmentRole : uint8_t {
 	UNKNOWN
 };
 
+enum class EnergySegmentPhase : uint8_t {
+	EXECUTE,
+	INITIALIZE,
+	PREPARE_FINISH,
+	FINISH
+};
+
 struct EnergySegmentRecord {
 	uint64_t segment_id = 0;
 	uint64_t plan_version = 0;
@@ -62,6 +72,11 @@ struct EnergySegmentRecord {
 	uint64_t pipeline_id = 0;
 	string pipeline_signature;
 	EnergySegmentRole role = EnergySegmentRole::UNKNOWN;
+	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
+	uint64_t lifecycle_group_id = 0;
+	uint64_t owner_pipeline_id = 0;
+	uint64_t lifecycle_member_count = 0;
+	vector<uint64_t> lifecycle_member_pipeline_ids;
 	uint64_t start_ns = 0;
 	uint64_t end_ns = 0;
 	double duration_s = 0;
@@ -95,11 +110,16 @@ public:
 	static void BeginQuery(ClientContext &context, uint64_t query_id, const string &query);
 	static void EndQuery(ClientContext &context);
 	static void AttachPipeline(ClientContext &context, Pipeline &pipeline, uint64_t profiler_pipeline_id);
+	static bool LifecyclePhasesEnabled(const ClientContext &context);
+	static uint64_t GetPipelineAttributionId(Pipeline &pipeline);
 };
 
 class EnergySegmentScope {
 public:
 	explicit EnergySegmentScope(Pipeline &pipeline, int start_cpu_hint = -1);
+	EnergySegmentScope(Pipeline &pipeline, Event &event, EnergySegmentPhase phase, int start_cpu_hint = -1);
+	EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase phase, uint64_t lifecycle_group_id,
+	                   const vector<uint64_t> &lifecycle_member_pipeline_ids, int start_cpu_hint = -1);
 	~EnergySegmentScope();
 
 	EnergySegmentScope(const EnergySegmentScope &) = delete;
@@ -121,5 +141,6 @@ private:
 };
 
 const char *EnergySegmentRoleToString(EnergySegmentRole role);
+const char *EnergySegmentPhaseToString(EnergySegmentPhase phase);
 
 } // namespace duckdb

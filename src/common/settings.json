@@ -1088,6 +1088,27 @@
         "custom_implementation": true
     },
     {
+        "name": "query_admission_max_active",
+        "description": "Maximum number of SLA-tagged workload queries admitted at once; zero disables admission control",
+        "type": "UBIGINT",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "query_activation_scheduler_enable",
+        "description": "Enable prototype per-query pipeline activation scheduling for SLA-tagged workload queries",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "query_activation_debug_enable",
+        "description": "Enable debug logging for query admission and activation scheduler state",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
         "name": "progress_bar_time",
         "description": "Sets the time (in milliseconds) how long a query needs to take before we start printing a progress bar",
         "type": "BIGINT",

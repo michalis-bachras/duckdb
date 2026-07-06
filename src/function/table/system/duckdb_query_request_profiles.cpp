@@ -6,7 +6,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/function/table/system_functions.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/query_admission_controller.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
+#include "duckdb/parallel/query_activation_scheduler.hpp"
+#include "duckdb/parallel/query_pipeline_debug.hpp"
 
 namespace duckdb {
 
@@ -27,6 +31,26 @@ struct DuckDBQueryRequestSamplesData : public GlobalTableFunctionState {
 
 struct DuckDBQueryRequestPipelineInstancesData : public GlobalTableFunctionState {
 	vector<QueryRequestPipelineInstanceSnapshot> instances;
+	idx_t offset = 0;
+};
+
+struct DuckDBQueryAdmissionData : public GlobalTableFunctionState {
+	vector<QueryAdmissionSnapshot> snapshots;
+	idx_t offset = 0;
+};
+
+struct DuckDBQueryAdmissionEventsData : public GlobalTableFunctionState {
+	vector<QueryAdmissionEventSnapshot> snapshots;
+	idx_t offset = 0;
+};
+
+struct DuckDBQueryActivationEventsData : public GlobalTableFunctionState {
+	vector<QueryActivationEventSnapshot> snapshots;
+	idx_t offset = 0;
+};
+
+struct DuckDBQueryPipelineEventsData : public GlobalTableFunctionState {
+	vector<QueryPipelineDebugEventSnapshot> snapshots;
 	idx_t offset = 0;
 };
 
@@ -333,6 +357,263 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 	output.SetCardinality(count);
 }
 
+static unique_ptr<FunctionData> DuckDBQueryAdmissionBind(ClientContext &context, TableFunctionBindInput &input,
+                                                         vector<LogicalType> &return_types, vector<string> &names) {
+	names.emplace_back("state");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("slot_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("db_query_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("request_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("template_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("scale_factor");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("sla_tag");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("deadline_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("queued_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("admitted_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQueryAdmissionInit(ClientContext &context,
+                                                                     TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryAdmissionData>();
+	result->snapshots = DatabaseInstance::GetDatabase(context).GetQueryAdmissionController().GetSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryAdmissionFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryAdmissionData>();
+	idx_t count = 0;
+	while (data.offset < data.snapshots.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &snapshot = data.snapshots[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value(snapshot.state));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.slot_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.db_query_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.request_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.scale_factor));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.sla_tag));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.deadline_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.queued_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.admitted_ns));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryAdmissionEventsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                               vector<LogicalType> &return_types,
+                                                               vector<string> &names) {
+	names.emplace_back("event_state");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("timestamp_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("ticket");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("slot_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("max_active");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("active_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("waiting_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("db_query_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("request_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("template_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("scale_factor");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("sla_tag");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("deadline_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("queued_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("admitted_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("released_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQueryAdmissionEventsInit(ClientContext &context,
+                                                                           TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryAdmissionEventsData>();
+	result->snapshots = QueryAdmissionController::GetEventSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryAdmissionEventsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryAdmissionEventsData>();
+	idx_t count = 0;
+	while (data.offset < data.snapshots.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &snapshot = data.snapshots[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value(snapshot.event_state));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.timestamp_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.ticket));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.slot_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.max_active));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.active_count));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.waiting_count));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.db_query_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.request_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.scale_factor));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.sla_tag));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.deadline_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.queued_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.admitted_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.released_ns));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryActivationEventsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                                vector<LogicalType> &return_types,
+                                                                vector<string> &names) {
+	names.emplace_back("db_query_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("request_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("template_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("scale_factor");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("activation_group_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("event_kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("event_state");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("timestamp_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQueryActivationEventsInit(ClientContext &context,
+                                                                            TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryActivationEventsData>();
+	result->snapshots = QueryActivationScheduler::GetDebugSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryActivationEventsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryActivationEventsData>();
+	idx_t count = 0;
+	while (data.offset < data.snapshots.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &snapshot = data.snapshots[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.db_query_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.request_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.scale_factor));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.activation_group_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.pipeline_id));
+		output.SetValue(col++, count, Value(snapshot.event_kind));
+		output.SetValue(col++, count, Value(snapshot.event_state));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.timestamp_ns));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryPipelineEventsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                              vector<LogicalType> &return_types,
+                                                              vector<string> &names) {
+	names.emplace_back("db_query_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("request_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("template_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("scale_factor");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("activation_group_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("event_kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("event_state");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("timestamp_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("total_tasks");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("finished_tasks");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("effective_max_threads");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("source_max_threads");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("scheduler_threads");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("parallel");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("parallel_blocker");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("source_type");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sink_type");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("operator_type_sequence");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQueryPipelineEventsInit(ClientContext &context,
+                                                                          TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryPipelineEventsData>();
+	result->snapshots = QueryPipelineDebug::GetDebugSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryPipelineEventsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryPipelineEventsData>();
+	idx_t count = 0;
+	while (data.offset < data.snapshots.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &snapshot = data.snapshots[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.db_query_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.request_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.scale_factor));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.activation_group_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.pipeline_id));
+		output.SetValue(col++, count, Value(snapshot.event_kind));
+		output.SetValue(col++, count, Value(snapshot.event_state));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.timestamp_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.total_tasks));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.finished_tasks));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.effective_max_threads));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.source_max_threads));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.scheduler_threads));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.parallel));
+		output.SetValue(col++, count, Value(snapshot.parallel_blocker));
+		output.SetValue(col++, count, Value(snapshot.source_type));
+		output.SetValue(col++, count, Value(snapshot.sink_type));
+		output.SetValue(col++, count, Value(snapshot.operator_type_sequence));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	set.AddFunction(TableFunction("duckdb_debug_query_request_profiles", {}, DuckDBQueryRequestProfilesFunction,
 	                              DuckDBQueryRequestProfilesBind, DuckDBQueryRequestProfilesInit));
@@ -345,6 +626,14 @@ void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	                              DuckDBQueryRequestPipelineInstancesFunction,
 	                              DuckDBQueryRequestPipelineInstancesBind,
 	                              DuckDBQueryRequestPipelineInstancesInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_admission", {}, DuckDBQueryAdmissionFunction,
+	                              DuckDBQueryAdmissionBind, DuckDBQueryAdmissionInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_admission_events", {}, DuckDBQueryAdmissionEventsFunction,
+	                              DuckDBQueryAdmissionEventsBind, DuckDBQueryAdmissionEventsInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_activation_events", {}, DuckDBQueryActivationEventsFunction,
+	                              DuckDBQueryActivationEventsBind, DuckDBQueryActivationEventsInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_pipeline_events", {}, DuckDBQueryPipelineEventsFunction,
+	                              DuckDBQueryPipelineEventsBind, DuckDBQueryPipelineEventsInit));
 }
 
 } // namespace duckdb

@@ -28,8 +28,10 @@ struct QueryRequestMetadata {
 
 class QueryRequestMetadataManager {
 public:
-	static bool Enabled(ClientContext &context);
+	static bool NeedsMetadata(ClientContext &context);
+	static bool ProfilingEnabled(ClientContext &context);
 	static void BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query);
+	static void RefreshQueryStart(ClientContext &context);
 	static void EndQuery(ClientContext &context);
 	static bool HasActiveMetadata(ClientContext &context);
 	static bool TryGetActive(ClientContext &context, QueryRequestMetadata &metadata);

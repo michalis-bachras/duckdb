@@ -47,6 +47,7 @@ add_library_unity(
   pipeline_dvfs_profiler.cpp
   relation.cpp
   query_profiler.cpp
+  query_admission_controller.cpp
   query_request_metadata.cpp
   query_request_profile_store.cpp
   query_result.cpp

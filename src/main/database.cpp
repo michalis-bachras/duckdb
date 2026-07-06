@@ -17,6 +17,7 @@
 #include "duckdb/main/db_instance_cache.hpp"
 #include "duckdb/main/error_manager.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/query_admission_controller.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -95,6 +96,7 @@ DatabaseInstance::~DatabaseInstance() {
 
 	external_file_cache.reset();
 	result_set_manager.reset();
+	query_admission_controller.reset();
 
 	buffer_manager.reset();
 
@@ -295,6 +297,7 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	bool enable_external_file_cache = Settings::Get<EnableExternalFileCacheSetting>(config);
 	external_file_cache = make_uniq<ExternalFileCache>(*this, enable_external_file_cache);
 	result_set_manager = make_uniq<ResultSetManager>(*this);
+	query_admission_controller = make_uniq<QueryAdmissionController>(*this);
 
 	scheduler = make_uniq<TaskScheduler>(*this);
 	object_cache = make_uniq<ObjectCache>(*config.buffer_pool);
@@ -393,6 +396,13 @@ ExternalFileCache &DatabaseInstance::GetExternalFileCache() {
 
 ResultSetManager &DatabaseInstance::GetResultSetManager() {
 	return *result_set_manager;
+}
+
+QueryAdmissionController &DatabaseInstance::GetQueryAdmissionController() {
+	if (!query_admission_controller) {
+		throw InternalException("Missing query admission controller");
+	}
+	return *query_admission_controller;
 }
 
 ConnectionManager &DatabaseInstance::GetConnectionManager() {

@@ -11,6 +11,7 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parallel/event.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 
 #include <algorithm>
@@ -174,6 +175,28 @@ struct PipelineEfficiencyAggregate {
 	double energy_only_duration_s = 0;
 	double energy_only_active_energy_j = 0;
 	double energy_only_base_time_share_energy_j = 0;
+	double allocated_initialize_energy_j = 0;
+	double allocated_prepare_finish_energy_j = 0;
+	double allocated_finish_energy_j = 0;
+};
+
+struct LifecyclePhaseProfileAggregate {
+	uint64_t query_id = 0;
+	uint64_t lifecycle_group_id = 0;
+	uint64_t owner_pipeline_id = 0;
+	uint64_t lifecycle_member_count = 0;
+	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
+	uint64_t start_ns = 0;
+	uint64_t end_ns = 0;
+	double core_freq_hz = 0;
+	double uncore_freq_hz = 0;
+	int smt_occupancy = 1;
+	uint64_t sample_count = 0;
+	double total_duration_s = 0;
+	double attributed_active_energy_j = 0;
+	double base_time_share_energy_j = 0;
+	double corrected_cycles = 0;
+	vector<uint64_t> member_pipeline_ids;
 };
 
 struct PeriodicPipelineProfileKey {
@@ -198,6 +221,33 @@ struct PeriodicPipelineProfileKeyHash {
 	}
 };
 
+struct PeriodicLifecycleProfileKey {
+	uint64_t query_id = 0;
+	uint64_t lifecycle_group_id = 0;
+	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
+	int64_t core_freq_hz = 0;
+	int64_t uncore_freq_hz = 0;
+
+	bool operator==(const PeriodicLifecycleProfileKey &other) const {
+		return query_id == other.query_id && lifecycle_group_id == other.lifecycle_group_id && phase == other.phase &&
+		       core_freq_hz == other.core_freq_hz && uncore_freq_hz == other.uncore_freq_hz;
+	}
+};
+
+struct PeriodicLifecycleProfileKeyHash {
+	size_t operator()(const PeriodicLifecycleProfileKey &key) const {
+		size_t result = std::hash<uint64_t> {}(key.query_id);
+		result ^= std::hash<uint64_t> {}(key.lifecycle_group_id) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<int> {}(static_cast<int>(key.phase)) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<int64_t> {}(key.core_freq_hz) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<int64_t> {}(key.uncore_freq_hz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		return result;
+	}
+};
+
 static int64_t PeriodicFrequencyKey(double frequency_hz) {
 	return static_cast<int64_t>(std::llround(frequency_hz));
 }
@@ -206,6 +256,23 @@ static PeriodicPipelineProfileKey BuildPeriodicPipelineProfileKey(const EnergySe
 	PeriodicPipelineProfileKey key;
 	key.query_id = record.query_id;
 	key.pipeline_id = record.pipeline_id;
+	key.core_freq_hz = PeriodicFrequencyKey(record.core_freq_hz);
+	key.uncore_freq_hz = PeriodicFrequencyKey(record.uncore_freq_hz);
+	return key;
+}
+
+static PeriodicPipelineProfileKey BuildPeriodicPipelineProfileKeyForPipeline(const EnergySegmentRecord &record,
+                                                                             uint64_t pipeline_id) {
+	auto key = BuildPeriodicPipelineProfileKey(record);
+	key.pipeline_id = pipeline_id;
+	return key;
+}
+
+static PeriodicLifecycleProfileKey BuildPeriodicLifecycleProfileKey(const EnergySegmentRecord &record) {
+	PeriodicLifecycleProfileKey key;
+	key.query_id = record.query_id;
+	key.lifecycle_group_id = record.lifecycle_group_id;
+	key.phase = record.phase;
 	key.core_freq_hz = PeriodicFrequencyKey(record.core_freq_hz);
 	key.uncore_freq_hz = PeriodicFrequencyKey(record.uncore_freq_hz);
 	return key;
@@ -1649,6 +1716,16 @@ static void UpdateEfficiencyAggregateTimeRange(PipelineEfficiencyAggregate &prof
 	}
 }
 
+static void UpdateLifecycleProfileTimeRange(LifecyclePhaseProfileAggregate &profile, uint64_t start_ns,
+                                            uint64_t end_ns) {
+	if (start_ns > 0) {
+		profile.start_ns = profile.start_ns == 0 ? start_ns : MinValue<uint64_t>(profile.start_ns, start_ns);
+	}
+	if (end_ns > 0) {
+		profile.end_ns = MaxValue<uint64_t>(profile.end_ns, end_ns);
+	}
+}
+
 static vector<PipelineEfficiencyAggregate> BuildEfficiencyProfiles(const vector<AttributedSegment> &segments) {
 	std::map<string, PipelineEfficiencyAggregate> profiles;
 	for (idx_t i = 0; i < segments.size(); i++) {
@@ -1701,7 +1778,8 @@ static vector<PipelineEfficiencyAggregate> BuildEfficiencyProfiles(const vector<
 static void WriteSegmentsCSV(const string &path, const vector<AttributedSegment> &segments) {
 	std::ofstream out(path.c_str());
 	out << "segment_id,plan_version,worker_id,linux_tid,socket_id,physical_core_id,logical_cpu_id,end_socket_id,"
-	       "end_physical_core_id,end_logical_cpu_id,query_id,pipeline_id,pipeline_signature,role,start_ns,end_ns,"
+	       "end_physical_core_id,end_logical_cpu_id,query_id,pipeline_id,pipeline_signature,role,phase_kind,"
+	       "lifecycle_group_id,owner_pipeline_id,lifecycle_member_count,start_ns,end_ns,"
 	       "duration_s,work_units,tuples,chunks,core_freq_hz,uncore_freq_hz,smt_occupancy,cycles,instructions,"
 	       "ref_cycles,cache_refs,cache_misses,llc_misses,offcore_responses,counters_valid,counters_scaled,"
 	       "hardware_state_stable,migrated,counter_status\n";
@@ -1710,8 +1788,10 @@ static void WriteSegmentsCSV(const string &path, const vector<AttributedSegment>
 		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << "," << r.socket_id
 		    << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
 		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id << ","
-		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << "," << r.start_ns << ","
-		    << r.end_ns << "," << r.duration_s << "," << r.work_units << "," << r.tuples << "," << r.chunks << ","
+		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << ","
+		    << EnergySegmentPhaseToString(r.phase) << "," << r.lifecycle_group_id << "," << r.owner_pipeline_id << ","
+		    << r.lifecycle_member_count << "," << r.start_ns << "," << r.end_ns << "," << r.duration_s << ","
+		    << r.work_units << "," << r.tuples << "," << r.chunks << ","
 		    << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy << "," << r.cycles << ","
 		    << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << "," << r.cache_misses << ","
 		    << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid << "," << r.counters_scaled << ","
@@ -1728,7 +1808,8 @@ static void WriteClosedSegmentsCSV(const string &path, vector<EnergySegmentRecor
 	});
 	std::ofstream out(path.c_str());
 	out << "segment_id,plan_version,worker_id,linux_tid,socket_id,physical_core_id,logical_cpu_id,end_socket_id,"
-	       "end_physical_core_id,end_logical_cpu_id,query_id,pipeline_id,pipeline_signature,role,start_ns,end_ns,"
+	       "end_physical_core_id,end_logical_cpu_id,query_id,pipeline_id,pipeline_signature,role,phase_kind,"
+	       "lifecycle_group_id,owner_pipeline_id,lifecycle_member_count,start_ns,end_ns,"
 	       "duration_s,work_units,tuples,chunks,core_freq_hz,uncore_freq_hz,smt_occupancy,cycles,instructions,"
 	       "ref_cycles,cache_refs,cache_misses,llc_misses,offcore_responses,counters_valid,counters_scaled,"
 	       "hardware_state_stable,migrated,counter_status,frequency_ratio,corrected_cycles,throughput_rows_per_s\n";
@@ -1739,8 +1820,10 @@ static void WriteClosedSegmentsCSV(const string &path, vector<EnergySegmentRecor
 		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << "," << r.socket_id
 		    << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
 		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id << ","
-		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << "," << r.start_ns << ","
-		    << r.end_ns << "," << duration << "," << r.work_units << "," << r.tuples << "," << r.chunks << ","
+		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << ","
+		    << EnergySegmentPhaseToString(r.phase) << "," << r.lifecycle_group_id << "," << r.owner_pipeline_id << ","
+		    << r.lifecycle_member_count << "," << r.start_ns << "," << r.end_ns << "," << duration << ","
+		    << r.work_units << "," << r.tuples << "," << r.chunks << ","
 		    << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy << "," << r.cycles << ","
 		    << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << "," << r.cache_misses << ","
 		    << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid << "," << r.counters_scaled << ","
@@ -1775,7 +1858,8 @@ static void WriteSocketWindowsCSV(const string &path, const vector<SocketEnergyW
 
 static void WriteAttributedSegmentsCSV(const string &path, const vector<AttributedSegment> &segments) {
 	std::ofstream out(path.c_str());
-	out << "segment_id,query_id,pipeline_id,pipeline_signature,socket_id,physical_core_id,logical_cpu_id,duration_s,"
+	out << "segment_id,query_id,pipeline_id,pipeline_signature,phase_kind,lifecycle_group_id,owner_pipeline_id,"
+	       "lifecycle_member_count,socket_id,physical_core_id,logical_cpu_id,duration_s,"
 	       "work_units,frequency_ratio,corrected_cycles,activity_weight,weight_denominator,"
 	       "attributed_active_energy_j,base_time_weight,base_time_denominator_s,attributed_base_energy_j,"
 	       "charged_total_energy_j,throughput,corrected_cycles_per_work,active_package_power_w,charged_power_w,"
@@ -1789,8 +1873,10 @@ static void WriteAttributedSegmentsCSV(const string &path, const vector<Attribut
 		double active_power = duration > 0 ? s.attributed_active_energy_j / duration : 0;
 		double charged_power = duration > 0 ? charged_total_energy / duration : 0;
 		out << s.record.segment_id << "," << s.record.query_id << "," << s.record.pipeline_id << ","
-		    << CsvEscape(s.record.pipeline_signature) << "," << s.record.socket_id << "," << s.record.physical_core_id
-		    << "," << s.record.logical_cpu_id << "," << duration << "," << s.record.work_units << ","
+		    << CsvEscape(s.record.pipeline_signature) << "," << EnergySegmentPhaseToString(s.record.phase) << ","
+		    << s.record.lifecycle_group_id << "," << s.record.owner_pipeline_id << ","
+		    << s.record.lifecycle_member_count << "," << s.record.socket_id << "," << s.record.physical_core_id << ","
+		    << s.record.logical_cpu_id << "," << duration << "," << s.record.work_units << ","
 		    << s.frequency_ratio << "," << s.corrected_cycles << "," << s.activity_weight << "," << s.weight_denominator
 		    << "," << s.attributed_active_energy_j << "," << s.base_time_weight << "," << s.base_time_denominator_s
 		    << "," << s.attributed_base_energy_j << "," << charged_total_energy << "," << s.throughput << ","
@@ -1818,6 +1904,52 @@ static void WriteProfilesCSV(const string &path, const vector<PipelineProfileAgg
 	}
 }
 
+static string JoinUInt64List(const vector<uint64_t> &values) {
+	std::ostringstream out;
+	for (idx_t i = 0; i < values.size(); i++) {
+		if (i > 0) {
+			out << ";";
+		}
+		out << values[i];
+	}
+	return out.str();
+}
+
+static void WriteLifecyclePhaseProfilesCSV(const string &path, const vector<LifecyclePhaseProfileAggregate> &profiles) {
+	std::ofstream out(path.c_str());
+	out << "query_id,lifecycle_group_id,phase_kind,owner_pipeline_id,lifecycle_member_count,member_pipeline_ids,"
+	       "core_freq_hz,uncore_freq_hz,smt_occupancy,sample_count,start_ns,end_ns,elapsed_s,total_duration_s,"
+	       "attributed_active_energy_j,base_time_share_energy_j,charged_total_energy_j,active_power_w,charged_power_w,"
+	       "corrected_cycles\n";
+	for (idx_t i = 0; i < profiles.size(); i++) {
+		const auto &p = profiles[i];
+		double elapsed_s =
+		    p.end_ns > p.start_ns ? static_cast<double>(p.end_ns - p.start_ns) / static_cast<double>(NSEC_PER_SEC) : 0;
+		double charged_total_energy = p.attributed_active_energy_j + p.base_time_share_energy_j;
+		double active_power = p.total_duration_s > 0 ? p.attributed_active_energy_j / p.total_duration_s : 0;
+		double charged_power = p.total_duration_s > 0 ? charged_total_energy / p.total_duration_s : 0;
+		out << p.query_id << "," << p.lifecycle_group_id << "," << EnergySegmentPhaseToString(p.phase) << ","
+		    << p.owner_pipeline_id << "," << p.lifecycle_member_count << ","
+		    << CsvEscape(JoinUInt64List(p.member_pipeline_ids)) << "," << p.core_freq_hz << "," << p.uncore_freq_hz
+		    << "," << p.smt_occupancy << "," << p.sample_count << "," << p.start_ns << "," << p.end_ns << ","
+		    << elapsed_s << "," << p.total_duration_s << "," << p.attributed_active_energy_j << ","
+		    << p.base_time_share_energy_j << "," << charged_total_energy << "," << active_power << "," << charged_power
+		    << "," << p.corrected_cycles << "\n";
+	}
+}
+
+static void WriteLifecycleGroupMembersCSV(const string &path, const vector<LifecyclePhaseProfileAggregate> &profiles) {
+	std::ofstream out(path.c_str());
+	out << "query_id,lifecycle_group_id,phase_kind,owner_pipeline_id,lifecycle_member_count,member_pipeline_id\n";
+	for (idx_t i = 0; i < profiles.size(); i++) {
+		const auto &p = profiles[i];
+		for (auto member_pipeline_id : p.member_pipeline_ids) {
+			out << p.query_id << "," << p.lifecycle_group_id << "," << EnergySegmentPhaseToString(p.phase) << ","
+			    << p.owner_pipeline_id << "," << p.lifecycle_member_count << "," << member_pipeline_id << "\n";
+		}
+	}
+}
+
 static void WriteEfficiencyProfilesCSV(const string &path, const vector<PipelineEfficiencyAggregate> &profiles,
                                        bool include_query_lifecycle = false) {
 	std::ofstream out(path.c_str());
@@ -1833,7 +1965,9 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 	       "charged_power_w,active_throughput_per_watt_rows_per_j,charged_throughput_per_watt_rows_per_j,"
 	       "active_energy_per_row_j,charged_energy_per_row_j,corrected_cycles,corrected_cycles_per_row,"
 	       "input_corrected_cycles_per_row,energy_only_duration_s,energy_only_active_energy_j,"
-	       "energy_only_base_time_share_energy_j,energy_only_charged_energy_j\n";
+	       "energy_only_base_time_share_energy_j,energy_only_charged_energy_j,allocated_initialize_energy_j,"
+	       "allocated_prepare_finish_energy_j,allocated_finish_energy_j,allocated_lifecycle_energy_j,"
+	       "total_with_lifecycle_energy_j\n";
 	for (idx_t i = 0; i < profiles.size(); i++) {
 		const auto &p = profiles[i];
 		double total_throughput = p.total_duration_s > 0 ? p.total_input_rows / p.total_duration_s : 0;
@@ -1850,6 +1984,8 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 		double input_corrected_cycles_per_row =
 		    p.total_input_rows > 0 ? p.input_corrected_cycles / p.total_input_rows : 0;
 		double energy_only_charged_energy = p.energy_only_active_energy_j + p.energy_only_base_time_share_energy_j;
+		double allocated_lifecycle_energy = p.allocated_initialize_energy_j + p.allocated_prepare_finish_energy_j +
+		                                    p.allocated_finish_energy_j;
 		double elapsed_s =
 		    p.end_ns > p.start_ns ? static_cast<double>(p.end_ns - p.start_ns) / static_cast<double>(NSEC_PER_SEC) : 0;
 		out << p.query_id << ",";
@@ -1866,7 +2002,10 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 		    << active_throughput_per_watt << "," << charged_throughput_per_watt << "," << active_energy_per_row << ","
 		    << charged_energy_per_row << "," << p.corrected_cycles << "," << corrected_cycles_per_row << ","
 		    << input_corrected_cycles_per_row << "," << p.energy_only_duration_s << "," << p.energy_only_active_energy_j
-		    << "," << p.energy_only_base_time_share_energy_j << "," << energy_only_charged_energy << "\n";
+		    << "," << p.energy_only_base_time_share_energy_j << "," << energy_only_charged_energy << ","
+		    << p.allocated_initialize_energy_j << "," << p.allocated_prepare_finish_energy_j << ","
+		    << p.allocated_finish_energy_j << "," << allocated_lifecycle_energy << ","
+		    << charged_total_energy + allocated_lifecycle_energy << "\n";
 	}
 }
 
@@ -2116,6 +2255,61 @@ static void MergeEfficiencyAggregate(PipelineEfficiencyAggregate &target, const 
 	target.energy_only_duration_s += source.energy_only_duration_s;
 	target.energy_only_active_energy_j += source.energy_only_active_energy_j;
 	target.energy_only_base_time_share_energy_j += source.energy_only_base_time_share_energy_j;
+	target.allocated_initialize_energy_j += source.allocated_initialize_energy_j;
+	target.allocated_prepare_finish_energy_j += source.allocated_prepare_finish_energy_j;
+	target.allocated_finish_energy_j += source.allocated_finish_energy_j;
+}
+
+static bool AddLifecycleSegmentToProfile(LifecyclePhaseProfileAggregate &profile, const AttributedSegment &segment) {
+	auto duration = SegmentDuration(segment.record);
+	if (!segment.record.counters_valid || !segment.record.hardware_state_stable || duration <= 0) {
+		return false;
+	}
+	if (profile.sample_count == 0) {
+		profile.query_id = segment.record.query_id;
+		profile.lifecycle_group_id = segment.record.lifecycle_group_id;
+		profile.owner_pipeline_id = segment.record.owner_pipeline_id;
+		profile.lifecycle_member_count = segment.record.lifecycle_member_count;
+		profile.phase = segment.record.phase;
+		profile.core_freq_hz = segment.record.core_freq_hz;
+		profile.uncore_freq_hz = segment.record.uncore_freq_hz;
+		profile.smt_occupancy = segment.record.smt_occupancy;
+		profile.member_pipeline_ids = segment.record.lifecycle_member_pipeline_ids;
+	}
+	UpdateLifecycleProfileTimeRange(profile, segment.record.start_ns, segment.record.end_ns);
+	profile.sample_count++;
+	profile.total_duration_s += duration;
+	profile.attributed_active_energy_j += segment.attributed_active_energy_j;
+	profile.base_time_share_energy_j += segment.attributed_base_energy_j;
+	profile.corrected_cycles += segment.corrected_cycles;
+	return true;
+}
+
+static void AddAllocatedLifecycleEnergy(PipelineEfficiencyAggregate &profile, const AttributedSegment &segment,
+                                        uint64_t pipeline_id, double allocated_energy_j) {
+	if (profile.sample_count == 0 && profile.valid_input_sample_count == 0 && profile.energy_only_sample_count == 0) {
+		profile.query_id = segment.record.query_id;
+		profile.pipeline_id = pipeline_id;
+		profile.pipeline_signature = StringUtil::Format("pipeline_%llu", pipeline_id);
+		profile.core_freq_hz = segment.record.core_freq_hz;
+		profile.uncore_freq_hz = segment.record.uncore_freq_hz;
+		profile.smt_occupancy = segment.record.smt_occupancy;
+	}
+	UpdateEfficiencyAggregateTimeRange(profile, segment.record.start_ns, segment.record.end_ns);
+	switch (segment.record.phase) {
+	case EnergySegmentPhase::INITIALIZE:
+		profile.allocated_initialize_energy_j += allocated_energy_j;
+		break;
+	case EnergySegmentPhase::PREPARE_FINISH:
+		profile.allocated_prepare_finish_energy_j += allocated_energy_j;
+		break;
+	case EnergySegmentPhase::FINISH:
+		profile.allocated_finish_energy_j += allocated_energy_j;
+		break;
+	case EnergySegmentPhase::EXECUTE:
+	default:
+		break;
+	}
 }
 
 struct PeriodicPendingWindow {
@@ -2768,6 +2962,11 @@ private:
 		slice.pipeline_id = base.pipeline_id;
 		slice.pipeline_signature = base.pipeline_signature;
 		slice.role = base.role;
+		slice.phase = base.phase;
+		slice.lifecycle_group_id = base.lifecycle_group_id;
+		slice.owner_pipeline_id = base.owner_pipeline_id;
+		slice.lifecycle_member_count = base.lifecycle_member_count;
+		slice.lifecycle_member_pipeline_ids = base.lifecycle_member_pipeline_ids;
 		slice.start_ns = slice_start_ns;
 		slice.end_ns = slice_end_ns;
 		slice.duration_s = static_cast<double>(slice_end_ns - slice_start_ns) / static_cast<double>(NSEC_PER_SEC);
@@ -3238,9 +3437,25 @@ private:
 	void UpdateProfilesLocked(const vector<AttributedSegment> &segments) {
 		for (idx_t i = 0; i < segments.size(); i++) {
 			const auto &segment = segments[i];
-			auto pipeline_key = BuildPeriodicPipelineProfileKey(segment.record);
-			AddSegmentToEfficiencyAggregate(pipeline_profiles[pipeline_key], segment, true);
 			AddSegmentToEfficiencyAggregate(query_profiles[segment.record.query_id], segment, false);
+			if (segment.record.phase == EnergySegmentPhase::EXECUTE || segment.record.lifecycle_group_id == 0 ||
+			    segment.record.lifecycle_member_pipeline_ids.empty()) {
+				auto pipeline_key = BuildPeriodicPipelineProfileKey(segment.record);
+				AddSegmentToEfficiencyAggregate(pipeline_profiles[pipeline_key], segment, true);
+				continue;
+			}
+			auto lifecycle_key = BuildPeriodicLifecycleProfileKey(segment.record);
+			if (!AddLifecycleSegmentToProfile(lifecycle_phase_profiles[lifecycle_key], segment)) {
+				continue;
+			}
+			auto charged_energy = segment.attributed_active_energy_j + segment.attributed_base_energy_j;
+			auto member_count = static_cast<double>(segment.record.lifecycle_member_pipeline_ids.size());
+			auto allocated_energy = member_count > 0 ? charged_energy / member_count : charged_energy;
+			for (auto member_pipeline_id : segment.record.lifecycle_member_pipeline_ids) {
+				auto member_key = BuildPeriodicPipelineProfileKeyForPipeline(segment.record, member_pipeline_id);
+				AddAllocatedLifecycleEnergy(pipeline_profiles[member_key], segment, member_pipeline_id,
+				                            allocated_energy);
+			}
 		}
 	}
 
@@ -3253,8 +3468,9 @@ private:
 		              "base_conservation_error_j,summed_charged_energy_j,package_conservation_error_j,rapl_valid,"
 		              "base_power_valid,used_time_fallback,status,segment_count,total_base_energy_j,busy_wall_time_s,"
 		              "idle_gap_wall_time_s,busy_base_energy_j,idle_gap_base_energy_j\n";
-		segment_out << "window_id,segment_id,query_id,pipeline_id,pipeline_signature,socket_id,physical_core_id,"
-		               "logical_cpu_id,slice_start_ns,slice_end_ns,duration_s,work_units,frequency_ratio,"
+		segment_out << "window_id,segment_id,query_id,pipeline_id,pipeline_signature,phase_kind,lifecycle_group_id,"
+		               "owner_pipeline_id,lifecycle_member_count,socket_id,physical_core_id,logical_cpu_id,"
+		               "slice_start_ns,slice_end_ns,duration_s,work_units,frequency_ratio,"
 		               "corrected_cycles,activity_weight,weight_denominator,attributed_active_energy_j,"
 		               "base_time_weight,base_time_denominator_s,attributed_base_energy_j,charged_total_energy_j,"
 		               "throughput,corrected_cycles_per_work,active_power_w,charged_power_w,attribution_status\n";
@@ -3301,6 +3517,8 @@ private:
 			double charged_power = duration > 0 ? charged_total_energy / duration : 0;
 			segment_out << s.window_id << "," << s.record.segment_id << "," << s.record.query_id << ","
 			            << s.record.pipeline_id << "," << CsvEscape(s.record.pipeline_signature) << ","
+			            << EnergySegmentPhaseToString(s.record.phase) << "," << s.record.lifecycle_group_id << ","
+			            << s.record.owner_pipeline_id << "," << s.record.lifecycle_member_count << ","
 			            << s.record.socket_id << "," << s.record.physical_core_id << "," << s.record.logical_cpu_id
 			            << "," << s.slice_start_ns << "," << s.slice_end_ns << "," << duration << ","
 			            << s.record.work_units << "," << s.frequency_ratio << "," << s.corrected_cycles << ","
@@ -3330,7 +3548,11 @@ private:
 		}
 		vector<PipelineEfficiencyAggregate> pipeline_result;
 		for (auto entry = pipeline_profiles.begin(); entry != pipeline_profiles.end(); ++entry) {
-			if (entry->second.sample_count > 0 || entry->second.valid_input_sample_count > 0) {
+			auto allocated_lifecycle_energy = entry->second.allocated_initialize_energy_j +
+			                                  entry->second.allocated_prepare_finish_energy_j +
+			                                  entry->second.allocated_finish_energy_j;
+			if (entry->second.sample_count > 0 || entry->second.valid_input_sample_count > 0 ||
+			    allocated_lifecycle_energy > 0) {
 				pipeline_result.push_back(entry->second);
 			}
 		}
@@ -3361,8 +3583,32 @@ private:
 		          [](const PipelineEfficiencyAggregate &lhs, const PipelineEfficiencyAggregate &rhs) {
 			          return lhs.query_id < rhs.query_id;
 		          });
+		vector<LifecyclePhaseProfileAggregate> lifecycle_result;
+		for (auto entry = lifecycle_phase_profiles.begin(); entry != lifecycle_phase_profiles.end(); ++entry) {
+			if (entry->second.sample_count > 0) {
+				lifecycle_result.push_back(entry->second);
+			}
+		}
+		std::sort(lifecycle_result.begin(), lifecycle_result.end(),
+		          [](const LifecyclePhaseProfileAggregate &lhs, const LifecyclePhaseProfileAggregate &rhs) {
+			          if (lhs.query_id != rhs.query_id) {
+				          return lhs.query_id < rhs.query_id;
+			          }
+			          if (lhs.lifecycle_group_id != rhs.lifecycle_group_id) {
+				          return lhs.lifecycle_group_id < rhs.lifecycle_group_id;
+			          }
+			          if (lhs.phase != rhs.phase) {
+				          return static_cast<uint8_t>(lhs.phase) < static_cast<uint8_t>(rhs.phase);
+			          }
+			          if (lhs.core_freq_hz != rhs.core_freq_hz) {
+				          return lhs.core_freq_hz < rhs.core_freq_hz;
+			          }
+			          return lhs.uncore_freq_hz < rhs.uncore_freq_hz;
+		          });
 		WriteEfficiencyProfilesCSV(output_dir + "/period_pipeline_profiles.csv", pipeline_result);
 		WriteEfficiencyProfilesCSV(output_dir + "/period_query_profiles.csv", query_result, true);
+		WriteLifecyclePhaseProfilesCSV(output_dir + "/period_lifecycle_phase_profiles.csv", lifecycle_result);
+		WriteLifecycleGroupMembersCSV(output_dir + "/period_lifecycle_group_members.csv", lifecycle_result);
 		if (settings.closed_segments_export_enabled) {
 			WriteClosedSegmentsCSV(output_dir + "/period_closed_segments.csv", closed_segment_records);
 		}
@@ -3535,6 +3781,8 @@ private:
 	vector<EnergySegmentRecord> closed_segment_records;
 	std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
 	    pipeline_profiles;
+	std::unordered_map<PeriodicLifecycleProfileKey, LifecyclePhaseProfileAggregate, PeriodicLifecycleProfileKeyHash>
+	    lifecycle_phase_profiles;
 	std::unordered_map<uint64_t, PipelineEfficiencyAggregate> query_profiles;
 	vector<PeriodicRuntimeOverheadRecord> runtime_overhead;
 	std::ofstream window_out;
@@ -3570,15 +3818,38 @@ const char *EnergySegmentRoleToString(EnergySegmentRole role) {
 	}
 }
 
+const char *EnergySegmentPhaseToString(EnergySegmentPhase phase) {
+	switch (phase) {
+	case EnergySegmentPhase::EXECUTE:
+		return "EXECUTE";
+	case EnergySegmentPhase::INITIALIZE:
+		return "INITIALIZE";
+	case EnergySegmentPhase::PREPARE_FINISH:
+		return "PREPARE_FINISH";
+	case EnergySegmentPhase::FINISH:
+		return "FINISH";
+	default:
+		return "UNKNOWN";
+	}
+}
+
 static bool IsEnergyAttributionControlQuery(const string &query) {
 	auto normalized = query;
 	StringUtil::Trim(normalized);
 	normalized = StringUtil::Lower(normalized);
-	return normalized == "set" || StringUtil::StartsWith(normalized, "set ") ||
-	       StringUtil::StartsWith(normalized, "set\t") || StringUtil::StartsWith(normalized, "set\n") ||
-	       StringUtil::StartsWith(normalized, "pragma ") || normalized == "use" ||
-	       StringUtil::StartsWith(normalized, "use ") || StringUtil::StartsWith(normalized, "use\t") ||
-	       StringUtil::StartsWith(normalized, "use\n");
+	if (normalized == "set" || StringUtil::StartsWith(normalized, "set ") ||
+	    StringUtil::StartsWith(normalized, "set\t") || StringUtil::StartsWith(normalized, "set\n") ||
+	    StringUtil::StartsWith(normalized, "pragma ") || normalized == "use" ||
+	    StringUtil::StartsWith(normalized, "use ") || StringUtil::StartsWith(normalized, "use\t") ||
+	    StringUtil::StartsWith(normalized, "use\n")) {
+		return true;
+	}
+	return StringUtil::Contains(normalized, "duckdb_debug_query_request_profiles") ||
+	       StringUtil::Contains(normalized, "duckdb_debug_query_request_pipeline_profiles") ||
+	       StringUtil::Contains(normalized, "duckdb_debug_query_request_samples") ||
+	       StringUtil::Contains(normalized, "duckdb_debug_query_request_pipeline_instances") ||
+	       StringUtil::Contains(normalized, "duckdb_debug_query_admission") ||
+	       StringUtil::Contains(normalized, "duckdb_debug_query_activation_events");
 }
 
 bool EnergyAttributionManager::Enabled(const ClientContext &context) {
@@ -3587,6 +3858,24 @@ bool EnergyAttributionManager::Enabled(const ClientContext &context) {
 	}
 	EnergyAttributionSettings settings;
 	return TryGetDatabaseEnergySettings(DatabaseInstance::GetDatabase(context), settings);
+}
+
+bool EnergyAttributionManager::LifecyclePhasesEnabled(const ClientContext &context) {
+	const auto &local_settings = ClientConfig::GetConfig(context).energy_attribution;
+	if (local_settings.enabled) {
+		return local_settings.lifecycle_phases_enabled;
+	}
+	EnergyAttributionSettings settings;
+	return TryGetDatabaseEnergySettings(DatabaseInstance::GetDatabase(context), settings) &&
+	       settings.lifecycle_phases_enabled;
+}
+
+uint64_t EnergyAttributionManager::GetPipelineAttributionId(Pipeline &pipeline) {
+	auto pipeline_id = pipeline.GetEnergyAttributionPipelineId();
+	if (pipeline_id != 0) {
+		return pipeline_id;
+	}
+	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&pipeline));
 }
 
 void EnergyAttributionManager::ConfigureDatabaseRuntime(ClientContext &context) {
@@ -3691,7 +3980,27 @@ void EnergyAttributionManager::AttachPipeline(ClientContext &context, Pipeline &
 	pipeline.SetEnergyAttributionPipeline(query, pipeline_id);
 }
 
-EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, int start_cpu_hint) {
+static const vector<uint64_t> &EmptyLifecycleMemberPipelineIds() {
+	static const vector<uint64_t> empty;
+	return empty;
+}
+
+EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, int start_cpu_hint)
+    : EnergySegmentScope(pipeline, EnergySegmentPhase::EXECUTE, 0, EmptyLifecycleMemberPipelineIds(), start_cpu_hint) {
+}
+
+EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, Event &event, EnergySegmentPhase phase, int start_cpu_hint)
+    : EnergySegmentScope(pipeline, phase, event.HasEnergyLifecycleInfo() ? event.GetEnergyLifecycleGroupId() : 0,
+                         event.HasEnergyLifecycleInfo() ? event.GetEnergyLifecycleMemberPipelineIds()
+                                                        : EmptyLifecycleMemberPipelineIds(),
+                         start_cpu_hint) {
+}
+
+EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase phase, uint64_t lifecycle_group_id,
+                                       const vector<uint64_t> &lifecycle_member_pipeline_ids, int start_cpu_hint) {
+	if (phase != EnergySegmentPhase::EXECUTE && lifecycle_group_id == 0) {
+		return;
+	}
 	query_handle = pipeline.GetEnergyAttributionQueryHandle();
 	if (!query_handle) {
 		return;
@@ -3705,12 +4014,14 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, int start_cpu_hint) {
 	record = EnergySegmentRecord();
 	record.segment_id = thread_state.NextSegmentId(*query);
 	record.query_id = query->query_id;
-	record.pipeline_id = pipeline.GetEnergyAttributionPipelineId();
-	if (record.pipeline_id == 0) {
-		record.pipeline_id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&pipeline));
-	}
+	record.pipeline_id = EnergyAttributionManager::GetPipelineAttributionId(pipeline);
 	record.pipeline_signature = LookupPipelineSignature(*query, record.pipeline_id);
 	record.role = EnergySegmentRole::UNKNOWN;
+	record.phase = phase;
+	record.owner_pipeline_id = record.pipeline_id;
+	record.lifecycle_group_id = lifecycle_group_id;
+	record.lifecycle_member_count = lifecycle_member_pipeline_ids.size();
+	record.lifecycle_member_pipeline_ids = lifecycle_member_pipeline_ids;
 	record.worker_id = static_cast<uint64_t>(tid);
 	record.linux_tid = tid;
 	record.start_ns = TimestampNs();

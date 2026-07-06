@@ -12,6 +12,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/parallel/query_pipeline_debug.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -186,19 +187,26 @@ void Pipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
 	event->SetTasks(std::move(tasks));
 }
 
-bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
+bool Pipeline::ScheduleParallel(shared_ptr<Event> &event, string &parallel_blocker, idx_t &effective_max_threads,
+                                idx_t &source_max_threads, idx_t &scheduler_threads) {
+	auto &scheduler = TaskScheduler::GetScheduler(executor.context);
+	scheduler_threads = NumericCast<idx_t>(scheduler.NumberOfThreads());
 	// check if the sink, source and all intermediate operators support parallelism
 	if (!sink->ParallelSink()) {
+		parallel_blocker = "sink_not_parallel";
 		return false;
 	}
 	if (!source->ParallelSource()) {
+		parallel_blocker = "source_not_parallel";
 		return false;
 	}
 	auto max_threads = source_state->MaxThreads();
+	source_max_threads = max_threads;
 
 	for (auto &op_ref : operators) {
 		auto &op = op_ref.get();
 		if (!op.ParallelOperator()) {
+			parallel_blocker = "operator_not_parallel:" + PhysicalOperatorToString(op.type);
 			return false;
 		}
 		max_threads = MinValue<idx_t>(max_threads, op.op_state->MaxThreads(max_threads));
@@ -212,8 +220,7 @@ bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
 		}
 	}
 
-	auto &scheduler = TaskScheduler::GetScheduler(executor.context);
-	auto active_threads = NumericCast<idx_t>(scheduler.NumberOfThreads());
+	auto active_threads = scheduler_threads;
 	if (max_threads > active_threads) {
 		max_threads = active_threads;
 	}
@@ -222,6 +229,10 @@ bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
 	}
 	if (max_threads > active_threads) {
 		max_threads = active_threads;
+	}
+	effective_max_threads = max_threads;
+	if (max_threads <= 1) {
+		parallel_blocker = "max_threads_le_1";
 	}
 	return LaunchScanTasks(event, max_threads);
 }
@@ -258,10 +269,19 @@ void Pipeline::Schedule(shared_ptr<Event> &event) {
 	D_ASSERT(ready);
 	D_ASSERT(sink);
 	Reset();
-	if (!ScheduleParallel(event)) {
+	string parallel_blocker;
+	idx_t effective_max_threads = 0;
+	idx_t source_max_threads = source_state ? source_state->MaxThreads() : 0;
+	idx_t scheduler_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(executor.context).NumberOfThreads());
+	auto scheduled_parallel =
+	    ScheduleParallel(event, parallel_blocker, effective_max_threads, source_max_threads, scheduler_threads);
+	if (!scheduled_parallel) {
 		// could not parallelize this pipeline: push a sequential task instead
 		ScheduleSequentialTask(event);
+		effective_max_threads = 1;
 	}
+	QueryPipelineDebug::RecordPipelineSchedule(*this, *event, scheduled_parallel, parallel_blocker,
+	                                           effective_max_threads, source_max_threads, scheduler_threads);
 }
 
 bool Pipeline::LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads) {

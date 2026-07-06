@@ -736,6 +736,22 @@ Value EnergyAttributionMetadataCacheEnableSetting::GetSetting(const ClientContex
 	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.metadata_cache_enabled);
 }
 
+void EnergyAttributionLifecyclePhasesEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.lifecycle_phases_enabled = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionLifecyclePhasesEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.lifecycle_phases_enabled =
+	    ClientConfig().energy_attribution.lifecycle_phases_enabled;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionLifecyclePhasesEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.lifecycle_phases_enabled);
+}
+
 void EnergyAttributionMigrationCheckEnableSetting::SetLocal(ClientContext &context, const Value &input) {
 	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
 	ClientConfig::GetConfig(context).energy_attribution.migration_check_enabled = BooleanValue::Get(value);
@@ -1826,6 +1842,45 @@ void QueryRequestProfilingEnableSetting::ResetLocal(ClientContext &context) {
 
 Value QueryRequestProfilingEnableSetting::GetSetting(const ClientContext &context) {
 	return Value::BOOLEAN(ClientConfig::GetConfig(context).query_request_profiling_enabled);
+}
+
+void QueryAdmissionMaxActiveSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).query_admission_max_active = input.GetValue<idx_t>();
+}
+
+void QueryAdmissionMaxActiveSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).query_admission_max_active = ClientConfig().query_admission_max_active;
+}
+
+Value QueryAdmissionMaxActiveSetting::GetSetting(const ClientContext &context) {
+	return Value::UBIGINT(ClientConfig::GetConfig(context).query_admission_max_active);
+}
+
+void QueryActivationSchedulerEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).query_activation_scheduler_enabled = BooleanValue::Get(value);
+}
+
+void QueryActivationSchedulerEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).query_activation_scheduler_enabled =
+	    ClientConfig().query_activation_scheduler_enabled;
+}
+
+Value QueryActivationSchedulerEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).query_activation_scheduler_enabled);
+}
+
+void QueryActivationDebugEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).query_activation_debug_enabled = BooleanValue::Get(value);
+}
+
+void QueryActivationDebugEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).query_activation_debug_enabled = ClientConfig().query_activation_debug_enabled;
+}
+
+Value QueryActivationDebugEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).query_activation_debug_enabled);
 }
 
 //===----------------------------------------------------------------------===//

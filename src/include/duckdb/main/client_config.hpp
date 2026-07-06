@@ -52,6 +52,7 @@ struct EnergyAttributionSettings {
 	bool debug_export_enabled = false;
 	bool closed_segments_export_enabled = false;
 	bool overhead_detail_enabled = false;
+	bool lifecycle_phases_enabled = false;
 	bool pipeline_signatures_enabled = true;
 	bool metadata_cache_enabled = true;
 	bool migration_check_enabled = true;
@@ -83,6 +84,12 @@ struct ClientConfig {
 	PipelineProfilingSettings pipeline_profiling;
 	//! Optional request/template/pipeline profile store for scheduler research.
 	bool query_request_profiling_enabled = false;
+	//! Maximum number of SLA-tagged workload queries admitted at once. Zero disables admission control.
+	idx_t query_admission_max_active = 0;
+	//! Enable prototype per-query pipeline activation scheduling for SLA-tagged workload queries.
+	bool query_activation_scheduler_enabled = false;
+	//! Enable debug logging for query admission/activation scheduler state.
+	bool query_activation_debug_enabled = false;
 	//! Prototype Linux RAPL/perf_event pipeline energy attribution.
 	EnergyAttributionSettings energy_attribution;
 

@@ -1,5 +1,8 @@
 #include "duckdb/parallel/pipeline_prepare_finish_event.hpp"
 
+#include "duckdb/energy_attribution/energy_attribution.hpp"
+#include "duckdb/parallel/query_pipeline_debug.hpp"
+
 namespace duckdb {
 
 PipelinePrepareFinishEvent::PipelinePrepareFinishEvent(shared_ptr<Pipeline> pipeline_p)
@@ -16,6 +19,7 @@ public:
 
 public:
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		EnergySegmentScope energy_scope(pipeline, *event, EnergySegmentPhase::PREPARE_FINISH);
 		pipeline.PrepareFinalize();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
@@ -30,6 +34,7 @@ void PipelinePrepareFinishEvent::Schedule() {
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelinePreFinishTask>(*pipeline, shared_from_this()));
 	SetTasks(std::move(tasks));
+	QueryPipelineDebug::RecordLifecycleSchedule(*pipeline, *this, "scheduled_lifecycle");
 }
 
 void PipelinePrepareFinishEvent::FinishEvent() {

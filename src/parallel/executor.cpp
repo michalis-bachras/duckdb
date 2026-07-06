@@ -1,13 +1,16 @@
 #include "duckdb/execution/executor.hpp"
 
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline_complete_event.hpp"
@@ -16,15 +19,19 @@
 #include "duckdb/parallel/pipeline_finish_event.hpp"
 #include "duckdb/parallel/pipeline_initialize_event.hpp"
 #include "duckdb/parallel/pipeline_prepare_finish_event.hpp"
+#include "duckdb/parallel/query_activation_scheduler.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <unordered_map>
 
 namespace duckdb {
 
-Executor::Executor(ClientContext &context) : context(context), executor_tasks(0), blocked_thread_time(0) {
+Executor::Executor(ClientContext &context)
+    : context(context), next_activation_group_id(1), next_energy_lifecycle_group_id(1), executor_tasks(0),
+      blocked_thread_time(0) {
 }
 
 Executor::~Executor() {
@@ -41,6 +48,41 @@ void Executor::AddEvent(shared_ptr<Event> event) {
 		return;
 	}
 	events.push_back(std::move(event));
+}
+
+void Executor::ScheduleEvent(shared_ptr<Event> event) {
+	if (!activation_scheduler || !event->HasQueryActivationInfo()) {
+		ScheduleEventNow(std::move(event));
+		return;
+	}
+	auto ready_event = activation_scheduler->OnEventReady(std::move(event));
+	if (ready_event) {
+		ScheduleEventNow(std::move(ready_event));
+	}
+}
+
+void Executor::ScheduleEventNow(shared_ptr<Event> event) {
+	event->Schedule();
+	if (event->GetTotalTasks() == 0 && !event->IsFinished()) {
+		event->Finish();
+	}
+}
+
+void Executor::RegisterActivationEvent(Event &event, idx_t group_id, QueryActivationEventKind kind, idx_t pipeline_id) {
+	if (!activation_scheduler && !context.config.query_activation_debug_enabled) {
+		return;
+	}
+	event.SetQueryActivationInfo(group_id, kind, pipeline_id);
+}
+
+void Executor::NotifyEventFinished(Event &event) {
+	if (!activation_scheduler || !event.HasQueryActivationInfo()) {
+		return;
+	}
+	auto ready_event = activation_scheduler->OnEventFinished(event);
+	if (ready_event) {
+		ScheduleEventNow(std::move(ready_event));
+	}
 }
 
 struct PipelineEventStack {
@@ -60,6 +102,13 @@ struct PipelineEventStack {
 
 using event_map_t = reference_map_t<Pipeline, PipelineEventStack>;
 
+static void RegisterEnergyLifecycleGroups(std::unordered_map<Event *, vector<uint64_t>> &groups, idx_t &next_group_id) {
+	for (auto &entry : groups) {
+		auto group_id = next_group_id++;
+		entry.first->SetEnergyLifecycleInfo(group_id, std::move(entry.second));
+	}
+}
+
 struct ScheduleEventData {
 	ScheduleEventData(const vector<shared_ptr<MetaPipeline>> &meta_pipelines, vector<shared_ptr<Event>> &events,
 	                  bool initial_schedule)
@@ -76,6 +125,7 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 	D_ASSERT(meta_pipeline);
 	auto &events = event_data.events;
 	auto &event_map = event_data.event_map;
+	auto activation_group_id = next_activation_group_id++;
 
 	// create events/stack for the base pipeline
 	auto base_pipeline = meta_pipeline->GetBasePipeline();
@@ -85,6 +135,16 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 	auto base_finish_event = make_shared_ptr<PipelineFinishEvent>(base_pipeline);
 	auto base_complete_event =
 	    make_shared_ptr<PipelineCompleteEvent>(base_pipeline->executor, event_data.initial_schedule);
+	auto base_pipeline_id = base_pipeline->GetProfilerPipelineId();
+	RegisterActivationEvent(*base_initialize_event, activation_group_id, QueryActivationEventKind::INITIALIZE,
+	                        base_pipeline_id);
+	RegisterActivationEvent(*base_event, activation_group_id, QueryActivationEventKind::PIPELINE, base_pipeline_id);
+	RegisterActivationEvent(*base_prepare_finish_event, activation_group_id, QueryActivationEventKind::PREPARE_FINISH,
+	                        base_pipeline_id);
+	RegisterActivationEvent(*base_finish_event, activation_group_id, QueryActivationEventKind::FINISH,
+	                        base_pipeline_id);
+	RegisterActivationEvent(*base_complete_event, activation_group_id, QueryActivationEventKind::COMPLETE,
+	                        base_pipeline_id);
 	PipelineEventStack base_stack(*base_initialize_event, *base_event, *base_prepare_finish_event, *base_finish_event,
 	                              *base_complete_event);
 	events.push_back(std::move(base_initialize_event));
@@ -108,6 +168,8 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 
 		// create events/stack for this pipeline
 		auto pipeline_event = make_shared_ptr<PipelineEvent>(pipeline);
+		auto pipeline_id = pipeline->GetProfilerPipelineId();
+		RegisterActivationEvent(*pipeline_event, activation_group_id, QueryActivationEventKind::PIPELINE, pipeline_id);
 
 		auto finish_group = meta_pipeline->GetFinishGroup(*pipeline);
 		if (finish_group) {
@@ -129,6 +191,10 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 			// this pipeline has its own finish event (despite going into the same sink - Finalize twice!)
 			auto pipeline_prepare_finish_event = make_shared_ptr<PipelinePrepareFinishEvent>(pipeline);
 			auto pipeline_finish_event = make_shared_ptr<PipelineFinishEvent>(pipeline);
+			RegisterActivationEvent(*pipeline_prepare_finish_event, activation_group_id,
+			                        QueryActivationEventKind::PREPARE_FINISH, pipeline_id);
+			RegisterActivationEvent(*pipeline_finish_event, activation_group_id, QueryActivationEventKind::FINISH,
+			                        pipeline_id);
 			PipelineEventStack pipeline_stack(base_stack.pipeline_initialize_event, *pipeline_event,
 			                                  *pipeline_prepare_finish_event, *pipeline_finish_event,
 			                                  base_stack.pipeline_complete_event);
@@ -162,6 +228,21 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 
 	// add base stack to the event data too
 	event_map.insert(make_pair(reference<Pipeline>(*base_pipeline), base_stack));
+
+	if (EnergyAttributionManager::LifecyclePhasesEnabled(context)) {
+		std::unordered_map<Event *, vector<uint64_t>> initialize_groups;
+		std::unordered_map<Event *, vector<uint64_t>> prepare_finish_groups;
+		std::unordered_map<Event *, vector<uint64_t>> finish_groups;
+		for (auto entry = event_map.begin(); entry != event_map.end(); ++entry) {
+			auto pipeline_id = EnergyAttributionManager::GetPipelineAttributionId(entry->first.get());
+			initialize_groups[&entry->second.pipeline_initialize_event].push_back(pipeline_id);
+			prepare_finish_groups[&entry->second.pipeline_prepare_finish_event].push_back(pipeline_id);
+			finish_groups[&entry->second.pipeline_finish_event].push_back(pipeline_id);
+		}
+		RegisterEnergyLifecycleGroups(initialize_groups, next_energy_lifecycle_group_id);
+		RegisterEnergyLifecycleGroups(prepare_finish_groups, next_energy_lifecycle_group_id);
+		RegisterEnergyLifecycleGroups(finish_groups, next_energy_lifecycle_group_id);
+	}
 
 	for (auto &pipeline : pipelines) {
 		auto source = pipeline->GetSource();
@@ -262,7 +343,7 @@ void Executor::ScheduleEventsInternal(ScheduleEventData &event_data) {
 	// schedule the pipelines that do not have dependencies
 	for (auto &event : events) {
 		if (!event->HasDependencies()) {
-			event->Schedule();
+			ScheduleEvent(event);
 		}
 	}
 }
@@ -420,6 +501,13 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 
 		// collect all pipelines from the root pipelines (recursively) for the progress bar and verify them
 		root_pipeline->GetPipelines(pipelines, true);
+
+		QueryRequestMetadata request_metadata;
+		if (context.config.query_activation_scheduler_enabled &&
+		    QueryRequestMetadataManager::TryGetActive(context, request_metadata)) {
+			activation_scheduler =
+			    make_uniq<QueryActivationScheduler>(*this, request_metadata, context.config.query_activation_debug_enabled);
+		}
 
 		// finally, verify and schedule
 		VerifyPipelines();
@@ -638,10 +726,13 @@ void Executor::Reset() {
 	physical_plan = nullptr;
 	cancelled = false;
 	root_executor.reset();
+	activation_scheduler.reset();
 	root_pipelines.clear();
 	root_pipeline_idx = 0;
 	completed_pipelines = 0;
 	total_pipelines = 0;
+	next_activation_group_id = 1;
+	next_energy_lifecycle_group_id = 1;
 	error_manager.Reset();
 	pipelines.clear();
 	events.clear();
