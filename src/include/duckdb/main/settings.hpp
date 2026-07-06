@@ -1063,6 +1063,17 @@ struct QueryActivationDebugEnableSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct QueryWorkerOnlyExecutionEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_worker_only_execution_enable";
+	static constexpr const char *Description =
+	    "Enable prototype materialized query execution where client threads wait instead of executing tasks";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct ErrorsAsJSONSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "errors_as_json";

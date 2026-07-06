@@ -59,7 +59,9 @@ public:
 	void CancelTasks();
 	PendingExecutionResult ExecuteTask(bool dry_run = false);
 	void WaitForTask();
+	void WaitForExecutionResult();
 	void SignalTaskRescheduled(lock_guard<mutex> &);
+	void NotifyExecutionProgress();
 
 	void Reset();
 
@@ -91,9 +93,7 @@ public:
 	//! Returns the progress of the pipelines
 	idx_t GetPipelinesProgress(ProgressData &progress);
 
-	void CompletePipeline() {
-		completed_pipelines++;
-	}
+	void CompletePipeline();
 	ProducerToken &GetToken() {
 		return *producer;
 	}
@@ -116,12 +116,8 @@ public:
 	//! Returns true if all pipelines have been completed
 	bool ExecutionIsFinished();
 
-	void RegisterTask() {
-		executor_tasks++;
-	}
-	void UnregisterTask() {
-		executor_tasks--;
-	}
+	void RegisterTask();
+	void UnregisterTask();
 
 	idx_t GetTotalPipelines() const {
 		return total_pipelines;
@@ -134,6 +130,7 @@ public:
 private:
 	//! Check if the streaming query result is waiting to be fetched from, must hold the 'executor_lock'
 	bool ResultCollectorIsBlocked();
+	void CancelTasksWorkerOnly();
 	void InitializeInternal(PhysicalOperator &physical_plan);
 
 	void ScheduleEvents(const vector<shared_ptr<MetaPipeline>> &meta_pipelines);
@@ -198,6 +195,8 @@ private:
 	unordered_map<Task *, shared_ptr<Task>> to_be_rescheduled_tasks;
 	//! The semaphore to signal task rescheduling
 	std::condition_variable task_reschedule;
+	//! Signals executor progress to worker-only client waiters and cancellation task-drain waiters.
+	std::condition_variable execution_progress;
 
 	//! Currently alive executor tasks
 	atomic<idx_t> executor_tasks;

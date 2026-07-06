@@ -1,5 +1,7 @@
 #include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/execution/executor.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 
 namespace duckdb {
@@ -45,7 +47,12 @@ void PendingQueryResult::CheckExecutableInternal(ClientContextLock &lock) {
 
 void PendingQueryResult::WaitForTask() {
 	auto lock = LockContext();
-	context->WaitForTask(*lock, *this);
+	if (DBConfig::GetConfig(*context).options.query_worker_only_execution_enabled) {
+		D_ASSERT(!allow_stream_result);
+		context->GetExecutor().WaitForExecutionResult();
+	} else {
+		context->WaitForTask(*lock, *this);
+	}
 }
 
 PendingExecutionResult PendingQueryResult::ExecuteTask() {
@@ -65,7 +72,16 @@ bool PendingQueryResult::AllowStreamResult() const {
 
 PendingExecutionResult PendingQueryResult::ExecuteTaskInternal(ClientContextLock &lock) {
 	CheckExecutableInternal(lock);
-	return context->ExecuteTaskInternal(lock, *this, false);
+	if (!DBConfig::GetConfig(*context).options.query_worker_only_execution_enabled) {
+		return context->ExecuteTaskInternal(lock, *this, false);
+	}
+
+	D_ASSERT(!allow_stream_result);
+	auto execution_result = context->ExecuteTaskInternal(lock, *this, true);
+	if (!IsResultReady(execution_result)) {
+		context->GetExecutor().WaitForExecutionResult();
+	}
+	return execution_result;
 }
 
 unique_ptr<QueryResult> PendingQueryResult::ExecuteInternal(ClientContextLock &lock) {
@@ -73,7 +89,8 @@ unique_ptr<QueryResult> PendingQueryResult::ExecuteInternal(ClientContextLock &l
 
 	PendingExecutionResult execution_result;
 	while (!IsResultReady(execution_result = ExecuteTaskInternal(lock))) {
-		if (execution_result == PendingExecutionResult::BLOCKED) {
+		if (!DBConfig::GetConfig(*context).options.query_worker_only_execution_enabled &&
+		    execution_result == PendingExecutionResult::BLOCKED) {
 			CheckExecutableInternal(lock);
 			context->WaitForTask(lock, *this);
 		}

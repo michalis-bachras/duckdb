@@ -599,12 +599,13 @@ ClientContext::PendingPreparedStatementInternal(ClientContextLock &lock,
 		query_progress.Restart();
 	}
 
-	const auto stream_result = parameters.query_parameters.output_type == QueryResultOutputType::ALLOW_STREAMING &&
+	auto &client_config = ClientConfig::GetConfig(*this);
+	const auto stream_result = !DBConfig::GetConfig(*this).options.query_worker_only_execution_enabled &&
+	                           parameters.query_parameters.output_type == QueryResultOutputType::ALLOW_STREAMING &&
 	                           statement_data.properties.output_type == QueryResultOutputType::ALLOW_STREAMING;
 
 	// Decide how to get the result collector.
 	get_result_collector_t get_collector = PhysicalResultCollector::GetResultCollector;
-	auto &client_config = ClientConfig::GetConfig(*this);
 	if (!stream_result && client_config.get_result_collector) {
 		get_collector = client_config.get_result_collector;
 	}
@@ -671,6 +672,9 @@ PendingExecutionResult ClientContext::ExecuteTaskInternal(ClientContextLock &loc
 	D_ASSERT(active_query->IsOpenResult(result));
 	bool invalidate_transaction = true;
 	try {
+		if (interrupted) {
+			throw InterruptException();
+		}
 		auto query_result = active_query->executor->ExecuteTask(dry_run);
 		if (active_query->progress_bar) {
 			auto is_finished = PendingQueryResult::IsResultReady(query_result);

@@ -1109,6 +1109,13 @@
         "custom_implementation": true
     },
     {
+        "name": "query_worker_only_execution_enable",
+        "description": "Enable prototype materialized query execution where client threads wait instead of executing tasks",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
         "name": "progress_bar_time",
         "description": "Sets the time (in milliseconds) how long a query needs to take before we start printing a progress bar",
         "type": "BIGINT",

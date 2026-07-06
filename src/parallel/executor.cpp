@@ -7,9 +7,9 @@
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
@@ -40,6 +40,26 @@ Executor::~Executor() {
 
 Executor &Executor::Get(ClientContext &context) {
 	return context.GetExecutor();
+}
+
+void Executor::RegisterTask() {
+	executor_tasks++;
+}
+
+void Executor::UnregisterTask() {
+	auto remaining_tasks = --executor_tasks;
+	if (remaining_tasks == 0) {
+		NotifyExecutionProgress();
+	}
+}
+
+void Executor::CompletePipeline() {
+	completed_pipelines++;
+	NotifyExecutionProgress();
+}
+
+void Executor::NotifyExecutionProgress() {
+	execution_progress.notify_all();
 }
 
 void Executor::AddEvent(shared_ptr<Event> event) {
@@ -76,6 +96,7 @@ void Executor::RegisterActivationEvent(Event &event, idx_t group_id, QueryActiva
 }
 
 void Executor::NotifyEventFinished(Event &event) {
+	NotifyExecutionProgress();
 	if (!activation_scheduler || !event.HasQueryActivationInfo()) {
 		return;
 	}
@@ -516,6 +537,10 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 }
 
 void Executor::CancelTasks() {
+	if (DBConfig::GetConfig(context).options.query_worker_only_execution_enabled) {
+		CancelTasksWorkerOnly();
+		return;
+	}
 	task.reset();
 	{
 		lock_guard<mutex> elock(executor_lock);
@@ -538,6 +563,46 @@ void Executor::CancelTasks() {
 	root_pipelines.clear();
 	to_be_rescheduled_tasks.clear();
 	events.clear();
+}
+
+void Executor::CancelTasksWorkerOnly() {
+#ifndef DUCKDB_NO_THREADS
+	task.reset();
+	bool wait_for_tasks = false;
+	{
+		lock_guard<mutex> elock(executor_lock);
+		cancelled = true;
+		wait_for_tasks = executor_tasks.load() > 0;
+		if (wait_for_tasks) {
+			context.interrupted = true;
+		}
+		to_be_rescheduled_tasks.clear();
+	}
+
+	NotifyExecutionProgress();
+	if (wait_for_tasks) {
+		auto &scheduler = TaskScheduler::GetScheduler(context);
+		scheduler.Signal(MaxValue<idx_t>(NumericCast<idx_t>(scheduler.NumberOfThreads()), 1));
+
+		static constexpr std::chrono::microseconds WAIT_TIME_MS = std::chrono::microseconds(WAIT_TIME * 1000);
+		std::unique_lock<mutex> lock(executor_lock);
+		while (executor_tasks.load() > 0) {
+			execution_progress.wait_for(lock, WAIT_TIME_MS);
+		}
+	}
+
+	lock_guard<mutex> elock(executor_lock);
+	for (auto &rec_cte_ref : recursive_ctes) {
+		auto &rec_cte = rec_cte_ref.get().Cast<PhysicalRecursiveCTE>();
+		rec_cte.recursive_meta_pipeline.reset();
+	}
+	pipelines.clear();
+	root_pipelines.clear();
+	to_be_rescheduled_tasks.clear();
+	events.clear();
+#else
+	throw NotImplementedException("Worker-only query execution requires DuckDB threads");
+#endif
 }
 
 void Executor::WorkOnTasks() {
@@ -577,6 +642,23 @@ void Executor::WaitForTask() {
 
 	blocked_thread_time += ms + WAIT_TIME_MS.count();
 	task_reschedule.wait_for(l, WAIT_TIME_MS);
+#endif
+}
+
+void Executor::WaitForExecutionResult() {
+#ifndef DUCKDB_NO_THREADS
+	static constexpr std::chrono::microseconds WAIT_TIME_MS = std::chrono::microseconds(WAIT_TIME * 1000);
+	auto begin = std::chrono::high_resolution_clock::now();
+	std::unique_lock<mutex> l(executor_lock);
+	auto end = std::chrono::high_resolution_clock::now();
+	auto dur = end - begin;
+	auto ms = NumericCast<idx_t>(std::chrono::duration_cast<std::chrono::microseconds>(dur).count());
+	if (!ExecutionIsFinished() && !HasError() && !cancelled) {
+		blocked_thread_time += ms + WAIT_TIME_MS.count();
+		execution_progress.wait_for(l, WAIT_TIME_MS);
+	} else {
+		blocked_thread_time += ms;
+	}
 #endif
 }
 
@@ -770,6 +852,7 @@ void Executor::PushError(ErrorData exception) {
 	error_manager.PushError(std::move(exception));
 	// interrupt execution of any other pipelines that belong to this executor
 	context.interrupted = true;
+	NotifyExecutionProgress();
 }
 
 bool Executor::HasError() {

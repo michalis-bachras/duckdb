@@ -1883,6 +1883,19 @@ Value QueryActivationDebugEnableSetting::GetSetting(const ClientContext &context
 	return Value::BOOLEAN(ClientConfig::GetConfig(context).query_activation_debug_enabled);
 }
 
+void QueryWorkerOnlyExecutionEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	config.options.query_worker_only_execution_enabled = BooleanValue::Get(value);
+}
+
+void QueryWorkerOnlyExecutionEnableSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.query_worker_only_execution_enabled = DBConfigOptions().query_worker_only_execution_enabled;
+}
+
+Value QueryWorkerOnlyExecutionEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_worker_only_execution_enabled);
+}
+
 //===----------------------------------------------------------------------===//
 // Progress Bar Time
 //===----------------------------------------------------------------------===//
