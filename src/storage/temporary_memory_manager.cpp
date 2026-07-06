@@ -185,46 +185,60 @@ static idx_t ComputeInitialReservation(const TemporaryMemoryState &temporary_mem
 	return MaxValue<idx_t>(result, 1);
 }
 
+static double ClampThroughput(double throughput) {
+	static constexpr double MINIMUM_THROUGHPUT = 1e-300;
+	if (!std::isfinite(throughput) || throughput <= MINIMUM_THROUGHPUT) {
+		return MINIMUM_THROUGHPUT;
+	}
+	if (throughput > 1.0) {
+		return 1.0;
+	}
+	return throughput;
+}
+
 static void ComputeDerivatives(const vector<reference<const TemporaryMemoryState>> &states, const vector<idx_t> &res,
                                vector<double> &der, const idx_t n) {
 	// Cost function takes "throughput" (reservation / size) of each operator as its principal input
-	double prod_siz = 1;
-	double prod_res = 1;
 	double mat_cost = 0;
+	double log_throughput_sum = 0;
 	for (idx_t i = 0; i < n; i++) {
 		auto &state = states[i].get();
 		const auto resd = static_cast<double>(res[i]);
 		const auto sizd = static_cast<double>(MaxValue<idx_t>(state.GetRemainingSize(), 1));
 		const auto pend = static_cast<double>(state.GetMaterializationPenalty());
-		prod_res *= resd;
-		prod_siz *= sizd;
-		mat_cost += pend * (1 - resd / sizd); // Materialization cost: sum of (1 - throughput)
+		const auto throughput = ClampThroughput(resd / sizd);
+		log_throughput_sum += std::log(throughput);
+		mat_cost += pend * (1 - throughput); // Materialization cost: sum of (1 - throughput)
 	}
-	const double nd = static_cast<double>(n);                    // n as double for convenience
-	const double tp_mult = 1 - pow(prod_res / prod_siz, 1 / nd); // Throughput multiplier: 1 - geomean throughputs
+	const double nd = static_cast<double>(n);                          // n as double for convenience
+	const double geomean_throughput = std::exp(log_throughput_sum / nd); // Geomean of throughputs
+	const double tp_mult = 1 - geomean_throughput;                       // Throughput multiplier
 
 	// Cost function: materialization cost * (1 - throughput multiplier), but we don't actually need to compute it
 	// here. We need to compute the derivative with respect to every reservation, stored in "der"
 	// Just use https://www.derivative-calculator.net with this (n = 3) to see what's going on
 	// (3 - (a_1/s_1)-(a_2/s_2)-(a_3/s_3))*(1-((a_1/s_1)*(a_2/s_2)*(a_3/s_3))^(1/3))
-	const double intermediate = -(pow(prod_res, 1 / nd) * mat_cost) / (nd * pow(prod_siz, 1 / nd));
+	const double intermediate = -(geomean_throughput * mat_cost) / nd;
 	for (idx_t i = 0; i < n; i++) {
 		auto &state = states[i].get();
-		const auto resd = static_cast<double>(res[i]);
+		const auto resd = static_cast<double>(MaxValue<idx_t>(res[i], 1));
 		const auto sizd = static_cast<double>(MaxValue<idx_t>(state.GetRemainingSize(), 1));
 		const auto pend = static_cast<double>(state.GetMaterializationPenalty());
 		der[i] = intermediate / resd - pend * tp_mult / sizd;
+		if (!std::isfinite(der[i])) {
+			der[i] = NumericLimits<double>::Maximum();
+		}
 	}
 }
 
 idx_t TemporaryMemoryManager::ComputeReservation(const TemporaryMemoryState &temporary_memory_state) const {
 	static constexpr idx_t OPTIMIZATION_ITERATIONS_MULTIPLIER = 5;
+	static constexpr idx_t APPROXIMATE_RESERVATION_STATE_LIMIT = 32;
 
 	// Use vectors for ease
 	optional_idx state_index;
 	vector<reference<const TemporaryMemoryState>> states;
 	vector<idx_t> res;
-	vector<double> der;
 	idx_t sum_of_initial_res = 0;
 
 	idx_t i = 0;
@@ -238,58 +252,114 @@ idx_t TemporaryMemoryManager::ComputeReservation(const TemporaryMemoryState &tem
 		}
 		states.emplace_back(state);
 		res.push_back(initial_reservation);
-		der.push_back(NumericLimits<double>::Maximum());
 		i++;
 	}
 	const idx_t n = i;
+	if (!state_index.IsValid()) {
+		throw InternalException("Did not find state_index in ComputeReservation");
+	}
+	const auto current_state_index = state_index.GetIndex();
 
 	if (sum_of_initial_res >= memory_limit) {
-		return res[state_index.GetIndex()];
+		return res[current_state_index];
 	}
 	const auto free_memory = memory_limit - sum_of_initial_res;
 
+	if (n > APPROXIMATE_RESERVATION_STATE_LIMIT) {
+		double total_weight = 0;
+		double current_weight = 0;
+		for (i = 0; i < n; i++) {
+			auto &state = states[i].get();
+			const auto room = state.GetRemainingSize() > res[i] ? state.GetRemainingSize() - res[i] : 0;
+			double weight = 0;
+			if (room > 0) {
+				weight = static_cast<double>(MaxValue<idx_t>(state.GetMaterializationPenalty(), 1)) *
+				         static_cast<double>(room);
+				if (!std::isfinite(weight) || weight <= 0) {
+					weight = 1;
+				}
+			}
+			if (i == current_state_index) {
+				current_weight = weight;
+			}
+			total_weight += weight;
+		}
+
+		auto &state = states[current_state_index].get();
+		const auto initial_state_reservation = res[current_state_index];
+		const auto state_room =
+		    state.GetRemainingSize() > initial_state_reservation ? state.GetRemainingSize() - initial_state_reservation : 0;
+		idx_t state_reservation = initial_state_reservation;
+		if (state_room > 0 && total_weight > 0 && std::isfinite(total_weight) && current_weight > 0) {
+			const auto share = static_cast<double>(free_memory) * current_weight / total_weight;
+			idx_t extra_reservation;
+			if (!std::isfinite(share) || share >= static_cast<double>(state_room)) {
+				extra_reservation = state_room;
+			} else {
+				extra_reservation = LossyNumericCast<idx_t>(std::ceil(share));
+				extra_reservation = MinValue(extra_reservation, state_room);
+			}
+			state_reservation += extra_reservation;
+		}
+
+		const auto state_remaining = initial_state_reservation + free_memory;
+		auto upper_bound = LossyNumericCast<idx_t>(MAXIMUM_FREE_MEMORY_RATIO * static_cast<double>(state_remaining));
+		auto num_other_states = MinValue(MAXIMUM_REMAINING_STATE_RESERVATIONS, num_connections);
+		num_other_states = MaxValue(num_other_states, MINIMUM_REMAINING_STATE_RESERVATIONS);
+		upper_bound = MinValue(upper_bound, num_other_states * DefaultMinimumReservation());
+		state_reservation = MinValue(state_reservation, upper_bound);
+		return MaxValue(state_reservation, initial_state_reservation);
+	}
+
 	// Distribute memory in OPTIMIZATION_ITERATIONS
 	idx_t remaining_memory = free_memory;
+	vector<double> der(n, NumericLimits<double>::Maximum());
 	const idx_t optimization_iterations = OPTIMIZATION_ITERATIONS_MULTIPLIER * n;
-	for (idx_t opt_idx = 0; opt_idx < optimization_iterations; opt_idx++) {
+	const idx_t max_optimization_iterations = optimization_iterations + n;
+	for (idx_t opt_idx = 0; opt_idx < max_optimization_iterations && remaining_memory != 0; opt_idx++) {
 		D_ASSERT(remaining_memory != 0);
 		ComputeDerivatives(states, res, der, n);
 
 		// Find the index of the state with the lowest derivative
 		idx_t min_idx = 0;
 		double min_der = NumericLimits<double>::Maximum();
+		bool found_candidate = false;
 		for (i = 0; i < n; i++) {
 			auto &state = states[i].get();
 			if (res[i] >= state.GetRemainingSize()) {
 				continue; // We can't increase the reservation of "maxed" states, so we skip these
 			}
-			if (der[i] < min_der) {
+			if (!std::isfinite(der[i])) {
+				continue;
+			}
+			if (!found_candidate || der[i] < min_der) {
 				min_idx = i;
 				min_der = der[i];
+				found_candidate = true;
 			}
+		}
+		if (!found_candidate) {
+			break;
 		}
 		auto &min_state = states[min_idx].get();
 
 		// This is how much memory we will distribute in this round
+		const auto remaining_iterations = opt_idx < optimization_iterations ? optimization_iterations - opt_idx : 1;
 		const auto iter_memory = ExactNumericCast<idx_t>(
-		    std::ceil(static_cast<double>(remaining_memory) / static_cast<double>(optimization_iterations - opt_idx)));
+		    std::ceil(static_cast<double>(remaining_memory) / static_cast<double>(remaining_iterations)));
 
 		// Compute how much we can add
 		const auto state_room = min_state.GetRemainingSize() - res[min_idx];
 		const auto delta = MinValue(iter_memory, state_room);
 		D_ASSERT(delta <= remaining_memory);
+		if (delta == 0) {
+			break;
+		}
 
 		// Update counts
 		res[min_idx] += delta;
 		remaining_memory -= delta;
-
-		// If we aren't able to assign the remaining memory to the lowest-derivative state in the last iteration,
-		// we'll exit this loop without assigning all free memory. This adds another iteration
-		if (opt_idx == optimization_iterations - 1 && delta < iter_memory) {
-			opt_idx--;
-		}
 	}
-	D_ASSERT(remaining_memory == 0);
 
 	// We computed how the memory should be assigned to the states,
 	// but we did not yet take into account the upper bound of MAXIMUM_FREE_MEMORY_RATIO * free_memory.
@@ -324,7 +394,7 @@ idx_t TemporaryMemoryManager::ComputeReservation(const TemporaryMemoryState &tem
 		// But make sure it's never less than the initial reservation
 		state_reservation = MaxValue(state_reservation, initial_state_reservation);
 		// If this is the current state, we can just return
-		if (idx == state_index.GetIndex()) {
+		if (idx == current_state_index) {
 			return state_reservation;
 		}
 		// Decrement the remaining memory
