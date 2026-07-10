@@ -1042,6 +1042,17 @@ struct QueryAdmissionMaxActiveSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct QueryAdmissionNonblockingEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_admission_nonblocking_enable";
+	static constexpr const char *Description =
+	    "Return pending SLA-tagged queries immediately while they wait for a query admission slot";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct QueryActivationSchedulerEnableSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "query_activation_scheduler_enable";

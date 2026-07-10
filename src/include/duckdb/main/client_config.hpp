@@ -86,6 +86,8 @@ struct ClientConfig {
 	bool query_request_profiling_enabled = false;
 	//! Maximum number of SLA-tagged workload queries admitted at once. Zero disables admission control.
 	idx_t query_admission_max_active = 0;
+	//! Return pending SLA-tagged queries immediately when they are waiting for an admission slot.
+	bool query_admission_nonblocking_enabled = false;
 	//! Enable prototype per-query pipeline activation scheduling for SLA-tagged workload queries.
 	bool query_activation_scheduler_enabled = false;
 	//! Enable debug logging for query admission/activation scheduler state.

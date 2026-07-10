@@ -286,9 +286,12 @@ private:
 	ErrorData EndQueryInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
 	                           optional_ptr<ErrorData> previous_error);
 
-	//! Wait until a task is available to execute
-	void WaitForTask(ClientContextLock &lock, BaseQueryResult &result);
-	PendingExecutionResult ExecuteTaskInternal(ClientContextLock &lock, BaseQueryResult &result, bool dry_run = false);
+		//! Wait until a task is available to execute
+		void WaitForTask(ClientContextLock &lock, BaseQueryResult &result);
+		PendingExecutionResult EnsurePendingQueryExecution(ClientContextLock &lock, BaseQueryResult &result,
+		                                                   bool wait_for_admission);
+		void InitializePendingQueryExecution(ClientContextLock &lock, PendingQueryResult &pending);
+		PendingExecutionResult ExecuteTaskInternal(ClientContextLock &lock, BaseQueryResult &result, bool dry_run = false);
 
 	unique_ptr<PendingQueryResult> PendingStatementOrPreparedStatementInternal(
 	    ClientContextLock &lock, const string &query, unique_ptr<SQLStatement> statement,

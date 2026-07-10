@@ -56,54 +56,55 @@ class QueryAdmissionController;
 
 class QueryAdmissionHandle {
 public:
-	QueryAdmissionHandle(QueryAdmissionController &controller, idx_t slot_id);
+	QueryAdmissionHandle(QueryAdmissionController &controller, const QueryRequestMetadata &metadata, idx_t max_active,
+	                     idx_t ticket, uint64_t queued_ns, bool debug_enabled);
 	~QueryAdmissionHandle();
 
 	QueryAdmissionHandle(const QueryAdmissionHandle &) = delete;
 	QueryAdmissionHandle &operator=(const QueryAdmissionHandle &) = delete;
 
-	QueryAdmissionHandle(QueryAdmissionHandle &&other) noexcept;
-	QueryAdmissionHandle &operator=(QueryAdmissionHandle &&other) noexcept;
+	QueryAdmissionHandle(QueryAdmissionHandle &&other) = delete;
+	QueryAdmissionHandle &operator=(QueryAdmissionHandle &&other) = delete;
 
 	idx_t SlotId() const {
 		return slot_id;
 	}
+	bool IsAdmitted() const {
+		return admitted;
+	}
+	void Wait();
 
 private:
 	QueryAdmissionController *controller;
-	idx_t slot_id;
+	QueryRequestMetadata metadata;
+	idx_t max_active;
+	idx_t ticket;
+	idx_t slot_id = 0;
+	uint64_t queued_ns;
+	uint64_t admitted_ns = 0;
+	bool admitted = false;
+	bool cancelled = false;
+	bool debug_enabled;
+	std::condition_variable cv;
+
+	friend class QueryAdmissionController;
 };
 
 class QueryAdmissionController {
+	friend class QueryAdmissionHandle;
+
 public:
 	explicit QueryAdmissionController(DatabaseInstance &db);
 
+	unique_ptr<QueryAdmissionHandle> EnqueueOrAcquire(ClientContext &context, const QueryRequestMetadata &metadata,
+	                                                  idx_t max_active);
 	unique_ptr<QueryAdmissionHandle> Acquire(ClientContext &context, const QueryRequestMetadata &metadata,
 	                                        idx_t max_active);
-	void Release(idx_t slot_id);
 
 	vector<QueryAdmissionSnapshot> GetSnapshot() const;
 	static vector<QueryAdmissionEventSnapshot> GetEventSnapshot();
 
 private:
-	struct Waiter {
-		explicit Waiter(const QueryRequestMetadata &metadata_p, idx_t max_active_p, idx_t ticket_p,
-		                uint64_t queued_ns_p, bool debug_enabled_p)
-		    : metadata(metadata_p), max_active(max_active_p), ticket(ticket_p), queued_ns(queued_ns_p),
-		      debug_enabled(debug_enabled_p) {
-		}
-
-		QueryRequestMetadata metadata;
-		idx_t max_active;
-		idx_t ticket;
-		idx_t slot_id = 0;
-		uint64_t queued_ns;
-		uint64_t admitted_ns = 0;
-		bool admitted = false;
-		bool debug_enabled;
-		std::condition_variable cv;
-	};
-
 	struct ActiveEntry {
 		QueryRequestMetadata metadata;
 		idx_t slot_id;
@@ -116,8 +117,11 @@ private:
 
 private:
 	static uint64_t TimestampNs();
-	bool CanAdmit(const Waiter &waiter) const;
-	void AdmitWaiter(Waiter &waiter);
+	void AdmitRequest(QueryAdmissionHandle &request);
+	void CancelOrRelease(QueryAdmissionHandle &request);
+	void ReleaseLocked(idx_t slot_id);
+	void TryAdmitWaiters();
+	void Wait(QueryAdmissionHandle &request);
 	void LogEventLocked(const QueryRequestMetadata &metadata, const string &event_state, idx_t ticket, idx_t slot_id,
 	                    idx_t max_active, uint64_t queued_ns, uint64_t admitted_ns, uint64_t released_ns,
 	                    bool debug_enabled) const;
@@ -125,7 +129,7 @@ private:
 private:
 	DatabaseInstance &db;
 	mutable mutex admission_lock;
-	std::deque<Waiter *> waiters;
+	std::deque<QueryAdmissionHandle *> waiters;
 	std::unordered_map<idx_t, ActiveEntry> active;
 	idx_t next_ticket = 1;
 	idx_t next_slot_id = 1;

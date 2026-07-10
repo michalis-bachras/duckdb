@@ -244,7 +244,8 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 	if (QueryRequestMetadataManager::NeedsMetadata(*this)) {
 		QueryRequestMetadataManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
 		QueryRequestMetadata metadata;
-		if (QueryRequestMetadataManager::TryGetActive(*this, metadata) && config.query_admission_max_active > 0) {
+		if (!config.query_admission_nonblocking_enabled && QueryRequestMetadataManager::TryGetActive(*this, metadata) &&
+		    config.query_admission_max_active > 0) {
 			active_query->admission_handle =
 			    db_inst.GetQueryAdmissionController().Acquire(*this, metadata, config.query_admission_max_active);
 			QueryRequestMetadataManager::RefreshQueryStart(*this);
@@ -582,6 +583,48 @@ ClientContext::PendingPreparedStatementInternal(ClientContextLock &lock,
 	auto &statement_data = *statement_data_p;
 	BindPreparedStatementParameters(statement_data, parameters);
 
+	QueryRequestMetadata request_metadata;
+	if (config.query_admission_nonblocking_enabled && config.query_admission_max_active > 0 &&
+	    QueryRequestMetadataManager::TryGetActive(*this, request_metadata)) {
+		auto &db_inst = DatabaseInstance::GetDatabase(*this);
+		active_query->admission_handle =
+		    db_inst.GetQueryAdmissionController().EnqueueOrAcquire(*this, request_metadata, config.query_admission_max_active);
+		if (active_query->admission_handle && active_query->admission_handle->IsAdmitted()) {
+			QueryRequestMetadataManager::RefreshQueryStart(*this);
+		}
+	}
+
+	const auto stream_result = !active_query->admission_handle &&
+	                           !DBConfig::GetConfig(*this).options.query_worker_only_execution_enabled &&
+	                           parameters.query_parameters.output_type == QueryResultOutputType::ALLOW_STREAMING &&
+	                           statement_data.properties.output_type == QueryResultOutputType::ALLOW_STREAMING;
+
+	statement_data.output_type =
+	    stream_result ? QueryResultOutputType::ALLOW_STREAMING : QueryResultOutputType::FORCE_MATERIALIZED;
+	statement_data.memory_type = parameters.query_parameters.memory_type;
+
+	D_ASSERT(!active_query->HasOpenResult());
+	auto types = statement_data.types;
+	auto pending_result =
+	    make_uniq<PendingQueryResult>(shared_from_this(), *statement_data_p, std::move(types), stream_result);
+	active_query->prepared = std::move(statement_data_p);
+	active_query->SetOpenResult(*pending_result);
+
+	if (!active_query->admission_handle || active_query->admission_handle->IsAdmitted()) {
+		InitializePendingQueryExecution(lock, *pending_result);
+	}
+	return pending_result;
+}
+
+void ClientContext::InitializePendingQueryExecution(ClientContextLock &lock, PendingQueryResult &pending) {
+	D_ASSERT(active_query);
+	D_ASSERT(active_query->IsOpenResult(pending));
+	D_ASSERT(active_query->prepared);
+	if (active_query->executor) {
+		return;
+	}
+
+	auto &statement_data = *active_query->prepared;
 	// Create the query executor.
 	active_query->executor = make_uniq<Executor>(*this);
 	auto &executor = *active_query->executor;
@@ -599,19 +642,12 @@ ClientContext::PendingPreparedStatementInternal(ClientContextLock &lock,
 		query_progress.Restart();
 	}
 
-	auto &client_config = ClientConfig::GetConfig(*this);
-	const auto stream_result = !DBConfig::GetConfig(*this).options.query_worker_only_execution_enabled &&
-	                           parameters.query_parameters.output_type == QueryResultOutputType::ALLOW_STREAMING &&
-	                           statement_data.properties.output_type == QueryResultOutputType::ALLOW_STREAMING;
-
 	// Decide how to get the result collector.
 	get_result_collector_t get_collector = PhysicalResultCollector::GetResultCollector;
-	if (!stream_result && client_config.get_result_collector) {
+	auto &client_config = ClientConfig::GetConfig(*this);
+	if (statement_data.output_type != QueryResultOutputType::ALLOW_STREAMING && client_config.get_result_collector) {
 		get_collector = client_config.get_result_collector;
 	}
-	statement_data.output_type =
-	    stream_result ? QueryResultOutputType::ALLOW_STREAMING : QueryResultOutputType::FORCE_MATERIALIZED;
-	statement_data.memory_type = parameters.query_parameters.memory_type;
 
 	// Get the result collector and initialize the executor.
 	auto collector = get_collector(*this, statement_data);
@@ -620,13 +656,6 @@ ClientContext::PendingPreparedStatementInternal(ClientContextLock &lock,
 
 	auto types = executor.GetTypes();
 	D_ASSERT(types == statement_data.types);
-	D_ASSERT(!active_query->HasOpenResult());
-
-	auto pending_result =
-	    make_uniq<PendingQueryResult>(shared_from_this(), *statement_data_p, std::move(types), stream_result);
-	active_query->prepared = std::move(statement_data_p);
-	active_query->SetOpenResult(*pending_result);
-	return pending_result;
 }
 
 unique_ptr<PendingQueryResult> ClientContext::PendingPreparedStatement(ClientContextLock &lock, const string &query,
@@ -654,7 +683,37 @@ unique_ptr<PendingQueryResult> ClientContext::PendingPreparedStatement(ClientCon
 }
 
 void ClientContext::WaitForTask(ClientContextLock &lock, BaseQueryResult &result) {
+	auto admission_state = EnsurePendingQueryExecution(lock, result, true);
+	if (admission_state == PendingExecutionResult::WAITING_FOR_ADMISSION) {
+		return;
+	}
 	active_query->executor->WaitForTask();
+}
+
+PendingExecutionResult ClientContext::EnsurePendingQueryExecution(ClientContextLock &lock, BaseQueryResult &result,
+                                                                  bool wait_for_admission) {
+	D_ASSERT(active_query);
+	D_ASSERT(active_query->IsOpenResult(result));
+	if (active_query->executor) {
+		return PendingExecutionResult::RESULT_NOT_READY;
+	}
+	auto &admission_handle = active_query->admission_handle;
+	if (admission_handle && !admission_handle->IsAdmitted()) {
+		if (!wait_for_admission) {
+			return PendingExecutionResult::WAITING_FOR_ADMISSION;
+		}
+		admission_handle->Wait();
+		if (!admission_handle->IsAdmitted()) {
+			return PendingExecutionResult::WAITING_FOR_ADMISSION;
+		}
+		QueryRequestMetadataManager::RefreshQueryStart(*this);
+	}
+	if (result.type != PendingQueryResult::TYPE) {
+		throw InternalException("Cannot initialize query execution for a non-pending result");
+	}
+	auto &pending = reinterpret_cast<PendingQueryResult &>(result);
+	InitializePendingQueryExecution(lock, pending);
+	return PendingExecutionResult::RESULT_NOT_READY;
 }
 
 bool ClientContext::ErrorInvalidatesTransaction(ExceptionType type) {
@@ -674,6 +733,10 @@ PendingExecutionResult ClientContext::ExecuteTaskInternal(ClientContextLock &loc
 	try {
 		if (interrupted) {
 			throw InterruptException();
+		}
+		auto admission_state = EnsurePendingQueryExecution(lock, result, false);
+		if (admission_state == PendingExecutionResult::WAITING_FOR_ADMISSION) {
+			return admission_state;
 		}
 		auto query_result = active_query->executor->ExecuteTask(dry_run);
 		if (active_query->progress_bar) {

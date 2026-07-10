@@ -47,6 +47,10 @@ void PendingQueryResult::CheckExecutableInternal(ClientContextLock &lock) {
 
 void PendingQueryResult::WaitForTask() {
 	auto lock = LockContext();
+	auto admission_state = context->EnsurePendingQueryExecution(*lock, *this, true);
+	if (admission_state == PendingExecutionResult::WAITING_FOR_ADMISSION) {
+		return;
+	}
 	if (DBConfig::GetConfig(*context).options.query_worker_only_execution_enabled) {
 		D_ASSERT(!allow_stream_result);
 		context->GetExecutor().WaitForExecutionResult();
@@ -78,6 +82,9 @@ PendingExecutionResult PendingQueryResult::ExecuteTaskInternal(ClientContextLock
 
 	D_ASSERT(!allow_stream_result);
 	auto execution_result = context->ExecuteTaskInternal(lock, *this, true);
+	if (execution_result == PendingExecutionResult::WAITING_FOR_ADMISSION) {
+		return execution_result;
+	}
 	if (!IsResultReady(execution_result)) {
 		context->GetExecutor().WaitForExecutionResult();
 	}
@@ -91,6 +98,9 @@ unique_ptr<QueryResult> PendingQueryResult::ExecuteInternal(ClientContextLock &l
 	while (!IsResultReady(execution_result = ExecuteTaskInternal(lock))) {
 		if (!DBConfig::GetConfig(*context).options.query_worker_only_execution_enabled &&
 		    execution_result == PendingExecutionResult::BLOCKED) {
+			CheckExecutableInternal(lock);
+			context->WaitForTask(lock, *this);
+		} else if (execution_result == PendingExecutionResult::WAITING_FOR_ADMISSION) {
 			CheckExecutableInternal(lock);
 			context->WaitForTask(lock, *this);
 		}

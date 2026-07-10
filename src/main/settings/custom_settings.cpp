@@ -1856,6 +1856,20 @@ Value QueryAdmissionMaxActiveSetting::GetSetting(const ClientContext &context) {
 	return Value::UBIGINT(ClientConfig::GetConfig(context).query_admission_max_active);
 }
 
+void QueryAdmissionNonblockingEnableSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).query_admission_nonblocking_enabled = BooleanValue::Get(value);
+}
+
+void QueryAdmissionNonblockingEnableSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).query_admission_nonblocking_enabled =
+	    ClientConfig().query_admission_nonblocking_enabled;
+}
+
+Value QueryAdmissionNonblockingEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).query_admission_nonblocking_enabled);
+}
+
 void QueryActivationSchedulerEnableSetting::SetLocal(ClientContext &context, const Value &input) {
 	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
 	ClientConfig::GetConfig(context).query_activation_scheduler_enabled = BooleanValue::Get(value);

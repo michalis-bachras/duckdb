@@ -153,6 +153,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_LOCAL(EnergyAttributionRaplEnableSetting),
     DUCKDB_LOCAL(QueryRequestProfilingEnableSetting),
     DUCKDB_LOCAL(QueryAdmissionMaxActiveSetting),
+    DUCKDB_LOCAL(QueryAdmissionNonblockingEnableSetting),
     DUCKDB_LOCAL(QueryActivationSchedulerEnableSetting),
     DUCKDB_LOCAL(QueryActivationDebugEnableSetting),
     DUCKDB_GLOBAL(QueryWorkerOnlyExecutionEnableSetting),

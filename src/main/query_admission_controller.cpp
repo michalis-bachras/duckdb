@@ -28,34 +28,24 @@ static QueryAdmissionDebugStore &GetAdmissionDebugStore() {
 
 } // namespace
 
-QueryAdmissionHandle::QueryAdmissionHandle(QueryAdmissionController &controller_p, idx_t slot_id_p)
-    : controller(&controller_p), slot_id(slot_id_p) {
+QueryAdmissionHandle::QueryAdmissionHandle(QueryAdmissionController &controller_p, const QueryRequestMetadata &metadata_p,
+                                           idx_t max_active_p, idx_t ticket_p, uint64_t queued_ns_p,
+                                           bool debug_enabled_p)
+    : controller(&controller_p), metadata(metadata_p), max_active(max_active_p), ticket(ticket_p), queued_ns(queued_ns_p),
+      debug_enabled(debug_enabled_p) {
 }
 
 QueryAdmissionHandle::~QueryAdmissionHandle() {
 	if (controller) {
-		controller->Release(slot_id);
+		controller->CancelOrRelease(*this);
 	}
 }
 
-QueryAdmissionHandle::QueryAdmissionHandle(QueryAdmissionHandle &&other) noexcept
-    : controller(other.controller), slot_id(other.slot_id) {
-	other.controller = nullptr;
-	other.slot_id = 0;
-}
-
-QueryAdmissionHandle &QueryAdmissionHandle::operator=(QueryAdmissionHandle &&other) noexcept {
-	if (this == &other) {
-		return *this;
+void QueryAdmissionHandle::Wait() {
+	if (!controller) {
+		return;
 	}
-	if (controller) {
-		controller->Release(slot_id);
-	}
-	controller = other.controller;
-	slot_id = other.slot_id;
-	other.controller = nullptr;
-	other.slot_id = 0;
-	return *this;
+	controller->Wait(*this);
 }
 
 QueryAdmissionController::QueryAdmissionController(DatabaseInstance &db_p) : db(db_p) {
@@ -67,22 +57,17 @@ uint64_t QueryAdmissionController::TimestampNs() {
 	        .count());
 }
 
-bool QueryAdmissionController::CanAdmit(const Waiter &waiter) const {
-	return !waiters.empty() && waiters.front() == &waiter && active.size() < waiter.max_active;
-}
-
-void QueryAdmissionController::AdmitWaiter(Waiter &waiter) {
+void QueryAdmissionController::AdmitRequest(QueryAdmissionHandle &request) {
 	auto slot_id = next_slot_id++;
 	auto admitted_ns = TimestampNs();
-	active[slot_id] =
-	    ActiveEntry {waiter.metadata, slot_id, waiter.ticket, waiter.max_active, waiter.queued_ns, admitted_ns,
-	                 waiter.debug_enabled};
-	waiter.slot_id = slot_id;
-	waiter.admitted_ns = admitted_ns;
-	waiter.admitted = true;
-	waiters.pop_front();
-	LogEventLocked(waiter.metadata, "admitted", waiter.ticket, waiter.slot_id, waiter.max_active, waiter.queued_ns,
-	               waiter.admitted_ns, 0, waiter.debug_enabled);
+	active[slot_id] = ActiveEntry {request.metadata, slot_id, request.ticket, request.max_active, request.queued_ns,
+	                               admitted_ns, request.debug_enabled};
+	request.slot_id = slot_id;
+	request.admitted_ns = admitted_ns;
+	request.admitted = true;
+	LogEventLocked(request.metadata, "admitted", request.ticket, request.slot_id, request.max_active, request.queued_ns,
+	               request.admitted_ns, 0, request.debug_enabled);
+	request.cv.notify_all();
 }
 
 void QueryAdmissionController::LogEventLocked(const QueryRequestMetadata &metadata, const string &event_state,
@@ -115,65 +100,38 @@ void QueryAdmissionController::LogEventLocked(const QueryRequestMetadata &metada
 	store.events.push_back(std::move(snapshot));
 }
 
-unique_ptr<QueryAdmissionHandle> QueryAdmissionController::Acquire(ClientContext &context,
-                                                                   const QueryRequestMetadata &metadata,
-                                                                   idx_t max_active) {
+unique_ptr<QueryAdmissionHandle> QueryAdmissionController::EnqueueOrAcquire(ClientContext &context,
+                                                                            const QueryRequestMetadata &metadata,
+                                                                            idx_t max_active) {
 	if (!metadata.valid || max_active == 0) {
 		return nullptr;
 	}
 
 	unique_lock<mutex> guard(admission_lock);
 	auto debug_enabled = context.config.query_activation_debug_enabled;
-	if (!debug_enabled && waiters.empty() && active.size() < max_active) {
-		auto ticket = next_ticket++;
-		auto slot_id = next_slot_id++;
-		auto admitted_ns = TimestampNs();
-		active.emplace(slot_id, ActiveEntry {metadata, slot_id, ticket, max_active, admitted_ns, admitted_ns,
-		                                     debug_enabled});
-		return make_uniq<QueryAdmissionHandle>(*this, slot_id);
+	auto request = make_uniq<QueryAdmissionHandle>(*this, metadata, max_active, next_ticket++, TimestampNs(), debug_enabled);
+	if (waiters.empty() && active.size() < max_active) {
+		AdmitRequest(*request);
+		return request;
 	}
 
-	Waiter waiter(metadata, max_active, next_ticket++, TimestampNs(), debug_enabled);
-	waiters.push_back(&waiter);
-	auto remove_waiter = [&]() {
-		if (waiter.admitted) {
-			return;
-		}
-		for (auto entry = waiters.begin(); entry != waiters.end(); entry++) {
-			if (*entry == &waiter) {
-				waiters.erase(entry);
-				break;
-			}
-		}
-		for (auto *pending : waiters) {
-			pending->cv.notify_one();
-			break;
-		}
-	};
-	struct WaiterCleanup {
-		decltype(remove_waiter) &cleanup;
-		~WaiterCleanup() {
-			cleanup();
-		}
-	} waiter_cleanup {remove_waiter};
-	LogEventLocked(waiter.metadata, "queued", waiter.ticket, 0, waiter.max_active, waiter.queued_ns, 0, 0,
-	               waiter.debug_enabled);
-	while (!waiter.admitted) {
-		if (CanAdmit(waiter)) {
-			AdmitWaiter(waiter);
-			break;
-		}
-		waiter.cv.wait(guard);
-	}
-	for (auto *pending : waiters) {
-		pending->cv.notify_one();
-		break;
-	}
-	return make_uniq<QueryAdmissionHandle>(*this, waiter.slot_id);
+	waiters.push_back(request.get());
+	LogEventLocked(request->metadata, "queued", request->ticket, 0, request->max_active, request->queued_ns, 0, 0,
+	               request->debug_enabled);
+	return request;
 }
 
-void QueryAdmissionController::Release(idx_t slot_id) {
-	lock_guard<mutex> guard(admission_lock);
+unique_ptr<QueryAdmissionHandle> QueryAdmissionController::Acquire(ClientContext &context,
+                                                                   const QueryRequestMetadata &metadata,
+                                                                   idx_t max_active) {
+	auto request = EnqueueOrAcquire(context, metadata, max_active);
+	if (request) {
+		request->Wait();
+	}
+	return request;
+}
+
+void QueryAdmissionController::ReleaseLocked(idx_t slot_id) {
 	auto entry = active.find(slot_id);
 	if (entry == active.end()) {
 		return;
@@ -184,9 +142,50 @@ void QueryAdmissionController::Release(idx_t slot_id) {
 	LogEventLocked(active_entry.metadata, "released", active_entry.ticket, active_entry.slot_id,
 	               active_entry.max_active, active_entry.queued_ns, active_entry.admitted_ns, released_ns,
 	               active_entry.debug_enabled);
-	for (auto *waiter : waiters) {
-		waiter->cv.notify_one();
-		break;
+	TryAdmitWaiters();
+}
+
+void QueryAdmissionController::TryAdmitWaiters() {
+	while (!waiters.empty()) {
+		auto *request = waiters.front();
+		if (active.size() >= request->max_active) {
+			break;
+		}
+		waiters.pop_front();
+		AdmitRequest(*request);
+	}
+}
+
+void QueryAdmissionController::CancelOrRelease(QueryAdmissionHandle &request) {
+	unique_lock<mutex> guard(admission_lock);
+	if (request.cancelled) {
+		return;
+	}
+	request.cancelled = true;
+	if (request.admitted) {
+		auto slot_id = request.slot_id;
+		request.controller = nullptr;
+		request.cv.notify_all();
+		ReleaseLocked(slot_id);
+		return;
+	}
+	for (auto entry = waiters.begin(); entry != waiters.end(); entry++) {
+		if (*entry == &request) {
+			waiters.erase(entry);
+			LogEventLocked(request.metadata, "cancelled", request.ticket, 0, request.max_active, request.queued_ns, 0, 0,
+			               request.debug_enabled);
+			break;
+		}
+	}
+	request.controller = nullptr;
+	request.cv.notify_all();
+	TryAdmitWaiters();
+}
+
+void QueryAdmissionController::Wait(QueryAdmissionHandle &request) {
+	unique_lock<mutex> guard(admission_lock);
+	while (!request.admitted && !request.cancelled) {
+		request.cv.wait(guard);
 	}
 }
 
@@ -210,8 +209,8 @@ vector<QueryAdmissionSnapshot> QueryAdmissionController::GetSnapshot() const {
 		snapshot.admitted_ns = active_entry.admitted_ns;
 		result.push_back(std::move(snapshot));
 	}
-	for (auto *waiter : waiters) {
-		const auto &metadata = waiter->metadata;
+	for (auto *request : waiters) {
+		const auto &metadata = request->metadata;
 		QueryAdmissionSnapshot snapshot;
 		snapshot.state = "waiting";
 		snapshot.slot_id = 0;
@@ -221,7 +220,7 @@ vector<QueryAdmissionSnapshot> QueryAdmissionController::GetSnapshot() const {
 		snapshot.scale_factor = metadata.scale_factor;
 		snapshot.sla_tag = metadata.sla_tag;
 		snapshot.deadline_ns = metadata.deadline_ns;
-		snapshot.queued_ns = waiter->queued_ns;
+		snapshot.queued_ns = request->queued_ns;
 		snapshot.admitted_ns = 0;
 		result.push_back(std::move(snapshot));
 	}

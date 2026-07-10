@@ -89,6 +89,7 @@ duckdb_pending_state duckdb_pending_execute_check_state(duckdb_pending_result pe
 	case PendingExecutionResult::RESULT_READY:
 		return DUCKDB_PENDING_RESULT_READY;
 	case PendingExecutionResult::NO_TASKS_AVAILABLE:
+	case PendingExecutionResult::WAITING_FOR_ADMISSION:
 		return DUCKDB_PENDING_NO_TASKS_AVAILABLE;
 	case PendingExecutionResult::RESULT_NOT_READY:
 		return DUCKDB_PENDING_RESULT_NOT_READY;
@@ -121,6 +122,7 @@ duckdb_pending_state duckdb_pending_execute_task(duckdb_pending_result pending_r
 		return DUCKDB_PENDING_RESULT_READY;
 	case PendingExecutionResult::BLOCKED:
 	case PendingExecutionResult::NO_TASKS_AVAILABLE:
+	case PendingExecutionResult::WAITING_FOR_ADMISSION:
 		return DUCKDB_PENDING_NO_TASKS_AVAILABLE;
 	case PendingExecutionResult::RESULT_NOT_READY:
 		return DUCKDB_PENDING_RESULT_NOT_READY;
