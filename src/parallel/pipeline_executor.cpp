@@ -16,7 +16,7 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
     : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p) {
 	D_ASSERT(pipeline.source_state);
 	const auto &config = ClientConfig::GetConfig(context_p);
-	collect_source_throughput = config.pipeline_profiling.throughput;
+	collect_source_throughput = config.pipeline_profiling.throughput || pipeline.SourceWorkTrackingEnabled();
 	collect_pipeline_input = EnergyAttributionManager::Enabled(context_p) || config.pipeline_profiling.task_trace ||
 	                         config.pipeline_profiling.throughput;
 	if (pipeline.sink) {
@@ -493,6 +493,10 @@ void PipelineExecutor::SetTaskForInterrupts(weak_ptr<Task> current_task) {
 void PipelineExecutor::ResetSourceThroughputCounters() {
 	if (collect_source_throughput) {
 		source_throughput_counters = SourceThroughputCounters();
+		published_source_rows = 0;
+		published_source_chunks_equiv = 0;
+		published_source_native_units = 0;
+		published_source_work_units = 0;
 	}
 	if (collect_pipeline_input) {
 		pipeline_input_counters = PipelineInputCounters();
@@ -505,6 +509,43 @@ const SourceThroughputCounters &PipelineExecutor::GetSourceThroughputCounters() 
 
 const PipelineInputCounters &PipelineExecutor::GetPipelineInputCounters() const {
 	return pipeline_input_counters;
+}
+
+void PipelineExecutor::PublishSourceWorkProgress() {
+	if (!pipeline.SourceWorkTrackingEnabled() ||
+	    (!source_throughput_counters.reported && !source_throughput_counters.work_reported)) {
+		return;
+	}
+	if (source_throughput_counters.work_reported) {
+		auto work_units = source_throughput_counters.work_units_touched;
+		if (work_units < published_source_work_units) {
+			published_source_work_units = 0;
+		}
+		auto delta_work_units = work_units - published_source_work_units;
+		if (delta_work_units != 0) {
+			pipeline.RecordSourceWorkProgress(0, delta_work_units, delta_work_units);
+			published_source_work_units = work_units;
+		}
+		return;
+	}
+	auto rows = source_throughput_counters.tuples_touched;
+	auto chunks = source_throughput_counters.chunks_touched;
+	auto native_units = source_throughput_counters.native_units_touched;
+	if (rows < published_source_rows || chunks < published_source_chunks_equiv ||
+	    native_units < published_source_native_units) {
+		published_source_rows = 0;
+		published_source_chunks_equiv = 0;
+		published_source_native_units = 0;
+	}
+	auto delta_rows = rows - published_source_rows;
+	auto delta_chunks = chunks - published_source_chunks_equiv;
+	auto delta_native_units = native_units - published_source_native_units;
+	if (delta_rows != 0 || delta_chunks != 0 || delta_native_units != 0) {
+		pipeline.RecordSourceWorkProgress(delta_rows, delta_chunks, delta_native_units);
+		published_source_rows = rows;
+		published_source_chunks_equiv = chunks;
+		published_source_native_units = native_units;
+	}
 }
 
 SourceResultType PipelineExecutor::GetData(DataChunk &chunk, OperatorSourceInput &input) {
@@ -552,6 +593,9 @@ SourceResultType PipelineExecutor::FetchFromSource(DataChunk &result) {
 	OperatorSourceInput source_input {*pipeline.source_state, *local_source_state, interrupt_state,
 	                                  collect_source_throughput ? &source_throughput_counters : nullptr};
 	auto res = GetData(result, source_input);
+	if (collect_source_throughput) {
+		PublishSourceWorkProgress();
+	}
 	if (collect_pipeline_input && result.size() > 0) {
 		pipeline_input_counters.tuples += result.size();
 		pipeline_input_counters.chunks++;

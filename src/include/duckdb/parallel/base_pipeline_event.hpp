@@ -22,6 +22,21 @@ public:
 	void PrintPipeline() override {
 		pipeline->Print();
 	}
+	bool GetPipelineWorkSnapshot(PipelineWorkSnapshot &snapshot) const override {
+		if (!pipeline) {
+			return false;
+		}
+		if (GetQueryActivationKind() != QueryActivationEventKind::PIPELINE) {
+			snapshot = PipelineWorkSnapshot();
+			snapshot.pipeline_id = pipeline->GetProfilerPipelineId();
+			snapshot.source_input_kind = "lifecycle";
+			snapshot.source_input_confidence = "exact";
+			snapshot.valid = true;
+			snapshot.scalable = false;
+			return true;
+		}
+		return pipeline->GetWorkSnapshot(snapshot);
+	}
 
 	//! The pipeline that this event belongs to
 	shared_ptr<Pipeline> pipeline;

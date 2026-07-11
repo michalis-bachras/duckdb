@@ -18,6 +18,7 @@
 namespace duckdb {
 
 class Executor;
+struct PipelineWorkSnapshot;
 
 struct QueryActivationEventSnapshot {
 	uint64_t db_query_id = 0;
@@ -38,6 +39,7 @@ public:
 
 	shared_ptr<Event> OnEventReady(shared_ptr<Event> event);
 	shared_ptr<Event> OnEventFinished(Event &event);
+	bool GetActivePipelineWorkSnapshot(PipelineWorkSnapshot &snapshot);
 
 	static vector<QueryActivationEventSnapshot> GetDebugSnapshot();
 	static void ClearDebugSnapshot();
@@ -63,6 +65,7 @@ private:
 	mutex scheduler_lock;
 	idx_t active_group_id = 0;
 	idx_t active_event_count = 0;
+	weak_ptr<Event> active_event;
 	std::deque<idx_t> deferred_group_order;
 	std::unordered_map<idx_t, std::deque<shared_ptr<Event>>> deferred_events_by_group;
 };

@@ -109,6 +109,10 @@ private:
 	//! Per-task source-side tuples touched by this pipeline executor.
 	SourceThroughputCounters source_throughput_counters;
 	PipelineInputCounters pipeline_input_counters;
+	idx_t published_source_rows = 0;
+	idx_t published_source_chunks_equiv = 0;
+	idx_t published_source_native_units = 0;
+	idx_t published_source_work_units = 0;
 	bool collect_source_throughput = false;
 	bool collect_pipeline_input = false;
 
@@ -151,6 +155,7 @@ private:
 	//! Reset the operator index to the first operator
 	void GoToSource(idx_t &current_idx, idx_t initial_idx);
 	SourceResultType FetchFromSource(DataChunk &result);
+	void PublishSourceWorkProgress();
 
 	void FinishProcessing(int32_t operator_idx = -1);
 	bool IsFinished();

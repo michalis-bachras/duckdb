@@ -16,6 +16,7 @@
 namespace duckdb {
 class Executor;
 class Task;
+struct PipelineWorkSnapshot;
 
 enum class QueryActivationEventKind : uint8_t {
 	UNREGISTERED = 0,
@@ -92,6 +93,9 @@ public:
 	}
 
 	virtual void PrintPipeline() {
+	}
+	virtual bool GetPipelineWorkSnapshot(PipelineWorkSnapshot &) const {
+		return false;
 	}
 
 	ClientContext &GetClientContext();

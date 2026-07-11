@@ -211,6 +211,18 @@ struct OperatorSourceInput {
 		ReportSourceOutputChunk(chunk, SourceThroughputKindToString(kind), confidence, adaptive_candidate, native_unit);
 	}
 
+	void ReportSourceWorkUnits(idx_t work_units, const string &kind, const string &confidence,
+	                           const string &work_unit = string()) {
+		if (source_throughput) {
+			source_throughput->AddWorkUnits(work_units, kind, confidence, work_unit);
+		}
+	}
+
+	void ReportSourceWorkUnits(idx_t work_units, SourceThroughputKind kind, const string &confidence,
+	                           const string &work_unit = string()) {
+		ReportSourceWorkUnits(work_units, SourceThroughputKindToString(kind), confidence, work_unit);
+	}
+
 	void ReportSourceControl(const string &kind, const string &confidence, const string &native_unit = "none") {
 		ReportSourceTuplesTouched(0, kind, confidence, false, 0, 0, native_unit);
 	}

@@ -55,6 +55,11 @@ struct SourceThroughputCounters {
 	string native_unit;
 	bool adaptive_morsel_candidate = false;
 	bool reported = false;
+	string work_kind = "unknown";
+	string work_confidence = "unknown";
+	idx_t work_units_touched = 0;
+	string work_unit;
+	bool work_reported = false;
 
 	static idx_t EstimateStandardChunks(idx_t tuples);
 
@@ -62,9 +67,16 @@ struct SourceThroughputCounters {
 	               idx_t chunks = 0, idx_t native_units = 0, const string &native_unit_p = string());
 	void AddTuples(idx_t tuples, SourceThroughputKind kind, const string &confidence, bool adaptive_candidate,
 	               idx_t chunks = 0, idx_t native_units = 0, const string &native_unit_p = string());
+	void AddWorkUnits(idx_t work_units, const string &kind, const string &confidence,
+	                  const string &work_unit_p = string());
+	void AddWorkUnits(idx_t work_units, SourceThroughputKind kind, const string &confidence,
+	                  const string &work_unit_p = string());
 };
 
 struct SourceThroughputEstimate {
+	// This EWMA is intentionally tuple-based. Scheduler ETA should not consume it directly when live remaining work is
+	// expressed in native chunk-equivalent units such as hash_table_chunk, sort_partition or aggregate_partition_phase.
+	// For that model, derive a rate from planned_input_chunks_equiv and task runtime in the query request profile store.
 	double estimated_tuples_per_task_s = 0;
 	double last_task_tuples_per_s = 0;
 	double alpha = 0.8;

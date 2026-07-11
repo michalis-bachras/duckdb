@@ -102,6 +102,7 @@ void QueryActivationScheduler::MarkScheduledLocked(Event &event) {
 		active_group_id = group_id;
 	}
 	D_ASSERT(active_group_id == group_id);
+	active_event = event.shared_from_this();
 	active_event_count++;
 }
 
@@ -111,6 +112,10 @@ void QueryActivationScheduler::MarkFinishedLocked(Event &event) {
 	}
 	if (active_event_count > 0) {
 		active_event_count--;
+	}
+	auto current_event = active_event.lock();
+	if (current_event && current_event.get() == &event) {
+		active_event.reset();
 	}
 }
 
@@ -234,6 +239,15 @@ void QueryActivationScheduler::ClearDebugSnapshot() {
 	auto &store = GetDebugStore();
 	lock_guard<mutex> guard(store.lock);
 	store.events.clear();
+}
+
+bool QueryActivationScheduler::GetActivePipelineWorkSnapshot(PipelineWorkSnapshot &snapshot) {
+	lock_guard<mutex> guard(scheduler_lock);
+	auto event = active_event.lock();
+	if (!event) {
+		return false;
+	}
+	return event->GetPipelineWorkSnapshot(snapshot);
 }
 
 } // namespace duckdb

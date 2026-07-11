@@ -26,6 +26,24 @@ class MetaPipeline;
 class PipelineExecutor;
 class Pipeline;
 
+struct PipelineWorkSnapshot {
+	idx_t pipeline_id = 0;
+	string source_input_kind;
+	string source_input_confidence;
+	idx_t total_rows = 0;
+	idx_t total_chunks_equiv = 0;
+	idx_t total_native_units = 0;
+	string native_unit;
+	idx_t completed_rows = 0;
+	idx_t completed_chunks_equiv = 0;
+	idx_t completed_native_units = 0;
+	idx_t remaining_chunks_equiv = 0;
+	idx_t source_max_threads = 0;
+	idx_t effective_max_threads = 0;
+	bool scalable = false;
+	bool valid = false;
+};
+
 class PipelineTask : public ExecutorTask {
 	static constexpr const idx_t PARTIAL_CHUNK_COUNT = 50;
 
@@ -130,6 +148,9 @@ public:
 	idx_t RecordProfilerTaskStart(uint64_t thread_id, int start_cpu);
 	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                           idx_t pipeline_input_tuples, idx_t pipeline_input_chunks, uint64_t task_duration_ns);
+	bool SourceWorkTrackingEnabled() const;
+	void RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units);
+	bool GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const;
 
 	//! Registers a new batch index for a pipeline executor - returns the current minimum batch index
 	idx_t RegisterNewBatchIndex();
@@ -142,6 +163,10 @@ private:
 	void RecordProfilerStart(idx_t task_count, idx_t source_max_threads, const SourceInputVolume &source_input_volume);
 	void RecordProfilerTasksDone();
 	void RecordProfilerFinishDone();
+	void InitializeSourceWorkTracking(const SourceInputVolume &source_input_volume, idx_t source_max_threads,
+	                                  idx_t effective_max_threads);
+	void ResetSourceWorkTracking();
+	bool ShouldRecordSourceWorkDebugSample(idx_t completed_chunks_equiv);
 
 private:
 	//! Whether or not the pipeline has been readied
@@ -180,6 +205,26 @@ private:
 	//! Lock and state for per-pipeline online source-throughput estimation.
 	mutex source_throughput_lock;
 	SourceThroughputEstimator source_throughput_estimator;
+	//! Lightweight live source-work state for scheduler epochs. Completed counters are updated by workers.
+	mutable mutex source_work_lock;
+	atomic<bool> source_work_tracking_enabled {false};
+	bool source_work_valid = false;
+	string source_work_kind;
+	string source_work_confidence;
+	string source_work_native_unit;
+	idx_t source_work_total_rows = 0;
+	idx_t source_work_total_chunks_equiv = 0;
+	idx_t source_work_total_native_units = 0;
+	idx_t source_work_source_max_threads = 0;
+	idx_t source_work_effective_max_threads = 0;
+	bool source_work_scalable = false;
+	atomic<idx_t> source_work_completed_rows {0};
+	atomic<idx_t> source_work_completed_chunks_equiv {0};
+	atomic<idx_t> source_work_completed_native_units {0};
+	atomic<bool> source_work_debug_sampling_enabled {false};
+	atomic<idx_t> source_work_debug_sample_step_chunks_equiv {0};
+	atomic<idx_t> source_work_debug_next_sample_chunks_equiv {0};
+	atomic<idx_t> source_work_debug_total_chunks_equiv {0};
 
 private:
 	void ScheduleSequentialTask(shared_ptr<Event> &event);

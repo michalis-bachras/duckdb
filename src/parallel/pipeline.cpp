@@ -53,6 +53,19 @@ static bool PipelineTaskProfilingRequested(Pipeline &pipeline) {
 	return settings.task_trace || settings.throughput;
 }
 
+static idx_t SourceInputChunksEquiv(const SourceInputVolume &source_input_volume) {
+	if (source_input_volume.chunks_equiv > 0) {
+		return source_input_volume.chunks_equiv;
+	}
+	if (source_input_volume.rows > 0) {
+		return SourceThroughputCounters::EstimateStandardChunks(source_input_volume.rows);
+	}
+	if (source_input_volume.native_units > 0) {
+		return source_input_volume.native_units;
+	}
+	return 0;
+}
+
 PipelineTask::PipelineTask(Pipeline &pipeline_p, shared_ptr<Event> event_p)
     : ExecutorTask(pipeline_p.executor, std::move(event_p)), pipeline(pipeline_p) {
 }
@@ -178,11 +191,142 @@ bool Pipeline::GetProgress(ProgressData &progress) {
 	return progress.IsValid();
 }
 
+void Pipeline::ResetSourceWorkTracking() {
+	source_work_tracking_enabled.store(false);
+	source_work_debug_sampling_enabled.store(false);
+	lock_guard<mutex> guard(source_work_lock);
+	source_work_valid = false;
+	source_work_kind.clear();
+	source_work_confidence.clear();
+	source_work_native_unit.clear();
+	source_work_total_rows = 0;
+	source_work_total_chunks_equiv = 0;
+	source_work_total_native_units = 0;
+	source_work_source_max_threads = 0;
+	source_work_effective_max_threads = 0;
+	source_work_scalable = false;
+	source_work_completed_rows.store(0);
+	source_work_completed_chunks_equiv.store(0);
+	source_work_completed_native_units.store(0);
+	source_work_debug_sample_step_chunks_equiv.store(0);
+	source_work_debug_next_sample_chunks_equiv.store(0);
+	source_work_debug_total_chunks_equiv.store(0);
+}
+
+void Pipeline::InitializeSourceWorkTracking(const SourceInputVolume &source_input_volume, idx_t source_max_threads,
+                                            idx_t effective_max_threads) {
+	auto tracking_enabled = executor.activation_scheduler != nullptr;
+	// Live scheduler progress is tracked in chunk-equivalent work units. For many sources this is a native physical
+	// unit (e.g. hash_table_chunk, sort_partition, aggregate_partition_phase), not necessarily a STANDARD_VECTOR_SIZE
+	// row chunk. Historical scheduler rates must therefore be derived in this same chunks_equiv unit.
+	auto total_chunks_equiv = SourceInputChunksEquiv(source_input_volume);
+	auto debug_sampling_enabled =
+	    tracking_enabled && total_chunks_equiv > 0 && QueryPipelineDebug::Enabled(GetClientContext());
+	auto debug_sample_step = debug_sampling_enabled ? MaxValue<idx_t>(idx_t(1), total_chunks_equiv / 10) : idx_t(0);
+	{
+		lock_guard<mutex> guard(source_work_lock);
+		source_work_valid = tracking_enabled;
+		source_work_kind = source_input_volume.kind;
+		source_work_confidence = source_input_volume.confidence;
+		source_work_native_unit = source_input_volume.native_unit;
+		source_work_total_rows = source_input_volume.rows;
+		source_work_total_chunks_equiv = total_chunks_equiv;
+		source_work_total_native_units = source_input_volume.native_units;
+		source_work_source_max_threads = source_max_threads;
+		source_work_effective_max_threads = effective_max_threads;
+		source_work_scalable = source_work_total_chunks_equiv > 0 && effective_max_threads > 1;
+		source_work_completed_rows.store(0);
+		source_work_completed_chunks_equiv.store(0);
+		source_work_completed_native_units.store(0);
+		source_work_debug_sample_step_chunks_equiv.store(debug_sample_step);
+		source_work_debug_next_sample_chunks_equiv.store(debug_sample_step);
+		source_work_debug_total_chunks_equiv.store(total_chunks_equiv);
+	}
+	source_work_tracking_enabled.store(tracking_enabled);
+	source_work_debug_sampling_enabled.store(debug_sampling_enabled);
+}
+
+bool Pipeline::SourceWorkTrackingEnabled() const {
+	return source_work_tracking_enabled.load();
+}
+
+void Pipeline::RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units) {
+	if (!SourceWorkTrackingEnabled()) {
+		return;
+	}
+	if (chunks_equiv == 0 && rows > 0) {
+		chunks_equiv = SourceThroughputCounters::EstimateStandardChunks(rows);
+	}
+	if (rows > 0) {
+		source_work_completed_rows.fetch_add(rows);
+	}
+	idx_t completed_chunks_equiv = 0;
+	if (chunks_equiv > 0) {
+		completed_chunks_equiv = source_work_completed_chunks_equiv.fetch_add(chunks_equiv) + chunks_equiv;
+	}
+	if (native_units > 0) {
+		source_work_completed_native_units.fetch_add(native_units);
+	}
+	if (completed_chunks_equiv > 0 && ShouldRecordSourceWorkDebugSample(completed_chunks_equiv)) {
+		QueryPipelineDebug::RecordWorkProgress(*this);
+	}
+}
+
+bool Pipeline::ShouldRecordSourceWorkDebugSample(idx_t completed_chunks_equiv) {
+	if (!source_work_debug_sampling_enabled.load()) {
+		return false;
+	}
+	auto sample_step = source_work_debug_sample_step_chunks_equiv.load();
+	auto total_chunks_equiv = source_work_debug_total_chunks_equiv.load();
+	if (sample_step == 0 || total_chunks_equiv == 0) {
+		return false;
+	}
+	auto next_sample = source_work_debug_next_sample_chunks_equiv.load();
+	while (next_sample > 0 && completed_chunks_equiv >= next_sample) {
+		auto new_next_sample = next_sample + sample_step;
+		if (new_next_sample >= total_chunks_equiv) {
+			new_next_sample = 0;
+		}
+		if (source_work_debug_next_sample_chunks_equiv.compare_exchange_weak(next_sample, new_next_sample)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool Pipeline::GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const {
+	lock_guard<mutex> guard(source_work_lock);
+	if (!source_work_valid) {
+		return false;
+	}
+	snapshot = PipelineWorkSnapshot();
+	snapshot.valid = true;
+	snapshot.pipeline_id = profiler_pipeline_id;
+	snapshot.source_input_kind = source_work_kind;
+	snapshot.source_input_confidence = source_work_confidence;
+	snapshot.total_rows = source_work_total_rows;
+	snapshot.total_chunks_equiv = source_work_total_chunks_equiv;
+	snapshot.total_native_units = source_work_total_native_units;
+	snapshot.native_unit = source_work_native_unit;
+	snapshot.completed_rows = source_work_completed_rows.load();
+	snapshot.completed_chunks_equiv = source_work_completed_chunks_equiv.load();
+	snapshot.completed_native_units = source_work_completed_native_units.load();
+	snapshot.remaining_chunks_equiv =
+	    snapshot.completed_chunks_equiv >= snapshot.total_chunks_equiv
+	        ? 0
+	        : snapshot.total_chunks_equiv - snapshot.completed_chunks_equiv;
+	snapshot.source_max_threads = source_work_source_max_threads;
+	snapshot.effective_max_threads = source_work_effective_max_threads;
+	snapshot.scalable = source_work_scalable;
+	return true;
+}
+
 void Pipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelineTask>(*this, event));
 	auto source_max_threads = source_state ? source_state->MaxThreads() : 0;
 	auto source_input_volume = source_state ? source_state->GetSourceInputVolume() : SourceInputVolume();
+	InitializeSourceWorkTracking(source_input_volume, source_max_threads, 1);
 	RecordProfilerStart(tasks.size(), source_max_threads, source_input_volume);
 	event->SetTasks(std::move(tasks));
 }
@@ -298,6 +442,7 @@ bool Pipeline::LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads) {
 	}
 	auto source_max_threads = source_state ? source_state->MaxThreads() : 0;
 	auto source_input_volume = source_state ? source_state->GetSourceInputVolume() : SourceInputVolume();
+	InitializeSourceWorkTracking(source_input_volume, source_max_threads, max_threads);
 	RecordProfilerStart(tasks.size(), source_max_threads, source_input_volume);
 	event->SetTasks(std::move(tasks));
 	return true;
@@ -333,6 +478,7 @@ void Pipeline::Reset() {
 		lock_guard<mutex> guard(source_throughput_lock);
 		source_throughput_estimator.Reset();
 	}
+	ResetSourceWorkTracking();
 	ResetSink();
 	for (auto &op_ref : operators) {
 		auto &op = op_ref.get();

@@ -190,6 +190,27 @@ void SourceThroughputCounters::AddTuples(idx_t tuples, SourceThroughputKind kind
 	          native_unit_p);
 }
 
+void SourceThroughputCounters::AddWorkUnits(idx_t work_units, const string &kind, const string &confidence,
+                                            const string &work_unit_p) {
+	if (!work_reported || work_kind == "unknown") {
+		work_kind = kind;
+		work_confidence = confidence;
+		work_unit = work_unit_p;
+	} else if (work_kind != kind) {
+		work_kind = SourceThroughputKindToString(SourceThroughputKind::MIXED_SOURCE_TUPLES);
+		work_confidence = "estimate";
+	} else if (work_confidence != confidence && work_confidence != "estimate") {
+		work_confidence = "estimate";
+	}
+	work_units_touched += work_units;
+	work_reported = true;
+}
+
+void SourceThroughputCounters::AddWorkUnits(idx_t work_units, SourceThroughputKind kind, const string &confidence,
+                                            const string &work_unit_p) {
+	AddWorkUnits(work_units, SourceThroughputKindToString(kind), confidence, work_unit_p);
+}
+
 double SourceTuplesPerTaskSecond(idx_t tuples, uint64_t duration_ns) {
 	if (duration_ns == 0) {
 		return 0;
