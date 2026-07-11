@@ -692,18 +692,11 @@ idx_t RadixPartitionedHashTable::MaxThreads(GlobalSinkState &sink_p) const {
 SourceInputVolume RadixPartitionedHashTable::GetSourceInputVolume(GlobalSinkState &sink_p) const {
 	auto &sink = sink_p.Cast<RadixHTGlobalSinkState>();
 	SourceInputVolume volume;
-	volume.kind = "hash_aggregate_groups";
+	volume.kind = SourceThroughputKindToString(SourceThroughputKind::PARTITIONED_AGGREGATE_GROUPS);
 	volume.confidence = "exact";
-	volume.native_unit = "aggregate_partition";
-	volume.native_units = sink.partitions.size();
-
-	for (auto &partition : sink.partitions) {
-		if (!partition || !partition->data) {
-			continue;
-		}
-		volume.rows += partition->data->Count();
-		volume.chunks_equiv += partition->data->ChunkCount();
-	}
+	volume.native_unit = "aggregate_partition_phase";
+	volume.native_units = 3 * sink.partitions.size();
+	volume.chunks_equiv = volume.native_units;
 	return volume;
 }
 
@@ -746,14 +739,16 @@ public:
 
 public:
 	//! Do the work this thread has been assigned
-	void ExecuteTask(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate, DataChunk &chunk);
+	void ExecuteTask(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate, DataChunk &chunk,
+	                 OperatorSourceInput &input);
 	//! Whether this thread has finished the work it has been assigned
 	bool TaskFinished();
 
 private:
 	//! Execute the finalize or scan task
-	void Finalize(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate);
-	void Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate, DataChunk &chunk);
+	void Finalize(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate, OperatorSourceInput &input);
+	void Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate, DataChunk &chunk,
+	          OperatorSourceInput &input);
 
 public:
 	//! Current task and index
@@ -834,21 +829,22 @@ RadixHTLocalSourceState::RadixHTLocalSourceState(ExecutionContext &context, cons
 }
 
 void RadixHTLocalSourceState::ExecuteTask(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate,
-                                          DataChunk &chunk) {
+                                          DataChunk &chunk, OperatorSourceInput &input) {
 	D_ASSERT(task != RadixHTSourceTaskType::NO_TASK);
 	switch (task) {
 	case RadixHTSourceTaskType::FINALIZE:
-		Finalize(sink, gstate);
+		Finalize(sink, gstate, input);
 		break;
 	case RadixHTSourceTaskType::SCAN:
-		Scan(sink, gstate, chunk);
+		Scan(sink, gstate, chunk, input);
 		break;
 	default:
 		throw InternalException("Unexpected RadixHTSourceTaskType in ExecuteTask!");
 	}
 }
 
-void RadixHTLocalSourceState::Finalize(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate) {
+void RadixHTLocalSourceState::Finalize(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate,
+                                       OperatorSourceInput &input) {
 	D_ASSERT(task == RadixHTSourceTaskType::FINALIZE);
 	D_ASSERT(scan_status != RadixHTScanStatus::IN_PROGRESS);
 	auto &partition = *sink.partitions[task_idx];
@@ -896,16 +892,21 @@ void RadixHTLocalSourceState::Finalize(RadixHTGlobalSinkState &sink, RadixHTGlob
 	}
 
 	// Update partition state
-	auto partition_guard = partition.Lock();
-	partition.state = AggregatePartitionState::READY_TO_SCAN;
-	partition.UnblockTasks(partition_guard);
+	{
+		auto partition_guard = partition.Lock();
+		partition.state = AggregatePartitionState::READY_TO_SCAN;
+		partition.UnblockTasks(partition_guard);
+	}
+	input.ReportSourceWorkUnits(2, SourceThroughputKind::PARTITIONED_AGGREGATE_GROUPS, "exact",
+	                            "aggregate_partition_phase");
 
 	// This thread will scan the partition
 	task = RadixHTSourceTaskType::SCAN;
 	scan_status = RadixHTScanStatus::INIT;
 }
 
-void RadixHTLocalSourceState::Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate, DataChunk &chunk) {
+void RadixHTLocalSourceState::Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSourceState &gstate, DataChunk &chunk,
+                                   OperatorSourceInput &input) {
 	D_ASSERT(task == RadixHTSourceTaskType::SCAN);
 	D_ASSERT(scan_status != RadixHTScanStatus::DONE);
 
@@ -923,10 +924,14 @@ void RadixHTLocalSourceState::Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSo
 			data_collection.Reset();
 		}
 		scan_status = RadixHTScanStatus::DONE;
-		auto guard = sink.Lock();
-		if (++gstate.task_done == sink.partitions.size()) {
-			gstate.finished = true;
+		{
+			auto guard = sink.Lock();
+			if (++gstate.task_done == sink.partitions.size()) {
+				gstate.finished = true;
+			}
 		}
+		input.ReportSourceWorkUnits(1, SourceThroughputKind::PARTITIONED_AGGREGATE_GROUPS, "exact",
+		                            "aggregate_partition_phase");
 		return;
 	}
 
@@ -1029,7 +1034,7 @@ SourceResultType RadixPartitionedHashTable::GetData(ExecutionContext &context, D
 				return res;
 			}
 		}
-		lstate.ExecuteTask(sink, gstate, chunk);
+		lstate.ExecuteTask(sink, gstate, chunk, input);
 	}
 
 	if (chunk.size() != 0) {

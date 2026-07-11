@@ -384,7 +384,7 @@ public:
 		volume.rows = merger.total_count;
 		volume.chunks_equiv =
 		    merger.total_count == 0 ? 0 : (merger.total_count + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
-		volume.native_units = merger_global_state ? merger_global_state->MaxThreads() : 1;
+		volume.native_units = merger_global_state ? merger_global_state->MaxThreads() : 0;
 		volume.native_unit = "sort_partition";
 		return volume;
 	}

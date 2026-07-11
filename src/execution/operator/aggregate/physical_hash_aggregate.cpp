@@ -837,9 +837,6 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = "hash_aggregate_groups";
-		volume.confidence = "exact";
-		volume.native_unit = "aggregate_partition";
 		if (op.groupings.empty()) {
 			return volume;
 		}
@@ -849,6 +846,17 @@ public:
 			auto &grouping = op.groupings[sidx];
 			auto &grouping_gstate = ht_state.grouping_states[sidx];
 			auto grouping_volume = grouping.table_data.GetSourceInputVolume(*grouping_gstate.table_state);
+			if (volume.kind == "unknown") {
+				volume.kind = grouping_volume.kind;
+				volume.confidence = grouping_volume.confidence;
+				volume.native_unit = grouping_volume.native_unit;
+			} else if (volume.kind != grouping_volume.kind) {
+				volume.kind = SourceThroughputKindToString(SourceThroughputKind::MIXED_SOURCE_TUPLES);
+				volume.confidence = "estimate";
+				volume.native_unit = string();
+			} else if (volume.confidence != grouping_volume.confidence && volume.confidence != "estimate") {
+				volume.confidence = "estimate";
+			}
 			volume.rows += grouping_volume.rows;
 			volume.chunks_equiv += grouping_volume.chunks_equiv;
 			volume.native_units += grouping_volume.native_units;
@@ -898,7 +906,7 @@ SourceResultType PhysicalHashAggregate::GetDataInternal(ExecutionContext &contex
 		auto &grouping_gstate = sink_gstate.grouping_states[radix_idx];
 
 		OperatorSourceInput source_input {*gstate.radix_states[radix_idx], *lstate.radix_states[radix_idx],
-		                                  input.interrupt_state};
+		                                  input.interrupt_state, input.source_throughput};
 		auto res = radix_table.GetData(context, chunk, *grouping_gstate.table_state, source_input);
 		if (res == SourceResultType::BLOCKED) {
 			return res;

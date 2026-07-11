@@ -447,6 +447,8 @@ public:
 	idx_t CurrentPartitionCount() const;
 	//! How many partitions are fully done
 	idx_t FinishedPartitionCount() const;
+	//! Get row/chunk work remaining in partitions that have not yet been moved into the active HT collection
+	void GetRemainingPartitionWork(idx_t &rows, idx_t &chunks) const;
 	//! Partition this HT
 	void Repartition(JoinHashTable &global_ht);
 

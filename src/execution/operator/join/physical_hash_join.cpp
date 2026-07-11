@@ -1167,11 +1167,17 @@ public:
 		D_ASSERT(op.sink_state);
 		auto &gstate = op.sink_state->Cast<HashJoinGlobalSinkState>();
 		if (!gstate.probe_spill && PropagatesBuildSide(op.join_type)) {
-			auto &data_collection = gstate.hash_table->GetDataCollection();
+			auto &hash_table = *gstate.hash_table;
+			auto &data_collection = hash_table.GetDataCollection();
+			idx_t remaining_partition_rows = 0;
+			idx_t remaining_partition_chunks = 0;
+			if (gstate.external) {
+				hash_table.GetRemainingPartitionWork(remaining_partition_rows, remaining_partition_chunks);
+			}
 			volume.kind = SourceThroughputKindToString(SourceThroughputKind::HASH_JOIN_BUILD_ROWS);
 			volume.confidence = "exact";
-			volume.rows = gstate.hash_table->Count();
-			volume.chunks_equiv = data_collection.ChunkCount();
+			volume.rows = data_collection.Count() + remaining_partition_rows;
+			volume.chunks_equiv = data_collection.ChunkCount() + remaining_partition_chunks;
 			volume.native_units = volume.chunks_equiv;
 			volume.native_unit = "hash_table_chunk";
 			return volume;
@@ -1548,6 +1554,7 @@ void HashJoinLocalSourceState::ExternalScanHT(HashJoinGlobalSinkState &sink, Has
                                               DataChunk &chunk, OperatorSourceInput &input) {
 	D_ASSERT(local_stage == HashJoinSourceStage::SCAN_HT);
 
+	input.ReportSourceWorkUnits(0, SourceThroughputKind::HASH_JOIN_BUILD_ROWS, "exact", "hash_table_chunk");
 	if (!full_outer_scan_state) {
 		full_outer_scan_state = make_uniq<JoinHTScanState>(sink.hash_table->GetDataCollection(),
 		                                                   full_outer_chunk_idx_from, full_outer_chunk_idx_to);
@@ -1557,8 +1564,13 @@ void HashJoinLocalSourceState::ExternalScanHT(HashJoinGlobalSinkState &sink, Has
 
 	if (chunk.size() == 0) {
 		full_outer_scan_state = nullptr;
-		auto guard = gstate.Lock();
-		gstate.full_outer_chunk_done += full_outer_chunk_idx_to - full_outer_chunk_idx_from;
+		const auto chunks_done = full_outer_chunk_idx_to - full_outer_chunk_idx_from;
+		{
+			auto guard = gstate.Lock();
+			gstate.full_outer_chunk_done += chunks_done;
+		}
+		input.ReportSourceWorkUnits(chunks_done, SourceThroughputKind::HASH_JOIN_BUILD_ROWS, "exact",
+		                            "hash_table_chunk");
 	}
 }
 

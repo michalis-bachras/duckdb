@@ -1602,6 +1602,22 @@ idx_t JoinHashTable::FinishedPartitionCount() const {
 	return completed_partitions.CountValid(num_partitions) - CurrentPartitionCount();
 }
 
+void JoinHashTable::GetRemainingPartitionWork(idx_t &rows, idx_t &chunks) const {
+	rows = 0;
+	chunks = 0;
+	const auto num_partitions = RadixPartitioning::NumberOfPartitions(radix_bits);
+	D_ASSERT(completed_partitions.Capacity() == num_partitions);
+	auto &partitions = sink_collection->GetPartitions();
+	for (idx_t partition_idx = 0; partition_idx < num_partitions; partition_idx++) {
+		if (completed_partitions.RowIsValidUnsafe(partition_idx)) {
+			continue;
+		}
+		auto &partition = *partitions[partition_idx];
+		rows += partition.Count();
+		chunks += partition.ChunkCount();
+	}
+}
+
 void JoinHashTable::Repartition(JoinHashTable &global_ht) {
 	auto new_sink_collection = make_uniq<RadixPartitionedTupleData>(
 	    buffer_manager, layout_ptr, MemoryTag::HASH_TABLE, global_ht.radix_bits, layout_ptr->ColumnCount() - 1);
