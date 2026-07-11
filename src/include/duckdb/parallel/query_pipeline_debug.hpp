@@ -33,6 +33,18 @@ struct QueryPipelineDebugEventSnapshot {
 	idx_t scheduler_threads = 0;
 	bool parallel = false;
 	string parallel_blocker;
+	bool work_valid = false;
+	bool scalable = false;
+	string source_input_kind;
+	string source_input_confidence;
+	idx_t total_rows = 0;
+	idx_t total_chunks_equiv = 0;
+	idx_t total_native_units = 0;
+	string native_unit;
+	idx_t completed_rows = 0;
+	idx_t completed_chunks_equiv = 0;
+	idx_t completed_native_units = 0;
+	idx_t remaining_chunks_equiv = 0;
 	string source_type;
 	string sink_type;
 	string operator_type_sequence;
@@ -45,6 +57,7 @@ public:
 	                                   idx_t effective_max_threads, idx_t source_max_threads,
 	                                   idx_t scheduler_threads);
 	static void RecordLifecycleSchedule(Pipeline &pipeline, Event &event, const string &state);
+	static void RecordWorkProgress(Pipeline &pipeline);
 	static void RecordEventFinished(Event &event);
 
 	static vector<QueryPipelineDebugEventSnapshot> GetDebugSnapshot();

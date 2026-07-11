@@ -276,6 +276,8 @@ void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_cou
 		profile->source_input_kind = planned_volume.kind;
 		profile->source_input_confidence = planned_volume.confidence;
 		profile->planned_input_rows = planned_volume.rows;
+		// Historical counterpart of live remaining work. Scheduler ETA should derive native-unit throughput as
+		// planned_input_chunks_equiv / task_runtime, rather than using the tuple/sec EWMA.
 		profile->planned_input_chunks_equiv = planned_volume.chunks_equiv;
 		profile->planned_input_native_units = planned_volume.native_units;
 		profile->planned_input_native_unit = planned_volume.native_unit;

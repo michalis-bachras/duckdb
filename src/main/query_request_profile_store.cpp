@@ -269,6 +269,8 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		pipeline_profile.planned_input_native_unit = profile.planned_input_native_unit;
 		pipeline_profile.source_max_threads.Add(static_cast<double>(profile.source_max_threads));
 		pipeline_profile.planned_input_rows.Add(static_cast<double>(profile.planned_input_rows));
+		// Store raw planned work and runtime samples. A scheduler-facing work-unit throughput can be derived as
+		// planned_input_chunks_equiv / task_runtime_ns for the matching pipeline signature and native unit.
 		pipeline_profile.planned_input_chunks_equiv.Add(static_cast<double>(profile.planned_input_chunks_equiv));
 		pipeline_profile.task_count.Add(static_cast<double>(profile.task_count));
 		QueryRequestPipelineInstanceSnapshot pipeline_instance;

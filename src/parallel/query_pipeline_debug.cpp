@@ -111,6 +111,44 @@ static void PopulateEventInfo(QueryPipelineDebugEventSnapshot &snapshot, Event &
 	snapshot.finished_tasks = event.GetFinishedTasks();
 }
 
+static void PopulateWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, const PipelineWorkSnapshot &work) {
+	snapshot.work_valid = work.valid;
+	snapshot.scalable = work.scalable;
+	snapshot.source_input_kind = work.source_input_kind;
+	snapshot.source_input_confidence = work.source_input_confidence;
+	snapshot.total_rows = work.total_rows;
+	snapshot.total_chunks_equiv = work.total_chunks_equiv;
+	snapshot.total_native_units = work.total_native_units;
+	snapshot.native_unit = work.native_unit;
+	snapshot.completed_rows = work.completed_rows;
+	snapshot.completed_chunks_equiv = work.completed_chunks_equiv;
+	snapshot.completed_native_units = work.completed_native_units;
+	snapshot.remaining_chunks_equiv = work.remaining_chunks_equiv;
+	if (!snapshot.pipeline_id) {
+		snapshot.pipeline_id = work.pipeline_id;
+	}
+	if (!snapshot.source_max_threads) {
+		snapshot.source_max_threads = work.source_max_threads;
+	}
+	if (!snapshot.effective_max_threads) {
+		snapshot.effective_max_threads = work.effective_max_threads;
+	}
+}
+
+static void PopulatePipelineWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, Pipeline &pipeline) {
+	PipelineWorkSnapshot work;
+	if (pipeline.GetWorkSnapshot(work)) {
+		PopulateWorkInfo(snapshot, work);
+	}
+}
+
+static void PopulateEventWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, Event &event) {
+	PipelineWorkSnapshot work;
+	if (event.GetPipelineWorkSnapshot(work)) {
+		PopulateWorkInfo(snapshot, work);
+	}
+}
+
 static void AppendDebugEvent(QueryPipelineDebugEventSnapshot snapshot) {
 	auto &store = GetPipelineDebugStore();
 	lock_guard<mutex> guard(store.lock);
@@ -140,6 +178,7 @@ void QueryPipelineDebug::RecordPipelineSchedule(Pipeline &pipeline, Event &event
 	if (!snapshot.pipeline_id) {
 		snapshot.pipeline_id = pipeline.GetProfilerPipelineId();
 	}
+	PopulatePipelineWorkInfo(snapshot, pipeline);
 	PopulatePipelineInfo(snapshot, pipeline);
 	AppendDebugEvent(std::move(snapshot));
 }
@@ -160,6 +199,27 @@ void QueryPipelineDebug::RecordLifecycleSchedule(Pipeline &pipeline, Event &even
 	if (!snapshot.pipeline_id) {
 		snapshot.pipeline_id = pipeline.GetProfilerPipelineId();
 	}
+	PopulateEventWorkInfo(snapshot, event);
+	PopulatePipelineInfo(snapshot, pipeline);
+	AppendDebugEvent(std::move(snapshot));
+}
+
+void QueryPipelineDebug::RecordWorkProgress(Pipeline &pipeline) {
+	QueryPipelineDebugEventSnapshot snapshot;
+	if (!PopulateMetadata(pipeline.GetClientContext(), snapshot)) {
+		return;
+	}
+	PipelineWorkSnapshot work;
+	if (!pipeline.GetWorkSnapshot(work) || !work.valid || work.total_chunks_equiv == 0) {
+		return;
+	}
+	snapshot.pipeline_id = pipeline.GetProfilerPipelineId();
+	snapshot.event_kind = "pipeline";
+	snapshot.event_state = "work_progress";
+	snapshot.timestamp_ns = TimestampNs();
+	snapshot.scheduler_threads =
+	    NumericCast<idx_t>(TaskScheduler::GetScheduler(pipeline.GetClientContext()).NumberOfThreads());
+	PopulateWorkInfo(snapshot, work);
 	PopulatePipelineInfo(snapshot, pipeline);
 	AppendDebugEvent(std::move(snapshot));
 }
@@ -172,6 +232,7 @@ void QueryPipelineDebug::RecordEventFinished(Event &event) {
 	PopulateEventInfo(snapshot, event);
 	snapshot.event_state = "finished";
 	snapshot.parallel = false;
+	PopulateEventWorkInfo(snapshot, event);
 	AppendDebugEvent(std::move(snapshot));
 }
 
