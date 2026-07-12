@@ -130,6 +130,10 @@ static void PopulateWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, const Pi
 	snapshot.completed_chunks_equiv = work.completed_chunks_equiv;
 	snapshot.completed_native_units = work.completed_native_units;
 	snapshot.remaining_chunks_equiv = work.remaining_chunks_equiv;
+	snapshot.throughput_completed_chunks_equiv = work.throughput_completed_chunks_equiv;
+	snapshot.throughput_worker_time_ns = work.throughput_worker_time_ns;
+	snapshot.single_worker_chunks_per_s = work.single_worker_chunks_per_s;
+	snapshot.throughput_valid = work.throughput_valid;
 	if (work.parallelism_valid && !snapshot.parallelism_valid) {
 		snapshot.remaining_tasks = work.remaining_tasks;
 		snapshot.preferred_parallelism = work.preferred_parallelism;

@@ -20,6 +20,7 @@ namespace duckdb {
 namespace {
 
 static const idx_t PROFILE_SAMPLE_LIMIT = 100;
+static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
 
 struct BoundedSamples {
 	std::deque<double> values;
@@ -140,6 +141,8 @@ struct PipelineProfileAggregate {
 	BoundedSamples task_runtime_ns;
 	BoundedSamples lifecycle_runtime_ns;
 	BoundedSamples downstream_suffix_ns;
+	BoundedSamples single_worker_chunks_per_s;
+	double ewma_single_worker_chunks_per_s = 0;
 };
 
 static std::mutex g_profile_store_lock;
@@ -162,6 +165,13 @@ static uint64_t StableStringHash64(const string &value) {
 		hash *= 1099511628211ULL;
 	}
 	return hash;
+}
+
+static double SingleWorkerChunksPerSecond(idx_t chunks_equiv, uint64_t worker_time_ns) {
+	if (chunks_equiv == 0 || worker_time_ns == 0) {
+		return 0;
+	}
+	return (static_cast<double>(chunks_equiv) * 1000000000.0) / static_cast<double>(worker_time_ns);
 }
 
 static string BuildPipelineSignature(const PipelineProfilingInfo &profile) {
@@ -206,6 +216,9 @@ static void PopulatePipelineEstimate(const PipelineProfileAggregate &profile,
 	estimate.mean_source_max_threads = profile.source_max_threads.Mean();
 	estimate.mean_planned_input_rows = profile.planned_input_rows.Mean();
 	estimate.mean_planned_input_chunks_equiv = profile.planned_input_chunks_equiv.Mean();
+	estimate.throughput_sample_count = profile.single_worker_chunks_per_s.Count();
+	estimate.mean_single_worker_chunks_per_s = profile.single_worker_chunks_per_s.Mean();
+	estimate.ewma_single_worker_chunks_per_s = profile.ewma_single_worker_chunks_per_s;
 }
 
 } // namespace
@@ -275,8 +288,8 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		pipeline_profile.planned_input_native_unit = profile.planned_input_native_unit;
 		pipeline_profile.source_max_threads.Add(static_cast<double>(profile.source_max_threads));
 		pipeline_profile.planned_input_rows.Add(static_cast<double>(profile.planned_input_rows));
-		// Store raw planned work and runtime samples. A scheduler-facing work-unit throughput can be derived as
-		// planned_input_chunks_equiv / task_runtime_ns for the matching pipeline signature and native unit.
+		// Store planned work in the same unit family as live remaining work. Scheduler throughput uses summed worker
+		// task time below; wall-clock pipeline runtime would overstate single-worker throughput under parallelism.
 		pipeline_profile.planned_input_chunks_equiv.Add(static_cast<double>(profile.planned_input_chunks_equiv));
 		pipeline_profile.task_count.Add(static_cast<double>(profile.task_count));
 		QueryRequestPipelineInstanceSnapshot pipeline_instance;
@@ -297,6 +310,20 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		pipeline_instance.source_max_threads = profile.source_max_threads;
 		pipeline_instance.planned_input_rows = profile.planned_input_rows;
 		pipeline_instance.planned_input_chunks_equiv = profile.planned_input_chunks_equiv;
+		pipeline_instance.worker_task_count = profile.worker_task_count;
+		pipeline_instance.worker_task_duration_ns = profile.worker_task_duration_ns;
+		auto single_worker_chunks_per_s =
+		    SingleWorkerChunksPerSecond(profile.planned_input_chunks_equiv, profile.worker_task_duration_ns);
+		if (single_worker_chunks_per_s > 0) {
+			pipeline_profile.single_worker_chunks_per_s.Add(single_worker_chunks_per_s);
+			pipeline_profile.ewma_single_worker_chunks_per_s =
+			    pipeline_profile.single_worker_chunks_per_s.Count() == 1
+			        ? single_worker_chunks_per_s
+			        : THROUGHPUT_EWMA_ALPHA * single_worker_chunks_per_s +
+			              (1.0 - THROUGHPUT_EWMA_ALPHA) * pipeline_profile.ewma_single_worker_chunks_per_s;
+			pipeline_instance.single_worker_chunks_per_s = single_worker_chunks_per_s;
+			pipeline_instance.throughput_valid = true;
+		}
 		pipeline_instance.source_estimated_cardinality = profile.source_estimated_cardinality;
 		pipeline_instance.sink_estimated_cardinality = profile.sink_estimated_cardinality;
 		pipeline_instance.start_ns = profile.start_ns;

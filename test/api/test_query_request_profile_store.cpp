@@ -69,6 +69,8 @@ static PipelineProfilingInfo PipelineProfile(uint64_t start_ns) {
 	profile.planned_input_rows = 1000;
 	profile.planned_input_chunks_equiv = 8;
 	profile.task_count = 6;
+	profile.worker_task_count = 6;
+	profile.worker_task_duration_ns = 4000;
 	profile.start_ns = start_ns;
 	profile.tasks_done_ns = start_ns + 700;
 	profile.finish_done_ns = start_ns + 900;
@@ -95,7 +97,9 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	duckdb::vector<PipelineProfilingInfo> pipelines_1;
 	pipelines_1.push_back(pipeline);
 	duckdb::vector<PipelineProfilingInfo> pipelines_2;
-	pipelines_2.push_back(PipelineProfile(22000));
+	auto second_pipeline = PipelineProfile(22000);
+	second_pipeline.worker_task_duration_ns = 8000;
+	pipelines_2.push_back(second_pipeline);
 
 	store.RecordQueryCompletion(Metadata(1, 101, 10, 1000, 9000), 11000, pipelines_1);
 	store.RecordQueryCompletion(Metadata(2, 101, 10, 21000, 29000), 31000, pipelines_2);
@@ -119,6 +123,10 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_instances[0].pipeline_id == 7);
 	REQUIRE(pipeline_instances[0].pipeline_signature_hash == signature_hash);
 	REQUIRE(pipeline_instances[0].operator_type_sequence == "TABLE_SCAN>PROJECTION>HASH_GROUP_BY");
+	REQUIRE(pipeline_instances[0].worker_task_count == 6);
+	REQUIRE(pipeline_instances[0].worker_task_duration_ns == 4000);
+	REQUIRE(pipeline_instances[0].throughput_valid);
+	REQUIRE(pipeline_instances[0].single_worker_chunks_per_s == 2000000.0);
 	REQUIRE(pipeline_instances[0].task_runtime_ns == 700);
 	REQUIRE(pipeline_instances[0].lifecycle_runtime_ns == 900);
 	REQUIRE(pipeline_instances[0].downstream_suffix_ns == 8300);
@@ -148,6 +156,9 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_estimate.mean_task_runtime_ns == 700);
 	REQUIRE(pipeline_estimate.mean_lifecycle_runtime_ns == 900);
 	REQUIRE(pipeline_estimate.mean_downstream_suffix_ns == 8300);
+	REQUIRE(pipeline_estimate.throughput_sample_count == 2);
+	REQUIRE(pipeline_estimate.mean_single_worker_chunks_per_s == 1500000.0);
+	REQUIRE(pipeline_estimate.ewma_single_worker_chunks_per_s == 1300000.0);
 
 	store.Clear();
 	for (idx_t i = 0; i < 105; i++) {

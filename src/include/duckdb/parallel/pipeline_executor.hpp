@@ -86,6 +86,8 @@ public:
 	void SetTaskForInterrupts(weak_ptr<Task> current_task);
 	void SetPipelineEventForDebug(Event *event);
 	void ResetSourceThroughputCounters();
+	void BeginThroughputTask(uint64_t start_ns);
+	void FinishThroughputTask(uint64_t end_ns);
 	const SourceThroughputCounters &GetSourceThroughputCounters() const;
 	const PipelineInputCounters &GetPipelineInputCounters() const;
 
@@ -114,9 +116,10 @@ private:
 	idx_t published_source_rows = 0;
 	idx_t published_source_chunks_equiv = 0;
 	idx_t published_source_native_units = 0;
-	idx_t published_source_work_units = 0;
+	uint64_t throughput_task_start_ns = 0;
 	bool collect_source_throughput = false;
 	bool collect_pipeline_input = false;
+	bool throughput_progress_active = false;
 	Event *debug_event = nullptr;
 
 	//! The final chunk used for moving data into the sink
@@ -159,6 +162,7 @@ private:
 	void GoToSource(idx_t &current_idx, idx_t initial_idx);
 	SourceResultType FetchFromSource(DataChunk &result);
 	void PublishSourceWorkProgress();
+	idx_t CurrentThroughputChunksEquiv() const;
 
 	void FinishProcessing(int32_t operator_idx = -1);
 	bool IsFinished();

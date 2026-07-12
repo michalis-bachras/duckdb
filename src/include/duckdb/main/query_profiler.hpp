@@ -107,7 +107,6 @@ struct PipelineTaskProfilingInfo {
 	bool adaptive_morsel_candidate = false;
 	idx_t pipeline_input_tuples = 0;
 	idx_t pipeline_input_chunks = 0;
-	double estimated_tuples_per_task_s = 0;
 };
 
 //! Coarse pipeline-level timing information emitted into the existing JSON query profile.
@@ -155,15 +154,11 @@ struct PipelineProfilingInfo {
 	idx_t pipeline_input_chunks = 0;
 	idx_t pipeline_input_task_count = 0;
 	uint64_t pipeline_input_task_duration_ns = 0;
+	idx_t worker_task_count = 0;
+	uint64_t worker_task_duration_ns = 0;
 	uint64_t throughput_task_duration_ns = 0;
 	idx_t throughput_task_count = 0;
 	string task_signature_key;
-	double estimated_tuples_per_task_s = 0;
-	double last_task_tuples_per_s = 0;
-	double throughput_ewma_alpha = 0.8;
-	idx_t throughput_sample_count = 0;
-	idx_t throughput_sample_tuples = 0;
-	uint64_t throughput_sample_ns = 0;
 
 	bool dvfs_metrics_enabled = false;
 	bool dvfs_measurement_stopped = false;
@@ -295,8 +290,7 @@ public:
 	DUCKDB_API void RecordPipelineProfileFinishDone(idx_t pipeline_id);
 	DUCKDB_API idx_t RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu);
 	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
-	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
-	                                      const SourceThroughputEstimate &throughput_estimate);
+	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks);
 	DUCKDB_API vector<PipelineProfilingInfo> GetPipelineProfilesSnapshot() const;
 
 	DUCKDB_API string QueryTreeToString() const;

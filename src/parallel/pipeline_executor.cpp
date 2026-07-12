@@ -4,6 +4,7 @@
 #include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/pipeline_dvfs_profiler.hpp"
 
 #ifdef DUCKDB_DEBUG_ASYNC_SINK_SOURCE
 #include <chrono>
@@ -496,8 +497,9 @@ void PipelineExecutor::ResetSourceThroughputCounters() {
 		published_source_rows = 0;
 		published_source_chunks_equiv = 0;
 		published_source_native_units = 0;
-		published_source_work_units = 0;
 	}
+	throughput_progress_active = false;
+	throughput_task_start_ns = 0;
 	if (collect_pipeline_input) {
 		pipeline_input_counters = PipelineInputCounters();
 	}
@@ -515,40 +517,52 @@ void PipelineExecutor::SetPipelineEventForDebug(Event *event) {
 	debug_event = event;
 }
 
+void PipelineExecutor::BeginThroughputTask(uint64_t start_ns) {
+	throughput_progress_active = false;
+	throughput_task_start_ns = 0;
+	if (!pipeline.SourceWorkTrackingEnabled()) {
+		return;
+	}
+	throughput_progress_active = true;
+	throughput_task_start_ns = start_ns == 0 ? PipelineDVFSProfiler::TimestampNs() : start_ns;
+}
+
+void PipelineExecutor::FinishThroughputTask(uint64_t end_ns) {
+	if (throughput_progress_active && end_ns > throughput_task_start_ns) {
+		pipeline.RecordThroughputProgress(CurrentThroughputChunksEquiv(), end_ns - throughput_task_start_ns);
+	}
+	throughput_progress_active = false;
+	throughput_task_start_ns = 0;
+}
+
+idx_t PipelineExecutor::CurrentThroughputChunksEquiv() const {
+	auto counters = pipeline.GetMatchingSourceWorkCounters(source_throughput_counters);
+	return counters.valid ? counters.chunks_equiv : 0;
+}
+
 void PipelineExecutor::PublishSourceWorkProgress() {
 	if (!pipeline.SourceWorkTrackingEnabled() ||
 	    (!source_throughput_counters.reported && !source_throughput_counters.work_reported)) {
 		return;
 	}
-	if (source_throughput_counters.work_reported) {
-		auto work_units = source_throughput_counters.work_units_touched;
-		if (work_units < published_source_work_units) {
-			published_source_work_units = 0;
-		}
-		auto delta_work_units = work_units - published_source_work_units;
-		if (delta_work_units != 0) {
-			pipeline.RecordSourceWorkProgress(0, delta_work_units, delta_work_units, debug_event);
-			published_source_work_units = work_units;
-		}
+	auto current = pipeline.GetMatchingSourceWorkCounters(source_throughput_counters);
+	if (!current.valid) {
 		return;
 	}
-	auto rows = source_throughput_counters.tuples_touched;
-	auto chunks = source_throughput_counters.chunks_touched;
-	auto native_units = source_throughput_counters.native_units_touched;
-	if (rows < published_source_rows || chunks < published_source_chunks_equiv ||
-	    native_units < published_source_native_units) {
+	if (current.rows < published_source_rows || current.chunks_equiv < published_source_chunks_equiv ||
+	    current.native_units < published_source_native_units) {
 		published_source_rows = 0;
 		published_source_chunks_equiv = 0;
 		published_source_native_units = 0;
 	}
-	auto delta_rows = rows - published_source_rows;
-	auto delta_chunks = chunks - published_source_chunks_equiv;
-	auto delta_native_units = native_units - published_source_native_units;
+	auto delta_rows = current.rows - published_source_rows;
+	auto delta_chunks = current.chunks_equiv - published_source_chunks_equiv;
+	auto delta_native_units = current.native_units - published_source_native_units;
 	if (delta_rows != 0 || delta_chunks != 0 || delta_native_units != 0) {
 		pipeline.RecordSourceWorkProgress(delta_rows, delta_chunks, delta_native_units, debug_event);
-		published_source_rows = rows;
-		published_source_chunks_equiv = chunks;
-		published_source_native_units = native_units;
+		published_source_rows = current.rows;
+		published_source_chunks_equiv = current.chunks_equiv;
+		published_source_native_units = current.native_units;
 	}
 }
 

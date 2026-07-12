@@ -45,6 +45,9 @@ struct QueryRequestPipelineProfileEstimate {
 	double mean_source_max_threads = 0;
 	double mean_planned_input_rows = 0;
 	double mean_planned_input_chunks_equiv = 0;
+	idx_t throughput_sample_count = 0;
+	double mean_single_worker_chunks_per_s = 0;
+	double ewma_single_worker_chunks_per_s = 0;
 };
 
 struct QueryRequestProfileSnapshot {
@@ -93,6 +96,9 @@ struct QueryRequestPipelineInstanceSnapshot {
 	idx_t source_max_threads = 0;
 	idx_t planned_input_rows = 0;
 	idx_t planned_input_chunks_equiv = 0;
+	idx_t worker_task_count = 0;
+	uint64_t worker_task_duration_ns = 0;
+	double single_worker_chunks_per_s = 0;
 	idx_t source_estimated_cardinality = 0;
 	idx_t sink_estimated_cardinality = 0;
 	uint64_t start_ns = 0;
@@ -101,6 +107,7 @@ struct QueryRequestPipelineInstanceSnapshot {
 	uint64_t task_runtime_ns = 0;
 	uint64_t lifecycle_runtime_ns = 0;
 	uint64_t downstream_suffix_ns = 0;
+	bool throughput_valid = false;
 };
 
 class QueryRequestProfileStore {

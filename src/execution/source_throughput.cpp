@@ -9,8 +9,6 @@
 
 namespace duckdb {
 
-static constexpr double SOURCE_THROUGHPUT_EWMA_ALPHA = 0.8;
-
 const char *SourceThroughputKindToString(SourceThroughputKind kind) {
 	switch (kind) {
 	case SourceThroughputKind::UNKNOWN:
@@ -216,30 +214,6 @@ double SourceTuplesPerTaskSecond(idx_t tuples, uint64_t duration_ns) {
 		return 0;
 	}
 	return static_cast<double>(tuples) * 1000000000.0 / static_cast<double>(duration_ns);
-}
-
-const SourceThroughputEstimate &SourceThroughputEstimator::Update(const SourceThroughputCounters &counters,
-                                                                  uint64_t duration_ns) {
-	if (!counters.reported || !counters.adaptive_morsel_candidate || counters.tuples_touched == 0 || duration_ns == 0) {
-		return estimate;
-	}
-	auto task_throughput = SourceTuplesPerTaskSecond(counters.tuples_touched, duration_ns);
-	if (estimate.sample_count == 0) {
-		estimate.alpha = SOURCE_THROUGHPUT_EWMA_ALPHA;
-		estimate.estimated_tuples_per_task_s = task_throughput;
-	} else {
-		estimate.estimated_tuples_per_task_s =
-		    estimate.alpha * task_throughput + (1 - estimate.alpha) * estimate.estimated_tuples_per_task_s;
-	}
-	estimate.last_task_tuples_per_s = task_throughput;
-	estimate.sample_count++;
-	estimate.sample_tuples += counters.tuples_touched;
-	estimate.sample_ns += duration_ns;
-	return estimate;
-}
-
-void SourceThroughputEstimator::Reset() {
-	estimate = SourceThroughputEstimate();
 }
 
 } // namespace duckdb

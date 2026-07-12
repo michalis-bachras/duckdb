@@ -153,6 +153,12 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineProfilesBind(ClientCon
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("mean_planned_input_chunks_equiv");
 	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("throughput_sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("mean_single_worker_chunks_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("ewma_single_worker_chunks_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
 	return nullptr;
 }
 
@@ -191,6 +197,9 @@ static void DuckDBQueryRequestPipelineProfilesFunction(ClientContext &context, T
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_source_max_threads));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_planned_input_rows));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_planned_input_chunks_equiv));
+		output.SetValue(col++, count, Value::UBIGINT(estimate.throughput_sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_single_worker_chunks_per_s));
+		output.SetValue(col++, count, Value::DOUBLE(estimate.ewma_single_worker_chunks_per_s));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -297,6 +306,14 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineInstancesBind(ClientCo
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("planned_input_chunks_equiv");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("worker_task_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("worker_task_duration_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("single_worker_chunks_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("throughput_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
 	names.emplace_back("source_estimated_cardinality");
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("sink_estimated_cardinality");
@@ -347,6 +364,10 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 		output.SetValue(col++, count, Value::UBIGINT(instance.source_max_threads));
 		output.SetValue(col++, count, Value::UBIGINT(instance.planned_input_rows));
 		output.SetValue(col++, count, Value::UBIGINT(instance.planned_input_chunks_equiv));
+		output.SetValue(col++, count, Value::UBIGINT(instance.worker_task_count));
+		output.SetValue(col++, count, Value::UBIGINT(instance.worker_task_duration_ns));
+		output.SetValue(col++, count, Value::DOUBLE(instance.single_worker_chunks_per_s));
+		output.SetValue(col++, count, Value::BOOLEAN(instance.throughput_valid));
 		output.SetValue(col++, count, Value::UBIGINT(instance.source_estimated_cardinality));
 		output.SetValue(col++, count, Value::UBIGINT(instance.sink_estimated_cardinality));
 		output.SetValue(col++, count, Value::UBIGINT(instance.start_ns));
@@ -601,6 +622,14 @@ static unique_ptr<FunctionData> DuckDBQueryPipelineEventsBind(ClientContext &con
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("remaining_chunks_equiv");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("throughput_completed_chunks_equiv");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("throughput_worker_time_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("single_worker_chunks_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("throughput_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
 	names.emplace_back("source_type");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("sink_type");
@@ -654,6 +683,10 @@ static void DuckDBQueryPipelineEventsFunction(ClientContext &context, TableFunct
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.completed_chunks_equiv));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.completed_native_units));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.remaining_chunks_equiv));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.throughput_completed_chunks_equiv));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.throughput_worker_time_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.single_worker_chunks_per_s));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.throughput_valid));
 		output.SetValue(col++, count, Value(snapshot.source_type));
 		output.SetValue(col++, count, Value(snapshot.sink_type));
 		output.SetValue(col++, count, Value(snapshot.operator_type_sequence));

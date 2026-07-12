@@ -95,6 +95,20 @@ public:
 	unique_ptr<DistinctAggregateState> distinct_state;
 };
 
+class UngroupedAggregateGlobalSourceState : public GlobalSourceState {
+public:
+	SourceInputVolume GetSourceInputVolume() const override {
+		SourceInputVolume volume;
+		volume.kind = SourceThroughputKindToString(SourceThroughputKind::SINGLE_AGGREGATE_ROW);
+		volume.confidence = "exact";
+		volume.rows = 1;
+		volume.chunks_equiv = 1;
+		volume.native_units = 1;
+		volume.native_unit = "row";
+		return volume;
+	}
+};
+
 ArenaAllocator &GlobalUngroupedAggregateState::CreateAllocator() const {
 	lock_guard<mutex> glock(lock);
 	stored_allocators.emplace_back(make_uniq<ArenaAllocator>(client_allocator));
@@ -285,6 +299,10 @@ bool PhysicalUngroupedAggregate::SinkOrderDependent() const {
 
 unique_ptr<GlobalSinkState> PhysicalUngroupedAggregate::GetGlobalSinkState(ClientContext &context) const {
 	return make_uniq<UngroupedAggregateGlobalSinkState>(*this, context);
+}
+
+unique_ptr<GlobalSourceState> PhysicalUngroupedAggregate::GetGlobalSourceState(ClientContext &context) const {
+	return make_uniq<UngroupedAggregateGlobalSourceState>();
 }
 
 unique_ptr<LocalSinkState> PhysicalUngroupedAggregate::GetLocalSinkState(ExecutionContext &context) const {

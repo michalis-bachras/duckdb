@@ -12,6 +12,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/parallel/query_pipeline_debug.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
@@ -50,7 +51,8 @@ static bool PipelineTaskProfilingRequested(Pipeline &pipeline) {
 		return false;
 	}
 	const auto &settings = ClientConfig::GetConfig(pipeline.GetClientContext()).pipeline_profiling;
-	return settings.task_trace || settings.throughput;
+	return settings.task_trace || settings.throughput ||
+	       QueryRequestMetadataManager::HasActiveMetadata(pipeline.GetClientContext());
 }
 
 static idx_t SourceInputChunksEquiv(const SourceInputVolume &source_input_volume) {
@@ -62,6 +64,67 @@ static idx_t SourceInputChunksEquiv(const SourceInputVolume &source_input_volume
 	}
 	if (source_input_volume.native_units > 0) {
 		return source_input_volume.native_units;
+	}
+	return 0;
+}
+
+static bool SourceInputUsesNativeWorkUnits(const SourceInputVolume &source_input_volume, idx_t chunks_equiv) {
+	if (chunks_equiv == 0 || source_input_volume.native_units == 0 || source_input_volume.native_unit.empty()) {
+		return false;
+	}
+	if (source_input_volume.rows > 0 &&
+	    chunks_equiv == SourceThroughputCounters::EstimateStandardChunks(source_input_volume.rows)) {
+		return false;
+	}
+	return chunks_equiv == source_input_volume.native_units;
+}
+
+static bool SourceWorkKindMatches(const string &planned_kind, const string &reported_kind) {
+	if (planned_kind == reported_kind) {
+		return true;
+	}
+	if (planned_kind == "table_rows_upper_bound" && reported_kind == "base_table_rows") {
+		return true;
+	}
+	if (planned_kind == "index_scan_row_ids" && reported_kind == "index_rowids") {
+		return true;
+	}
+	return false;
+}
+
+static bool SourceWorkUnitMatches(const string &planned_unit, const string &reported_unit) {
+	if (planned_unit.empty() || planned_unit == "none") {
+		return true;
+	}
+	return planned_unit == reported_unit;
+}
+
+static idx_t SaturatingAtomicAdd(atomic<idx_t> &target, idx_t delta, idx_t limit, idx_t *new_value = nullptr) {
+	if (delta == 0) {
+		if (new_value) {
+			*new_value = target.load();
+		}
+		return 0;
+	}
+	if (limit == 0) {
+		auto previous = target.fetch_add(delta);
+		if (new_value) {
+			*new_value = previous + delta;
+		}
+		return delta;
+	}
+	auto current = target.load();
+	while (current < limit) {
+		auto allowed = MinValue<idx_t>(delta, limit - current);
+		if (target.compare_exchange_weak(current, current + allowed)) {
+			if (new_value) {
+				*new_value = current + allowed;
+			}
+			return allowed;
+		}
+	}
+	if (new_value) {
+		*new_value = current;
 	}
 	return 0;
 }
@@ -83,8 +146,10 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	const bool energy_attribution_active = pipeline.GetEnergyAttributionQueryState() != nullptr;
 	const bool profiler_task_requested = PipelineTaskProfilingRequested(pipeline);
+	const bool live_throughput_requested = pipeline.SourceWorkTrackingEnabled();
+	const bool task_timing_requested = profiler_task_requested || live_throughput_requested;
 	uint64_t task_start_ns = 0;
-	if (profiler_task_requested) {
+	if (task_timing_requested) {
 		task_start_ns = PipelineDVFSProfiler::TimestampNs();
 	}
 	int start_cpu = -1;
@@ -117,11 +182,15 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		if (energy_attribution_active) {
 			energy_scope.SetEndCPUHint(end_cpu);
 		}
-		if (profiler_task_id) {
+		if (profiler_task_id || live_throughput_requested) {
 			auto task_end_ns = PipelineDVFSProfiler::TimestampNs();
-			auto task_duration_ns = task_end_ns >= task_start_ns ? task_end_ns - task_start_ns : 0;
-			pipeline.RecordProfilerTaskEnd(profiler_task_id, end_cpu, counters, pipeline_input_tuples,
-			                               pipeline_input_chunks, task_duration_ns);
+			if (pipeline_executor) {
+				pipeline_executor->FinishThroughputTask(task_end_ns);
+			}
+			if (profiler_task_id) {
+				pipeline.RecordProfilerTaskEnd(profiler_task_id, end_cpu, counters, pipeline_input_tuples,
+				                               pipeline_input_chunks);
+			}
 		}
 	};
 
@@ -130,6 +199,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	}
 	pipeline_executor->SetPipelineEventForDebug(event.get());
 	pipeline_executor->ResetSourceThroughputCounters();
+	pipeline_executor->BeginThroughputTask(task_start_ns);
 
 	pipeline_executor->SetTaskForInterrupts(shared_from_this());
 
@@ -197,6 +267,7 @@ void Pipeline::ResetSourceWorkTracking() {
 	source_work_debug_sampling_enabled.store(false);
 	lock_guard<mutex> guard(source_work_lock);
 	source_work_valid = false;
+	source_work_uses_native_work_units = false;
 	source_work_kind.clear();
 	source_work_confidence.clear();
 	source_work_native_unit.clear();
@@ -209,6 +280,8 @@ void Pipeline::ResetSourceWorkTracking() {
 	source_work_completed_rows.store(0);
 	source_work_completed_chunks_equiv.store(0);
 	source_work_completed_native_units.store(0);
+	source_work_throughput_completed_chunks_equiv.store(0);
+	source_work_throughput_worker_time_ns.store(0);
 	source_work_debug_sample_step_chunks_equiv.store(0);
 	source_work_debug_next_sample_chunks_equiv.store(0);
 	source_work_debug_total_chunks_equiv.store(0);
@@ -221,12 +294,14 @@ void Pipeline::InitializeSourceWorkTracking(const SourceInputVolume &source_inpu
 	// unit (e.g. hash_table_chunk, sort_partition, aggregate_partition_phase), not necessarily a STANDARD_VECTOR_SIZE
 	// row chunk. Historical scheduler rates must therefore be derived in this same chunks_equiv unit.
 	auto total_chunks_equiv = SourceInputChunksEquiv(source_input_volume);
+	auto uses_native_work_units = SourceInputUsesNativeWorkUnits(source_input_volume, total_chunks_equiv);
 	auto debug_sampling_enabled =
 	    tracking_enabled && total_chunks_equiv > 0 && QueryPipelineDebug::Enabled(GetClientContext());
 	auto debug_sample_step = debug_sampling_enabled ? MaxValue<idx_t>(idx_t(1), total_chunks_equiv / 10) : idx_t(0);
 	{
 		lock_guard<mutex> guard(source_work_lock);
 		source_work_valid = tracking_enabled;
+		source_work_uses_native_work_units = uses_native_work_units;
 		source_work_kind = source_input_volume.kind;
 		source_work_confidence = source_input_volume.confidence;
 		source_work_native_unit = source_input_volume.native_unit;
@@ -239,6 +314,8 @@ void Pipeline::InitializeSourceWorkTracking(const SourceInputVolume &source_inpu
 		source_work_completed_rows.store(0);
 		source_work_completed_chunks_equiv.store(0);
 		source_work_completed_native_units.store(0);
+		source_work_throughput_completed_chunks_equiv.store(0);
+		source_work_throughput_worker_time_ns.store(0);
 		source_work_debug_sample_step_chunks_equiv.store(debug_sample_step);
 		source_work_debug_next_sample_chunks_equiv.store(debug_sample_step);
 		source_work_debug_total_chunks_equiv.store(total_chunks_equiv);
@@ -251,6 +328,46 @@ bool Pipeline::SourceWorkTrackingEnabled() const {
 	return source_work_tracking_enabled.load();
 }
 
+SourceWorkCounterSnapshot Pipeline::GetMatchingSourceWorkCounters(const SourceThroughputCounters &counters) const {
+	SourceWorkCounterSnapshot result;
+	if (!SourceWorkTrackingEnabled()) {
+		return result;
+	}
+	lock_guard<mutex> guard(source_work_lock);
+	if (!source_work_valid) {
+		return result;
+	}
+	if (source_work_uses_native_work_units) {
+		if (!counters.work_reported || !SourceWorkKindMatches(source_work_kind, counters.work_kind) ||
+		    !SourceWorkUnitMatches(source_work_native_unit, counters.work_unit)) {
+			return result;
+		}
+		result.chunks_equiv = counters.work_units_touched;
+		result.native_units = counters.work_units_touched;
+		result.valid = true;
+		return result;
+	}
+	if (!counters.reported || !SourceWorkKindMatches(source_work_kind, counters.tuple_kind)) {
+		return result;
+	}
+	result.rows = counters.tuples_touched;
+	result.chunks_equiv = counters.chunks_touched > 0 ? counters.chunks_touched
+	                                                  : SourceThroughputCounters::EstimateStandardChunks(result.rows);
+	result.native_units = counters.native_units_touched;
+	result.valid = true;
+	return result;
+}
+
+void Pipeline::RecordThroughputProgress(idx_t chunks_equiv, uint64_t worker_time_ns) {
+	if (!SourceWorkTrackingEnabled() || worker_time_ns == 0 || source_work_total_chunks_equiv == 0) {
+		return;
+	}
+	if (chunks_equiv > 0) {
+		SaturatingAtomicAdd(source_work_throughput_completed_chunks_equiv, chunks_equiv, source_work_total_chunks_equiv);
+	}
+	source_work_throughput_worker_time_ns.fetch_add(worker_time_ns);
+}
+
 void Pipeline::RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units, Event *event) {
 	if (!SourceWorkTrackingEnabled()) {
 		return;
@@ -259,14 +376,15 @@ void Pipeline::RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t na
 		chunks_equiv = SourceThroughputCounters::EstimateStandardChunks(rows);
 	}
 	if (rows > 0) {
-		source_work_completed_rows.fetch_add(rows);
+		SaturatingAtomicAdd(source_work_completed_rows, rows, source_work_total_rows);
 	}
 	idx_t completed_chunks_equiv = 0;
 	if (chunks_equiv > 0) {
-		completed_chunks_equiv = source_work_completed_chunks_equiv.fetch_add(chunks_equiv) + chunks_equiv;
+		SaturatingAtomicAdd(source_work_completed_chunks_equiv, chunks_equiv, source_work_total_chunks_equiv,
+		                    &completed_chunks_equiv);
 	}
 	if (native_units > 0) {
-		source_work_completed_native_units.fetch_add(native_units);
+		SaturatingAtomicAdd(source_work_completed_native_units, native_units, source_work_total_native_units);
 	}
 	if (completed_chunks_equiv > 0 && ShouldRecordSourceWorkDebugSample(completed_chunks_equiv)) {
 		QueryPipelineDebug::RecordWorkProgress(*this, event);
@@ -312,6 +430,14 @@ bool Pipeline::GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const {
 	snapshot.completed_rows = source_work_completed_rows.load();
 	snapshot.completed_chunks_equiv = source_work_completed_chunks_equiv.load();
 	snapshot.completed_native_units = source_work_completed_native_units.load();
+	snapshot.throughput_completed_chunks_equiv = source_work_throughput_completed_chunks_equiv.load();
+	snapshot.throughput_worker_time_ns = source_work_throughput_worker_time_ns.load();
+	if (snapshot.throughput_completed_chunks_equiv > 0 && snapshot.throughput_worker_time_ns > 0) {
+		snapshot.single_worker_chunks_per_s =
+		    (static_cast<double>(snapshot.throughput_completed_chunks_equiv) * 1000000000.0) /
+		    static_cast<double>(snapshot.throughput_worker_time_ns);
+		snapshot.throughput_valid = true;
+	}
 	snapshot.remaining_chunks_equiv =
 	    snapshot.completed_chunks_equiv >= snapshot.total_chunks_equiv
 	        ? 0
@@ -475,10 +601,6 @@ void Pipeline::PrepareFinalize() {
 }
 
 void Pipeline::Reset() {
-	{
-		lock_guard<mutex> guard(source_throughput_lock);
-		source_throughput_estimator.Reset();
-	}
 	ResetSourceWorkTracking();
 	ResetSink();
 	for (auto &op_ref : operators) {
@@ -573,19 +695,12 @@ idx_t Pipeline::RecordProfilerTaskStart(uint64_t thread_id, int start_cpu) {
 }
 
 void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
-                                     idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
-                                     uint64_t task_duration_ns) {
+                                     idx_t pipeline_input_tuples, idx_t pipeline_input_chunks) {
 	if (!task_id) {
 		return;
 	}
-	SourceThroughputEstimate throughput_estimate;
-	{
-		lock_guard<mutex> guard(source_throughput_lock);
-		throughput_estimate = source_throughput_estimator.Update(source_throughput, task_duration_ns);
-	}
 	QueryProfiler::Get(GetClientContext())
-	    .RecordPipelineTaskEnd(task_id, end_cpu, source_throughput, pipeline_input_tuples, pipeline_input_chunks,
-	                           throughput_estimate);
+	    .RecordPipelineTaskEnd(task_id, end_cpu, source_throughput, pipeline_input_tuples, pipeline_input_chunks);
 }
 
 void Pipeline::AddDependency(shared_ptr<Pipeline> &pipeline) {

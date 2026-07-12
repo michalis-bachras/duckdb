@@ -73,27 +73,6 @@ struct SourceThroughputCounters {
 	                  const string &work_unit_p = string());
 };
 
-struct SourceThroughputEstimate {
-	// This EWMA is intentionally tuple-based. Scheduler ETA should not consume it directly when live remaining work is
-	// expressed in native chunk-equivalent units such as hash_table_chunk, sort_partition or aggregate_partition_phase.
-	// For that model, derive a rate from planned_input_chunks_equiv and task runtime in the query request profile store.
-	double estimated_tuples_per_task_s = 0;
-	double last_task_tuples_per_s = 0;
-	double alpha = 0.8;
-	idx_t sample_count = 0;
-	idx_t sample_tuples = 0;
-	uint64_t sample_ns = 0;
-};
-
 double SourceTuplesPerTaskSecond(idx_t tuples, uint64_t duration_ns);
-
-class SourceThroughputEstimator {
-public:
-	const SourceThroughputEstimate &Update(const SourceThroughputCounters &counters, uint64_t duration_ns);
-	void Reset();
-
-private:
-	SourceThroughputEstimate estimate;
-};
 
 } // namespace duckdb

@@ -45,9 +45,20 @@ struct PipelineWorkSnapshot {
 	idx_t finished_tasks = 0;
 	idx_t remaining_tasks = 0;
 	idx_t preferred_parallelism = 0;
+	idx_t throughput_completed_chunks_equiv = 0;
+	uint64_t throughput_worker_time_ns = 0;
+	double single_worker_chunks_per_s = 0;
 	bool scalable = false;
 	bool valid = false;
 	bool parallelism_valid = false;
+	bool throughput_valid = false;
+};
+
+struct SourceWorkCounterSnapshot {
+	idx_t rows = 0;
+	idx_t chunks_equiv = 0;
+	idx_t native_units = 0;
+	bool valid = false;
 };
 
 class PipelineTask : public ExecutorTask {
@@ -153,9 +164,11 @@ public:
 	idx_t GetEnergyAttributionPipelineId() const;
 	idx_t RecordProfilerTaskStart(uint64_t thread_id, int start_cpu);
 	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
-	                           idx_t pipeline_input_tuples, idx_t pipeline_input_chunks, uint64_t task_duration_ns);
+	                           idx_t pipeline_input_tuples, idx_t pipeline_input_chunks);
 	bool SourceWorkTrackingEnabled() const;
+	SourceWorkCounterSnapshot GetMatchingSourceWorkCounters(const SourceThroughputCounters &counters) const;
 	void RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units, Event *event = nullptr);
+	void RecordThroughputProgress(idx_t chunks_equiv, uint64_t worker_time_ns);
 	bool GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const;
 
 	//! Registers a new batch index for a pipeline executor - returns the current minimum batch index
@@ -208,13 +221,11 @@ private:
 	//! The reason is that when we start a new pipeline we insert the current minimum batch index as a placeholder
 	//! Which leads to duplicate entries in the set of active batch indexes
 	multiset<idx_t> batch_indexes;
-	//! Lock and state for per-pipeline online source-throughput estimation.
-	mutex source_throughput_lock;
-	SourceThroughputEstimator source_throughput_estimator;
 	//! Lightweight live source-work state for scheduler epochs. Completed counters are updated by workers.
 	mutable mutex source_work_lock;
 	atomic<bool> source_work_tracking_enabled {false};
 	bool source_work_valid = false;
+	bool source_work_uses_native_work_units = false;
 	string source_work_kind;
 	string source_work_confidence;
 	string source_work_native_unit;
@@ -227,6 +238,8 @@ private:
 	atomic<idx_t> source_work_completed_rows {0};
 	atomic<idx_t> source_work_completed_chunks_equiv {0};
 	atomic<idx_t> source_work_completed_native_units {0};
+	atomic<idx_t> source_work_throughput_completed_chunks_equiv {0};
+	atomic<uint64_t> source_work_throughput_worker_time_ns {0};
 	atomic<bool> source_work_debug_sampling_enabled {false};
 	atomic<idx_t> source_work_debug_sample_step_chunks_equiv {0};
 	atomic<idx_t> source_work_debug_next_sample_chunks_equiv {0};

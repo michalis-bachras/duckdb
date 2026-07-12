@@ -47,7 +47,11 @@ struct QueryPipelineDebugEventSnapshot {
 	idx_t completed_chunks_equiv = 0;
 	idx_t completed_native_units = 0;
 	idx_t remaining_chunks_equiv = 0;
+	idx_t throughput_completed_chunks_equiv = 0;
+	uint64_t throughput_worker_time_ns = 0;
+	double single_worker_chunks_per_s = 0;
 	bool parallelism_valid = false;
+	bool throughput_valid = false;
 	string source_type;
 	string sink_type;
 	string operator_type_sequence;

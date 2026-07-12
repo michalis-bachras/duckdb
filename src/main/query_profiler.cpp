@@ -154,20 +154,6 @@ static string SourceThroughputSignatureKey(const PipelineProfilingInfo &profile)
 	                          profile.planned_task_input_chunks_bucket);
 }
 
-static SourceInputVolume ApplySourceInputVolumeFallback(const PipelineProfilingInfo &profile,
-                                                        SourceInputVolume volume) {
-	if (volume.kind != "unknown" || profile.source_type != "UNGROUPED_AGGREGATE") {
-		return volume;
-	}
-	volume.kind = SourceThroughputKindToString(SourceThroughputKind::SINGLE_AGGREGATE_ROW);
-	volume.confidence = "exact";
-	volume.rows = 1;
-	volume.chunks_equiv = 1;
-	volume.native_units = 1;
-	volume.native_unit = "row";
-	return volume;
-}
-
 static SourceThroughputCounters ApplySourceThroughputFallback(const PipelineProfilingInfo &profile,
                                                               SourceThroughputCounters counters) {
 	if (counters.reported) {
@@ -175,10 +161,6 @@ static SourceThroughputCounters ApplySourceThroughputFallback(const PipelineProf
 	}
 	if (profile.source_input_kind == "hash_join_no_source_scan") {
 		counters.AddTuples(0, SourceThroughputKind::NO_SOURCE_SCAN, "exact", false, 0, 0, "none");
-		return counters;
-	}
-	if (SourceThroughputKindFromString(profile.source_input_kind) == SourceThroughputKind::SINGLE_AGGREGATE_ROW) {
-		counters.AddTuples(1, SourceThroughputKind::SINGLE_AGGREGATE_ROW, "exact", false, 1, 1, "row");
 		return counters;
 	}
 	if (profile.source_input_kind != "unknown" && profile.source_input_confidence != "unknown" &&
@@ -272,7 +254,7 @@ void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_cou
 		profile->dvfs_metrics_enabled = pipeline_dvfs_profiler.MetricsEnabled();
 		profile->throughput_enabled = ClientConfig::GetConfig(context).pipeline_profiling.throughput;
 		profile->source_max_threads = source_max_threads;
-		auto planned_volume = ApplySourceInputVolumeFallback(*profile, source_input_volume);
+		const auto &planned_volume = source_input_volume;
 		profile->source_input_kind = planned_volume.kind;
 		profile->source_input_confidence = planned_volume.confidence;
 		profile->planned_input_rows = planned_volume.rows;
@@ -340,11 +322,13 @@ void QueryProfiler::RecordPipelineProfileFinishDone(idx_t pipeline_id) {
 
 idx_t QueryProfiler::RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu) {
 	auto &pipeline_settings = ClientConfig::GetConfig(context).pipeline_profiling;
-	if (!pipeline_id || (!pipeline_dvfs_profiler.TaskTraceEnabled() && !pipeline_settings.throughput)) {
+	auto request_metadata_enabled = request_metadata_pipeline_profiles || QueryRequestMetadataManager::HasActiveMetadata(context);
+	if (!pipeline_id ||
+	    (!pipeline_dvfs_profiler.TaskTraceEnabled() && !pipeline_settings.throughput && !request_metadata_enabled)) {
 		return 0;
 	}
 	lock_guard<std::mutex> guard(lock);
-	if (!running || !IsEnabled() || !GetPipelineProfile(pipeline_id)) {
+	if (!running || (!IsEnabled() && !request_metadata_pipeline_profiles) || !GetPipelineProfile(pipeline_id)) {
 		return 0;
 	}
 	PipelineTaskProfilingInfo task_profile;
@@ -359,8 +343,7 @@ idx_t QueryProfiler::RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_
 }
 
 void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
-                                          idx_t pipeline_input_tuples, idx_t pipeline_input_chunks,
-                                          const SourceThroughputEstimate &throughput_estimate) {
+                                          idx_t pipeline_input_tuples, idx_t pipeline_input_chunks) {
 	if (!task_id) {
 		return;
 	}
@@ -377,6 +360,8 @@ void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const Sour
 	if (!profile) {
 		return;
 	}
+	profile->worker_task_count++;
+	profile->worker_task_duration_ns += duration_ns;
 	auto counters = ApplySourceThroughputFallback(*profile, source_throughput);
 	task_profile.source_tuple_kind = counters.tuple_kind;
 	task_profile.source_tuple_confidence = counters.tuple_confidence;
@@ -400,13 +385,6 @@ void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const Sour
 		profile->throughput_task_count++;
 		MergeSourceThroughputCounters(*profile, counters);
 		task_profile.task_signature_key = profile->task_signature_key;
-		task_profile.estimated_tuples_per_task_s = throughput_estimate.estimated_tuples_per_task_s;
-		profile->estimated_tuples_per_task_s = throughput_estimate.estimated_tuples_per_task_s;
-		profile->last_task_tuples_per_s = throughput_estimate.last_task_tuples_per_s;
-		profile->throughput_ewma_alpha = throughput_estimate.alpha;
-		profile->throughput_sample_count = throughput_estimate.sample_count;
-		profile->throughput_sample_tuples = throughput_estimate.sample_tuples;
-		profile->throughput_sample_ns = throughput_estimate.sample_ns;
 	}
 }
 
@@ -1138,12 +1116,6 @@ static void PipelineProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *result_o
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_task_count", profile.throughput_task_count);
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_task_duration_ns", profile.throughput_task_duration_ns);
 		yyjson_mut_obj_add_str(doc, pipeline_obj, "task_signature_key", profile.task_signature_key.c_str());
-		yyjson_mut_obj_add_real(doc, pipeline_obj, "estimated_tuples_per_task_s", profile.estimated_tuples_per_task_s);
-		yyjson_mut_obj_add_real(doc, pipeline_obj, "last_task_tuples_per_s", profile.last_task_tuples_per_s);
-		yyjson_mut_obj_add_real(doc, pipeline_obj, "throughput_ewma_alpha", profile.throughput_ewma_alpha);
-		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_sample_count", profile.throughput_sample_count);
-		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_sample_tuples", profile.throughput_sample_tuples);
-		yyjson_mut_obj_add_uint(doc, pipeline_obj, "throughput_sample_ns", profile.throughput_sample_ns);
 		if (profile.throughput_task_duration_ns > 0) {
 			yyjson_mut_obj_add_real(
 			    doc, pipeline_obj, "source_tuples_per_task_s",
@@ -1264,7 +1236,6 @@ static void PipelineTaskProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *resu
 		yyjson_mut_obj_add_uint(doc, task_obj, "pipeline_input_tuples", profile.pipeline_input_tuples);
 		yyjson_mut_obj_add_uint(doc, task_obj, "pipeline_input_chunks", profile.pipeline_input_chunks);
 		yyjson_mut_obj_add_str(doc, task_obj, "task_signature_key", profile.task_signature_key.c_str());
-		yyjson_mut_obj_add_real(doc, task_obj, "estimated_tuples_per_task_s", profile.estimated_tuples_per_task_s);
 		if (duration_ns > 0) {
 			yyjson_mut_obj_add_real(doc, task_obj, "pipeline_input_tuples_per_s",
 			                        SourceTuplesPerTaskSecond(profile.pipeline_input_tuples, duration_ns));
