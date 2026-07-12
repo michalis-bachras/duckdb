@@ -134,9 +134,10 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(query_estimate.mean_sla_cost > 0);
 
 	QueryRequestPipelineProfileEstimate pipeline_estimate;
-	REQUIRE(store.TryGetPipelineEstimate(101, 10, signature_hash, pipeline_estimate));
+	REQUIRE(store.TryGetPipelineEstimate(101, 10, 7, signature_hash, pipeline_estimate));
 	REQUIRE(pipeline_estimate.valid);
 	REQUIRE(pipeline_estimate.sample_count == 2);
+	REQUIRE(pipeline_estimate.pipeline_id == 7);
 	REQUIRE(pipeline_estimate.pipeline_signature_hash == signature_hash);
 	REQUIRE(pipeline_estimate.operator_type_sequence == "TABLE_SCAN>PROJECTION>HASH_GROUP_BY");
 	REQUIRE(pipeline_estimate.source_type == "TABLE_SCAN");
@@ -156,6 +157,37 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(store.QueryProfileCount() == 1);
 	REQUIRE(store.TryGetQueryEstimate(202, 10, query_estimate));
 	REQUIRE(query_estimate.sample_count == 100);
+
+	store.Clear();
+}
+
+TEST_CASE("Query request profile store separates repeated local pipeline signatures by pipeline id", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+
+	auto first_pipeline = PipelineProfile(2000);
+	auto second_pipeline = PipelineProfile(3000);
+	second_pipeline.pipeline_id = 17;
+	auto signature_hash = StableStringHash64(PipelineSignature(first_pipeline));
+	REQUIRE(StableStringHash64(PipelineSignature(second_pipeline)) == signature_hash);
+
+	duckdb::vector<PipelineProfilingInfo> pipelines;
+	pipelines.push_back(first_pipeline);
+	pipelines.push_back(second_pipeline);
+
+	store.RecordQueryCompletion(Metadata(1, 101, 10, 1000, 9000), 11000, pipelines);
+
+	REQUIRE(store.PipelineProfileCount() == 2);
+
+	QueryRequestPipelineProfileEstimate first_estimate;
+	REQUIRE(store.TryGetPipelineEstimate(101, 10, 7, signature_hash, first_estimate));
+	REQUIRE(first_estimate.valid);
+	REQUIRE(first_estimate.pipeline_id == 7);
+
+	QueryRequestPipelineProfileEstimate second_estimate;
+	REQUIRE(store.TryGetPipelineEstimate(101, 10, 17, signature_hash, second_estimate));
+	REQUIRE(second_estimate.valid);
+	REQUIRE(second_estimate.pipeline_id == 17);
 
 	store.Clear();
 }

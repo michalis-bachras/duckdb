@@ -28,6 +28,7 @@ struct QueryRequestProfileEstimate {
 struct QueryRequestPipelineProfileEstimate {
 	bool valid = false;
 	idx_t sample_count = 0;
+	idx_t pipeline_id = 0;
 	uint64_t pipeline_signature_hash = 0;
 	string pipeline_signature;
 	string operator_type_sequence;
@@ -109,8 +110,8 @@ public:
 	void RecordQueryCompletion(const QueryRequestMetadata &metadata, uint64_t query_end_ns,
 	                           const vector<PipelineProfilingInfo> &pipeline_profiles);
 	bool TryGetQueryEstimate(uint64_t template_id, uint64_t scale_factor, QueryRequestProfileEstimate &estimate) const;
-	bool TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor, uint64_t pipeline_signature_hash,
-	                            QueryRequestPipelineProfileEstimate &estimate) const;
+	bool TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor, idx_t pipeline_id,
+	                            uint64_t pipeline_signature_hash, QueryRequestPipelineProfileEstimate &estimate) const;
 	vector<QueryRequestProfileSnapshot> GetQueryProfilesSnapshot() const;
 	vector<QueryRequestPipelineProfileSnapshot> GetPipelineProfilesSnapshot() const;
 	vector<QueryRequestSampleSnapshot> GetQuerySamplesSnapshot() const;

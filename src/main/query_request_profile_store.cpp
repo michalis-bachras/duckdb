@@ -93,11 +93,12 @@ struct QueryProfileKeyHash {
 struct PipelineProfileKey {
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
+	idx_t pipeline_id = 0;
 	uint64_t pipeline_signature_hash = 0;
 
 	bool operator==(const PipelineProfileKey &other) const {
 		return template_id == other.template_id && scale_factor == other.scale_factor &&
-		       pipeline_signature_hash == other.pipeline_signature_hash;
+		       pipeline_id == other.pipeline_id && pipeline_signature_hash == other.pipeline_signature_hash;
 	}
 };
 
@@ -105,6 +106,7 @@ struct PipelineProfileKeyHash {
 	size_t operator()(const PipelineProfileKey &key) const {
 		size_t result = std::hash<uint64_t> {}(key.template_id);
 		result ^= std::hash<uint64_t> {}(key.scale_factor) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<idx_t> {}(key.pipeline_id) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
 		result ^= std::hash<uint64_t> {}(key.pipeline_signature_hash) + 0x9e3779b97f4a7c15ULL + (result << 6) +
 		          (result >> 2);
 		return result;
@@ -122,6 +124,7 @@ struct QueryProfileAggregate {
 struct PipelineProfileAggregate {
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
+	idx_t pipeline_id = 0;
 	uint64_t pipeline_signature_hash = 0;
 	string pipeline_signature;
 	string operator_type_sequence;
@@ -186,6 +189,7 @@ static void PopulatePipelineEstimate(const PipelineProfileAggregate &profile,
                                      QueryRequestPipelineProfileEstimate &estimate) {
 	estimate.valid = true;
 	estimate.sample_count = profile.task_count.Count();
+	estimate.pipeline_id = profile.pipeline_id;
 	estimate.pipeline_signature_hash = profile.pipeline_signature_hash;
 	estimate.pipeline_signature = profile.pipeline_signature;
 	estimate.operator_type_sequence = profile.operator_type_sequence;
@@ -255,10 +259,12 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		PipelineProfileKey pipeline_key;
 		pipeline_key.template_id = metadata.template_id;
 		pipeline_key.scale_factor = metadata.scale_factor;
+		pipeline_key.pipeline_id = profile.pipeline_id;
 		pipeline_key.pipeline_signature_hash = signature_hash;
 		auto &pipeline_profile = g_pipeline_profiles[pipeline_key];
 		pipeline_profile.template_id = metadata.template_id;
 		pipeline_profile.scale_factor = metadata.scale_factor;
+		pipeline_profile.pipeline_id = profile.pipeline_id;
 		pipeline_profile.pipeline_signature_hash = signature_hash;
 		pipeline_profile.pipeline_signature = signature;
 		pipeline_profile.operator_type_sequence = profile.operator_type_sequence;
@@ -327,13 +333,14 @@ bool QueryRequestProfileStore::TryGetQueryEstimate(uint64_t template_id, uint64_
 	return true;
 }
 
-bool QueryRequestProfileStore::TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor,
+bool QueryRequestProfileStore::TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor, idx_t pipeline_id,
                                                       uint64_t pipeline_signature_hash,
                                                       QueryRequestPipelineProfileEstimate &estimate) const {
 	lock_guard<std::mutex> guard(g_profile_store_lock);
 	PipelineProfileKey key;
 	key.template_id = template_id;
 	key.scale_factor = scale_factor;
+	key.pipeline_id = pipeline_id;
 	key.pipeline_signature_hash = pipeline_signature_hash;
 	auto entry = g_pipeline_profiles.find(key);
 	if (entry == g_pipeline_profiles.end()) {
@@ -382,6 +389,9 @@ vector<QueryRequestPipelineProfileSnapshot> QueryRequestProfileStore::GetPipelin
 		}
 		if (left.scale_factor != right.scale_factor) {
 			return left.scale_factor < right.scale_factor;
+		}
+		if (left.estimate.pipeline_id != right.estimate.pipeline_id) {
+			return left.estimate.pipeline_id < right.estimate.pipeline_id;
 		}
 		return left.estimate.pipeline_signature_hash < right.estimate.pipeline_signature_hash;
 	});

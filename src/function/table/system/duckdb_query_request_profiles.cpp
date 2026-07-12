@@ -117,6 +117,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineProfilesBind(ClientCon
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("scale_factor");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("pipeline_signature_hash");
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("sample_count");
@@ -171,6 +173,7 @@ static void DuckDBQueryRequestPipelineProfilesFunction(ClientContext &context, T
 		idx_t col = 0;
 		output.SetValue(col++, count, Value::UBIGINT(profile.template_id));
 		output.SetValue(col++, count, Value::UBIGINT(profile.scale_factor));
+		output.SetValue(col++, count, Value::UBIGINT(estimate.pipeline_id));
 		output.SetValue(col++, count, Value::UBIGINT(estimate.pipeline_signature_hash));
 		output.SetValue(col++, count, Value::UBIGINT(estimate.sample_count));
 		output.SetValue(col++, count, Value(estimate.pipeline_signature));
