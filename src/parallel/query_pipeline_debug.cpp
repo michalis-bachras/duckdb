@@ -109,6 +109,12 @@ static void PopulateEventInfo(QueryPipelineDebugEventSnapshot &snapshot, Event &
 	snapshot.timestamp_ns = TimestampNs();
 	snapshot.total_tasks = event.GetTotalTasks();
 	snapshot.finished_tasks = event.GetFinishedTasks();
+	if (snapshot.finished_tasks > snapshot.total_tasks) {
+		snapshot.finished_tasks = snapshot.total_tasks;
+	}
+	snapshot.remaining_tasks = snapshot.total_tasks - snapshot.finished_tasks;
+	snapshot.preferred_parallelism = snapshot.remaining_tasks;
+	snapshot.parallelism_valid = snapshot.total_tasks > 0;
 }
 
 static void PopulateWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, const PipelineWorkSnapshot &work) {
@@ -124,6 +130,11 @@ static void PopulateWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, const Pi
 	snapshot.completed_chunks_equiv = work.completed_chunks_equiv;
 	snapshot.completed_native_units = work.completed_native_units;
 	snapshot.remaining_chunks_equiv = work.remaining_chunks_equiv;
+	if (work.parallelism_valid && !snapshot.parallelism_valid) {
+		snapshot.remaining_tasks = work.remaining_tasks;
+		snapshot.preferred_parallelism = work.preferred_parallelism;
+		snapshot.parallelism_valid = true;
+	}
 	if (!snapshot.pipeline_id) {
 		snapshot.pipeline_id = work.pipeline_id;
 	}
@@ -204,7 +215,7 @@ void QueryPipelineDebug::RecordLifecycleSchedule(Pipeline &pipeline, Event &even
 	AppendDebugEvent(std::move(snapshot));
 }
 
-void QueryPipelineDebug::RecordWorkProgress(Pipeline &pipeline) {
+void QueryPipelineDebug::RecordWorkProgress(Pipeline &pipeline, Event *event) {
 	QueryPipelineDebugEventSnapshot snapshot;
 	if (!PopulateMetadata(pipeline.GetClientContext(), snapshot)) {
 		return;
@@ -213,10 +224,14 @@ void QueryPipelineDebug::RecordWorkProgress(Pipeline &pipeline) {
 	if (!pipeline.GetWorkSnapshot(work) || !work.valid || work.total_chunks_equiv == 0) {
 		return;
 	}
-	snapshot.pipeline_id = pipeline.GetProfilerPipelineId();
-	snapshot.event_kind = "pipeline";
+	if (event) {
+		PopulateEventInfo(snapshot, *event);
+	} else {
+		snapshot.pipeline_id = pipeline.GetProfilerPipelineId();
+		snapshot.event_kind = "pipeline";
+		snapshot.timestamp_ns = TimestampNs();
+	}
 	snapshot.event_state = "work_progress";
-	snapshot.timestamp_ns = TimestampNs();
 	snapshot.scheduler_threads =
 	    NumericCast<idx_t>(TaskScheduler::GetScheduler(pipeline.GetClientContext()).NumberOfThreads());
 	PopulateWorkInfo(snapshot, work);

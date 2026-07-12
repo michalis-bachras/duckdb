@@ -20,6 +20,7 @@
 
 namespace duckdb {
 class Executor;
+class Event;
 
 //! The result of executing a PipelineExecutor
 enum class PipelineExecuteResult {
@@ -83,6 +84,7 @@ public:
 
 	//! Registers the task in the interrupt_state to allow Source/Sink operators to block the task
 	void SetTaskForInterrupts(weak_ptr<Task> current_task);
+	void SetPipelineEventForDebug(Event *event);
 	void ResetSourceThroughputCounters();
 	const SourceThroughputCounters &GetSourceThroughputCounters() const;
 	const PipelineInputCounters &GetPipelineInputCounters() const;
@@ -115,6 +117,7 @@ private:
 	idx_t published_source_work_units = 0;
 	bool collect_source_throughput = false;
 	bool collect_pipeline_input = false;
+	Event *debug_event = nullptr;
 
 	//! The final chunk used for moving data into the sink
 	DataChunk final_chunk;

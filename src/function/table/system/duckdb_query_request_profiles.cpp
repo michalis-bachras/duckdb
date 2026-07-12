@@ -561,6 +561,10 @@ static unique_ptr<FunctionData> DuckDBQueryPipelineEventsBind(ClientContext &con
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("finished_tasks");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("remaining_tasks");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("preferred_parallelism");
+	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("effective_max_threads");
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("source_max_threads");
@@ -572,6 +576,8 @@ static unique_ptr<FunctionData> DuckDBQueryPipelineEventsBind(ClientContext &con
 	names.emplace_back("parallel_blocker");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("work_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("parallelism_valid");
 	return_types.emplace_back(LogicalType::BOOLEAN);
 	names.emplace_back("scalable");
 	return_types.emplace_back(LogicalType::BOOLEAN);
@@ -628,12 +634,15 @@ static void DuckDBQueryPipelineEventsFunction(ClientContext &context, TableFunct
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.timestamp_ns));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.total_tasks));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.finished_tasks));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.remaining_tasks));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.preferred_parallelism));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.effective_max_threads));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.source_max_threads));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.scheduler_threads));
 		output.SetValue(col++, count, Value::BOOLEAN(snapshot.parallel));
 		output.SetValue(col++, count, Value(snapshot.parallel_blocker));
 		output.SetValue(col++, count, Value::BOOLEAN(snapshot.work_valid));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.parallelism_valid));
 		output.SetValue(col++, count, Value::BOOLEAN(snapshot.scalable));
 		output.SetValue(col++, count, Value(snapshot.source_input_kind));
 		output.SetValue(col++, count, Value(snapshot.source_input_confidence));

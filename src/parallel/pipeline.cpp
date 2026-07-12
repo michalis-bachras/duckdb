@@ -128,6 +128,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	if (!pipeline_executor) {
 		pipeline_executor = make_uniq<PipelineExecutor>(pipeline.GetClientContext(), pipeline);
 	}
+	pipeline_executor->SetPipelineEventForDebug(event.get());
 	pipeline_executor->ResetSourceThroughputCounters();
 
 	pipeline_executor->SetTaskForInterrupts(shared_from_this());
@@ -250,7 +251,7 @@ bool Pipeline::SourceWorkTrackingEnabled() const {
 	return source_work_tracking_enabled.load();
 }
 
-void Pipeline::RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units) {
+void Pipeline::RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units, Event *event) {
 	if (!SourceWorkTrackingEnabled()) {
 		return;
 	}
@@ -268,7 +269,7 @@ void Pipeline::RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t na
 		source_work_completed_native_units.fetch_add(native_units);
 	}
 	if (completed_chunks_equiv > 0 && ShouldRecordSourceWorkDebugSample(completed_chunks_equiv)) {
-		QueryPipelineDebug::RecordWorkProgress(*this);
+		QueryPipelineDebug::RecordWorkProgress(*this, event);
 	}
 }
 

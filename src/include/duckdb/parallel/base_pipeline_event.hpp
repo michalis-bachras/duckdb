@@ -26,6 +26,18 @@ public:
 		if (!pipeline) {
 			return false;
 		}
+		auto populate_parallelism = [this](PipelineWorkSnapshot &snapshot) {
+			auto scheduled_tasks = GetTotalTasks();
+			auto finished_tasks = GetFinishedTasks();
+			if (finished_tasks > scheduled_tasks) {
+				finished_tasks = scheduled_tasks;
+			}
+			snapshot.scheduled_tasks = scheduled_tasks;
+			snapshot.finished_tasks = finished_tasks;
+			snapshot.remaining_tasks = scheduled_tasks - finished_tasks;
+			snapshot.preferred_parallelism = snapshot.remaining_tasks;
+			snapshot.parallelism_valid = scheduled_tasks > 0;
+		};
 		if (GetQueryActivationKind() != QueryActivationEventKind::PIPELINE) {
 			snapshot = PipelineWorkSnapshot();
 			snapshot.pipeline_id = pipeline->GetProfilerPipelineId();
@@ -33,9 +45,16 @@ public:
 			snapshot.source_input_confidence = "exact";
 			snapshot.valid = true;
 			snapshot.scalable = false;
+			populate_parallelism(snapshot);
 			return true;
 		}
-		return pipeline->GetWorkSnapshot(snapshot);
+		auto has_work_snapshot = pipeline->GetWorkSnapshot(snapshot);
+		if (!has_work_snapshot) {
+			snapshot = PipelineWorkSnapshot();
+			snapshot.pipeline_id = pipeline->GetProfilerPipelineId();
+		}
+		populate_parallelism(snapshot);
+		return true;
 	}
 
 	//! The pipeline that this event belongs to

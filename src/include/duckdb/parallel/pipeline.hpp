@@ -22,6 +22,7 @@ namespace duckdb {
 
 class Executor;
 class EnergyAttributionQueryHandle;
+class Event;
 class MetaPipeline;
 class PipelineExecutor;
 class Pipeline;
@@ -40,8 +41,13 @@ struct PipelineWorkSnapshot {
 	idx_t remaining_chunks_equiv = 0;
 	idx_t source_max_threads = 0;
 	idx_t effective_max_threads = 0;
+	idx_t scheduled_tasks = 0;
+	idx_t finished_tasks = 0;
+	idx_t remaining_tasks = 0;
+	idx_t preferred_parallelism = 0;
 	bool scalable = false;
 	bool valid = false;
+	bool parallelism_valid = false;
 };
 
 class PipelineTask : public ExecutorTask {
@@ -149,7 +155,7 @@ public:
 	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                           idx_t pipeline_input_tuples, idx_t pipeline_input_chunks, uint64_t task_duration_ns);
 	bool SourceWorkTrackingEnabled() const;
-	void RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units);
+	void RecordSourceWorkProgress(idx_t rows, idx_t chunks_equiv, idx_t native_units, Event *event = nullptr);
 	bool GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const;
 
 	//! Registers a new batch index for a pipeline executor - returns the current minimum batch index

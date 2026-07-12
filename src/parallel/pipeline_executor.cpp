@@ -511,6 +511,10 @@ const PipelineInputCounters &PipelineExecutor::GetPipelineInputCounters() const 
 	return pipeline_input_counters;
 }
 
+void PipelineExecutor::SetPipelineEventForDebug(Event *event) {
+	debug_event = event;
+}
+
 void PipelineExecutor::PublishSourceWorkProgress() {
 	if (!pipeline.SourceWorkTrackingEnabled() ||
 	    (!source_throughput_counters.reported && !source_throughput_counters.work_reported)) {
@@ -523,7 +527,7 @@ void PipelineExecutor::PublishSourceWorkProgress() {
 		}
 		auto delta_work_units = work_units - published_source_work_units;
 		if (delta_work_units != 0) {
-			pipeline.RecordSourceWorkProgress(0, delta_work_units, delta_work_units);
+			pipeline.RecordSourceWorkProgress(0, delta_work_units, delta_work_units, debug_event);
 			published_source_work_units = work_units;
 		}
 		return;
@@ -541,7 +545,7 @@ void PipelineExecutor::PublishSourceWorkProgress() {
 	auto delta_chunks = chunks - published_source_chunks_equiv;
 	auto delta_native_units = native_units - published_source_native_units;
 	if (delta_rows != 0 || delta_chunks != 0 || delta_native_units != 0) {
-		pipeline.RecordSourceWorkProgress(delta_rows, delta_chunks, delta_native_units);
+		pipeline.RecordSourceWorkProgress(delta_rows, delta_chunks, delta_native_units, debug_event);
 		published_source_rows = rows;
 		published_source_chunks_equiv = chunks;
 		published_source_native_units = native_units;
