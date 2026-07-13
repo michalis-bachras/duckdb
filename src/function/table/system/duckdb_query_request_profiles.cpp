@@ -159,6 +159,14 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineProfilesBind(ClientCon
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("ewma_single_worker_chunks_per_s");
 	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("continuation_sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("mean_effective_ns_per_work_unit");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("p50_effective_ns_per_work_unit");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("p90_effective_ns_per_work_unit");
+	return_types.emplace_back(LogicalType::DOUBLE);
 	return nullptr;
 }
 
@@ -200,6 +208,10 @@ static void DuckDBQueryRequestPipelineProfilesFunction(ClientContext &context, T
 		output.SetValue(col++, count, Value::UBIGINT(estimate.throughput_sample_count));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_single_worker_chunks_per_s));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.ewma_single_worker_chunks_per_s));
+		output.SetValue(col++, count, Value::UBIGINT(estimate.continuation_sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_effective_ns_per_work_unit));
+		output.SetValue(col++, count, Value::DOUBLE(estimate.p50_effective_ns_per_work_unit));
+		output.SetValue(col++, count, Value::DOUBLE(estimate.p90_effective_ns_per_work_unit));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -330,6 +342,10 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineInstancesBind(ClientCo
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("downstream_suffix_ns");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("effective_ns_per_work_unit");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("continuation_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
 	return nullptr;
 }
 
@@ -376,6 +392,8 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 		output.SetValue(col++, count, Value::UBIGINT(instance.task_runtime_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.lifecycle_runtime_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.downstream_suffix_ns));
+		output.SetValue(col++, count, Value::DOUBLE(instance.effective_ns_per_work_unit));
+		output.SetValue(col++, count, Value::BOOLEAN(instance.continuation_valid));
 		count++;
 	}
 	output.SetCardinality(count);

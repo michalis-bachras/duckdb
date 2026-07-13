@@ -130,6 +130,8 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_instances[0].task_runtime_ns == 700);
 	REQUIRE(pipeline_instances[0].lifecycle_runtime_ns == 900);
 	REQUIRE(pipeline_instances[0].downstream_suffix_ns == 8300);
+	REQUIRE(pipeline_instances[0].continuation_valid);
+	REQUIRE(pipeline_instances[0].effective_ns_per_work_unit == 112.5);
 
 	QueryRequestProfileEstimate query_estimate;
 	REQUIRE(store.TryGetQueryEstimate(101, 10, query_estimate));
@@ -159,6 +161,10 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_estimate.throughput_sample_count == 2);
 	REQUIRE(pipeline_estimate.mean_single_worker_chunks_per_s == 1500000.0);
 	REQUIRE(pipeline_estimate.ewma_single_worker_chunks_per_s == 1300000.0);
+	REQUIRE(pipeline_estimate.continuation_sample_count == 2);
+	REQUIRE(pipeline_estimate.mean_effective_ns_per_work_unit == 112.5);
+	REQUIRE(pipeline_estimate.p50_effective_ns_per_work_unit == 112.5);
+	REQUIRE(pipeline_estimate.p90_effective_ns_per_work_unit == 112.5);
 
 	store.Clear();
 	for (idx_t i = 0; i < 105; i++) {
@@ -168,6 +174,45 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(store.QueryProfileCount() == 1);
 	REQUIRE(store.TryGetQueryEstimate(202, 10, query_estimate));
 	REQUIRE(query_estimate.sample_count == 100);
+
+	store.Clear();
+}
+
+TEST_CASE("Query request profile store tracks bounded continuation percentiles", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+
+	auto signature_hash = StableStringHash64(PipelineSignature(PipelineProfile(1000)));
+	QueryRequestPipelineProfileEstimate pipeline_estimate;
+	for (idx_t i = 0; i < 10; i++) {
+		auto start_ns = 100000 + i * 1000000;
+		auto pipeline = PipelineProfile(start_ns);
+		pipeline.finish_done_ns = start_ns + (i + 1) * 8000;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(i, 303, 10, start_ns, start_ns + 100000000), start_ns + 200000000,
+		                            pipelines);
+	}
+	REQUIRE(store.TryGetPipelineEstimate(303, 10, 7, signature_hash, pipeline_estimate));
+	REQUIRE(pipeline_estimate.continuation_sample_count == 10);
+	REQUIRE(pipeline_estimate.mean_effective_ns_per_work_unit == 5500.0);
+	REQUIRE(pipeline_estimate.p50_effective_ns_per_work_unit == 5000.0);
+	REQUIRE(pipeline_estimate.p90_effective_ns_per_work_unit == 9000.0);
+
+	for (idx_t i = 10; i < 105; i++) {
+		auto start_ns = 100000 + i * 1000000;
+		auto pipeline = PipelineProfile(start_ns);
+		pipeline.finish_done_ns = start_ns + (i + 1) * 8000;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(i, 303, 10, start_ns, start_ns + 100000000), start_ns + 200000000,
+		                            pipelines);
+	}
+	REQUIRE(store.TryGetPipelineEstimate(303, 10, 7, signature_hash, pipeline_estimate));
+	REQUIRE(pipeline_estimate.continuation_sample_count == 100);
+	REQUIRE(pipeline_estimate.mean_effective_ns_per_work_unit == 55500.0);
+	REQUIRE(pipeline_estimate.p50_effective_ns_per_work_unit == 55000.0);
+	REQUIRE(pipeline_estimate.p90_effective_ns_per_work_unit == 95000.0);
 
 	store.Clear();
 }

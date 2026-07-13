@@ -13,6 +13,7 @@
 #include <cmath>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 namespace duckdb {
@@ -21,6 +22,8 @@ namespace {
 
 static const idx_t PROFILE_SAMPLE_LIMIT = 100;
 static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
+static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
+static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
 
 struct BoundedSamples {
 	std::deque<double> values;
@@ -72,6 +75,124 @@ struct BoundedSamples {
 		auto fraction = position - static_cast<double>(lower_index);
 		return sorted[lower_index] * (1.0 - fraction) + sorted[upper_index] * fraction;
 	}
+};
+
+struct QuantileEntry {
+	double value = 0;
+	uint64_t id = 0;
+
+	QuantileEntry() = default;
+	QuantileEntry(double value_p, uint64_t id_p) : value(value_p), id(id_p) {
+	}
+
+	bool operator<(const QuantileEntry &other) const {
+		if (value < other.value) {
+			return true;
+		}
+		if (value > other.value) {
+			return false;
+		}
+		return id < other.id;
+	}
+};
+
+class BoundedQuantileTracker {
+public:
+	explicit BoundedQuantileTracker(double quantile_p) : quantile(quantile_p) {
+	}
+
+	void Add(double value) {
+		if (!std::isfinite(value)) {
+			return;
+		}
+		QuantileEntry entry {value, next_id++};
+		if (lower.empty() || value <= lower.rbegin()->value) {
+			lower.insert(entry);
+		} else {
+			upper.insert(entry);
+		}
+		window.push_back(entry);
+		if (window.size() > PROFILE_SAMPLE_LIMIT) {
+			Remove(window.front());
+			window.pop_front();
+		}
+		Rebalance();
+	}
+
+	idx_t Count() const {
+		return lower.size() + upper.size();
+	}
+
+	double Quantile() const {
+		return lower.empty() ? 0 : lower.rbegin()->value;
+	}
+
+private:
+	idx_t TargetLowerSize() const {
+		auto count = Count();
+		if (count == 0) {
+			return 0;
+		}
+		auto target = static_cast<idx_t>(std::ceil(quantile * static_cast<double>(count)));
+		return MaxValue<idx_t>(idx_t(1), MinValue<idx_t>(target, count));
+	}
+
+	void Remove(const QuantileEntry &entry) {
+		auto lower_entry = lower.find(entry);
+		if (lower_entry != lower.end()) {
+			lower.erase(lower_entry);
+			return;
+		}
+		auto upper_entry = upper.find(entry);
+		if (upper_entry != upper.end()) {
+			upper.erase(upper_entry);
+		}
+	}
+
+	void MoveLowerToUpper() {
+		D_ASSERT(!lower.empty());
+		auto entry = std::prev(lower.end());
+		upper.insert(*entry);
+		lower.erase(entry);
+	}
+
+	void MoveUpperToLower() {
+		D_ASSERT(!upper.empty());
+		auto entry = upper.begin();
+		lower.insert(*entry);
+		upper.erase(entry);
+	}
+
+	void RebalanceOrdering() {
+		while (!lower.empty() && !upper.empty() && lower.rbegin()->value > upper.begin()->value) {
+			auto lower_entry = std::prev(lower.end());
+			auto upper_entry = upper.begin();
+			auto lower_value = *lower_entry;
+			auto upper_value = *upper_entry;
+			lower.erase(lower_entry);
+			upper.erase(upper_entry);
+			lower.insert(upper_value);
+			upper.insert(lower_value);
+		}
+	}
+
+	void Rebalance() {
+		RebalanceOrdering();
+		auto target = TargetLowerSize();
+		while (lower.size() > target) {
+			MoveLowerToUpper();
+		}
+		while (lower.size() < target && !upper.empty()) {
+			MoveUpperToLower();
+		}
+		RebalanceOrdering();
+	}
+
+	std::deque<QuantileEntry> window;
+	std::multiset<QuantileEntry> lower;
+	std::multiset<QuantileEntry> upper;
+	uint64_t next_id = 1;
+	double quantile;
 };
 
 struct QueryProfileKey {
@@ -142,6 +263,9 @@ struct PipelineProfileAggregate {
 	BoundedSamples lifecycle_runtime_ns;
 	BoundedSamples downstream_suffix_ns;
 	BoundedSamples single_worker_chunks_per_s;
+	BoundedSamples effective_ns_per_work_unit;
+	BoundedQuantileTracker p50_effective_ns_per_work_unit {CONTINUATION_MEDIAN_QUANTILE};
+	BoundedQuantileTracker p90_effective_ns_per_work_unit {CONTINUATION_TAIL_QUANTILE};
 	double ewma_single_worker_chunks_per_s = 0;
 };
 
@@ -172,6 +296,13 @@ static double SingleWorkerChunksPerSecond(idx_t chunks_equiv, uint64_t worker_ti
 		return 0;
 	}
 	return (static_cast<double>(chunks_equiv) * 1000000000.0) / static_cast<double>(worker_time_ns);
+}
+
+static double EffectiveNsPerWorkUnit(uint64_t duration_ns, idx_t chunks_equiv) {
+	if (chunks_equiv == 0 || duration_ns == 0) {
+		return 0;
+	}
+	return static_cast<double>(duration_ns) / static_cast<double>(chunks_equiv);
 }
 
 static string BuildPipelineSignature(const PipelineProfilingInfo &profile) {
@@ -219,6 +350,10 @@ static void PopulatePipelineEstimate(const PipelineProfileAggregate &profile,
 	estimate.throughput_sample_count = profile.single_worker_chunks_per_s.Count();
 	estimate.mean_single_worker_chunks_per_s = profile.single_worker_chunks_per_s.Mean();
 	estimate.ewma_single_worker_chunks_per_s = profile.ewma_single_worker_chunks_per_s;
+	estimate.continuation_sample_count = profile.effective_ns_per_work_unit.Count();
+	estimate.mean_effective_ns_per_work_unit = profile.effective_ns_per_work_unit.Mean();
+	estimate.p50_effective_ns_per_work_unit = profile.p50_effective_ns_per_work_unit.Quantile();
+	estimate.p90_effective_ns_per_work_unit = profile.p90_effective_ns_per_work_unit.Quantile();
 }
 
 } // namespace
@@ -341,6 +476,15 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 			auto lifecycle_runtime_ns = profile.finish_done_ns - profile.start_ns;
 			pipeline_profile.lifecycle_runtime_ns.Add(static_cast<double>(lifecycle_runtime_ns));
 			pipeline_instance.lifecycle_runtime_ns = lifecycle_runtime_ns;
+			auto effective_ns_per_work_unit =
+			    EffectiveNsPerWorkUnit(lifecycle_runtime_ns, profile.planned_input_chunks_equiv);
+			if (effective_ns_per_work_unit > 0) {
+				pipeline_profile.effective_ns_per_work_unit.Add(effective_ns_per_work_unit);
+				pipeline_profile.p50_effective_ns_per_work_unit.Add(effective_ns_per_work_unit);
+				pipeline_profile.p90_effective_ns_per_work_unit.Add(effective_ns_per_work_unit);
+				pipeline_instance.effective_ns_per_work_unit = effective_ns_per_work_unit;
+				pipeline_instance.continuation_valid = true;
+			}
 		}
 		g_pipeline_instances.push_back(std::move(pipeline_instance));
 	}

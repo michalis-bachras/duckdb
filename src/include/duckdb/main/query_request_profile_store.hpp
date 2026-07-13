@@ -48,6 +48,10 @@ struct QueryRequestPipelineProfileEstimate {
 	idx_t throughput_sample_count = 0;
 	double mean_single_worker_chunks_per_s = 0;
 	double ewma_single_worker_chunks_per_s = 0;
+	idx_t continuation_sample_count = 0;
+	double mean_effective_ns_per_work_unit = 0;
+	double p50_effective_ns_per_work_unit = 0;
+	double p90_effective_ns_per_work_unit = 0;
 };
 
 struct QueryRequestProfileSnapshot {
@@ -107,7 +111,9 @@ struct QueryRequestPipelineInstanceSnapshot {
 	uint64_t task_runtime_ns = 0;
 	uint64_t lifecycle_runtime_ns = 0;
 	uint64_t downstream_suffix_ns = 0;
+	double effective_ns_per_work_unit = 0;
 	bool throughput_valid = false;
+	bool continuation_valid = false;
 };
 
 class QueryRequestProfileStore {
