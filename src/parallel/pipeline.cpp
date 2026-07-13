@@ -13,6 +13,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
+#include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/query_pipeline_debug.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
@@ -80,16 +81,7 @@ static bool SourceInputUsesNativeWorkUnits(const SourceInputVolume &source_input
 }
 
 static bool SourceWorkKindMatches(const string &planned_kind, const string &reported_kind) {
-	if (planned_kind == reported_kind) {
-		return true;
-	}
-	if (planned_kind == "table_rows_upper_bound" && reported_kind == "base_table_rows") {
-		return true;
-	}
-	if (planned_kind == "index_scan_row_ids" && reported_kind == "index_rowids") {
-		return true;
-	}
-	return false;
+	return planned_kind == reported_kind;
 }
 
 static bool SourceWorkUnitMatches(const string &planned_unit, const string &reported_unit) {
@@ -277,6 +269,7 @@ void Pipeline::ResetSourceWorkTracking() {
 	source_work_source_max_threads = 0;
 	source_work_effective_max_threads = 0;
 	source_work_scalable = false;
+	continuation_estimate = PipelineContinuationEstimate();
 	source_work_completed_rows.store(0);
 	source_work_completed_chunks_equiv.store(0);
 	source_work_completed_native_units.store(0);
@@ -302,7 +295,7 @@ void Pipeline::InitializeSourceWorkTracking(const SourceInputVolume &source_inpu
 		lock_guard<mutex> guard(source_work_lock);
 		source_work_valid = tracking_enabled;
 		source_work_uses_native_work_units = uses_native_work_units;
-		source_work_kind = source_input_volume.kind;
+		source_work_kind = SourceThroughputKindToString(source_input_volume.kind);
 		source_work_confidence = source_input_volume.confidence;
 		source_work_native_unit = source_input_volume.native_unit;
 		source_work_total_rows = source_input_volume.rows;
@@ -445,6 +438,7 @@ bool Pipeline::GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const {
 	snapshot.source_max_threads = source_work_source_max_threads;
 	snapshot.effective_max_threads = source_work_effective_max_threads;
 	snapshot.scalable = source_work_scalable;
+	snapshot.continuation_estimate = continuation_estimate;
 	return true;
 }
 
@@ -649,8 +643,17 @@ void Pipeline::RegisterProfilerPipeline() {
 void Pipeline::RecordProfilerStart(idx_t task_count, idx_t source_max_threads,
                                    const SourceInputVolume &source_input_volume) {
 	if (profiler_pipeline_id) {
-		QueryProfiler::Get(GetClientContext())
-		    .RecordPipelineProfileStart(profiler_pipeline_id, task_count, source_max_threads, source_input_volume);
+		auto &context = GetClientContext();
+		auto identity = QueryProfiler::Get(context).RecordPipelineProfileStart(
+		    profiler_pipeline_id, task_count, source_max_threads, source_input_volume);
+		QueryRequestMetadata metadata;
+		if (!identity.valid || !QueryRequestMetadataManager::TryGetActive(context, metadata)) {
+			return;
+		}
+		auto estimate = QueryRequestProfileStore::Get().ResolvePipelineContinuation(
+		    metadata.template_id, metadata.scale_factor, identity, SourceInputChunksEquiv(source_input_volume));
+		lock_guard<mutex> guard(source_work_lock);
+		continuation_estimate = estimate;
 	}
 }
 

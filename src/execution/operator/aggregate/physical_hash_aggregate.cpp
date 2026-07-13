@@ -846,12 +846,12 @@ public:
 			auto &grouping = op.groupings[sidx];
 			auto &grouping_gstate = ht_state.grouping_states[sidx];
 			auto grouping_volume = grouping.table_data.GetSourceInputVolume(*grouping_gstate.table_state);
-			if (volume.kind == "unknown") {
+			if (volume.kind == SourceThroughputKind::UNKNOWN) {
 				volume.kind = grouping_volume.kind;
 				volume.confidence = grouping_volume.confidence;
 				volume.native_unit = grouping_volume.native_unit;
 			} else if (volume.kind != grouping_volume.kind) {
-				volume.kind = SourceThroughputKindToString(SourceThroughputKind::MIXED_SOURCE_TUPLES);
+				volume.kind = SourceThroughputKind::MIXED_SOURCE_TUPLES;
 				volume.confidence = "estimate";
 				volume.native_unit = string();
 			} else if (volume.confidence != grouping_volume.confidence && volume.confidence != "estimate") {

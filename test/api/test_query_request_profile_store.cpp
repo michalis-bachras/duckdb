@@ -4,6 +4,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
+#include "duckdb/parallel/query_pipeline_debug.hpp"
 #include "test_helpers.hpp"
 
 #include <chrono>
@@ -58,9 +59,13 @@ static PipelineProfilingInfo PipelineProfile(uint64_t start_ns) {
 	PipelineProfilingInfo profile;
 	profile.pipeline_id = 7;
 	profile.operator_type_sequence = "TABLE_SCAN>PROJECTION>HASH_GROUP_BY";
+	profile.source_operator_type = PhysicalOperatorType::TABLE_SCAN;
+	profile.sink_operator_type = PhysicalOperatorType::HASH_GROUP_BY;
+	profile.source_work_class.source_type = PhysicalOperatorType::TABLE_SCAN;
+	profile.source_work_class.work_kind = SourceThroughputKind::TABLE_SCAN_ROWS;
 	profile.source_type = "TABLE_SCAN";
 	profile.sink_type = "HASH_GROUP_BY";
-	profile.source_input_kind = "scan_rows";
+	profile.source_input_kind = SourceThroughputKindToString(SourceThroughputKind::TABLE_SCAN_ROWS);
 	profile.source_input_confidence = "exact";
 	profile.planned_input_native_unit = "row";
 	profile.source_estimated_cardinality = 1000;
@@ -74,7 +79,20 @@ static PipelineProfilingInfo PipelineProfile(uint64_t start_ns) {
 	profile.start_ns = start_ns;
 	profile.tasks_done_ns = start_ns + 700;
 	profile.finish_done_ns = start_ns + 900;
+	profile.pipeline_signature = PipelineSignature(profile);
+	profile.pipeline_signature_hash = StableStringHash64(profile.pipeline_signature);
 	return profile;
+}
+
+static PipelineProfileIdentity PipelineIdentity(const PipelineProfilingInfo &profile) {
+	PipelineProfileIdentity identity;
+	identity.pipeline_id = profile.pipeline_id;
+	identity.pipeline_signature_hash = profile.pipeline_signature_hash;
+	identity.source_work_class = profile.source_work_class;
+	identity.sink_type = profile.sink_operator_type;
+	identity.planned_input_native_unit = profile.planned_input_native_unit;
+	identity.valid = identity.pipeline_id != 0 && identity.pipeline_signature_hash != 0;
+	return identity;
 }
 
 static string MetadataQuery(uint64_t request_id, uint64_t template_id, uint64_t scale_factor, const string &body) {
@@ -123,6 +141,7 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_instances[0].pipeline_id == 7);
 	REQUIRE(pipeline_instances[0].pipeline_signature_hash == signature_hash);
 	REQUIRE(pipeline_instances[0].operator_type_sequence == "TABLE_SCAN>PROJECTION>HASH_GROUP_BY");
+	REQUIRE(pipeline_instances[0].source_work_class == "TABLE_SCAN::table_scan_rows");
 	REQUIRE(pipeline_instances[0].worker_task_count == 6);
 	REQUIRE(pipeline_instances[0].worker_task_duration_ns == 4000);
 	REQUIRE(pipeline_instances[0].throughput_valid);
@@ -152,6 +171,7 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_estimate.operator_type_sequence == "TABLE_SCAN>PROJECTION>HASH_GROUP_BY");
 	REQUIRE(pipeline_estimate.source_type == "TABLE_SCAN");
 	REQUIRE(pipeline_estimate.sink_type == "HASH_GROUP_BY");
+	REQUIRE(pipeline_estimate.source_work_class == "TABLE_SCAN::table_scan_rows");
 	REQUIRE(pipeline_estimate.mean_task_count == 6);
 	REQUIRE(pipeline_estimate.mean_source_max_threads == 4);
 	REQUIRE(pipeline_estimate.mean_planned_input_rows == 1000);
@@ -213,6 +233,140 @@ TEST_CASE("Query request profile store tracks bounded continuation percentiles",
 	REQUIRE(pipeline_estimate.mean_effective_ns_per_work_unit == 55500.0);
 	REQUIRE(pipeline_estimate.p50_effective_ns_per_work_unit == 55000.0);
 	REQUIRE(pipeline_estimate.p90_effective_ns_per_work_unit == 95000.0);
+
+	store.Clear();
+}
+
+TEST_CASE("Query request continuation resolver uses hierarchical fallbacks", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+
+	auto pipeline = PipelineProfile(1000);
+	duckdb::vector<PipelineProfilingInfo> pipelines;
+	pipelines.push_back(pipeline);
+	store.RecordQueryCompletion(Metadata(1, 101, 10, 500, 100000), 5000, pipelines);
+
+	auto identity = PipelineIdentity(pipeline);
+	auto exact = store.ResolvePipelineContinuation(101, 10, identity, 8);
+	REQUIRE(exact.valid);
+	REQUIRE(exact.level == ContinuationEstimateLevel::EXACT);
+	REQUIRE(exact.kind == ContinuationEstimateKind::NS_PER_WORK_UNIT);
+	REQUIRE(exact.sample_count == 1);
+	REQUIRE(exact.p90 == 112.5);
+
+	auto source_sink = store.ResolvePipelineContinuation(202, 30, identity, 8000);
+	REQUIRE(source_sink.valid);
+	REQUIRE(source_sink.level == ContinuationEstimateLevel::SOURCE_SINK);
+	REQUIRE(source_sink.kind == ContinuationEstimateKind::NS_PER_WORK_UNIT);
+	REQUIRE(source_sink.p90 == exact.p90);
+
+	auto different_sink = identity;
+	different_sink.sink_type = PhysicalOperatorType::ORDER_BY;
+	auto source = store.ResolvePipelineContinuation(202, 30, different_sink, 8);
+	REQUIRE(source.valid);
+	REQUIRE(source.level == ContinuationEstimateLevel::SOURCE);
+	REQUIRE(source.kind == ContinuationEstimateKind::NS_PER_WORK_UNIT);
+	REQUIRE(source.p90 == exact.p90);
+
+	auto different_source = identity;
+	different_source.source_work_class.source_type = PhysicalOperatorType::HASH_JOIN;
+	different_source.source_work_class.work_kind = SourceThroughputKind::HASH_JOIN_BUILD_ROWS;
+	auto global = store.ResolvePipelineContinuation(202, 30, different_source, 8);
+	REQUIRE(global.valid);
+	REQUIRE(global.level == ContinuationEstimateLevel::GLOBAL_RAW);
+	REQUIRE(global.kind == ContinuationEstimateKind::RAW_LATENCY_NS);
+	REQUIRE(global.p90 == 900.0);
+
+	auto zero_work = store.ResolvePipelineContinuation(101, 10, identity, 0);
+	REQUIRE(zero_work.valid);
+	REQUIRE(zero_work.level == ContinuationEstimateLevel::EXACT);
+	REQUIRE(zero_work.kind == ContinuationEstimateKind::RAW_LATENCY_NS);
+	REQUIRE(zero_work.p90 == 900.0);
+
+	store.Clear();
+	auto empty = store.ResolvePipelineContinuation(101, 10, identity, 8);
+	REQUIRE_FALSE(empty.valid);
+	REQUIRE(empty.level == ContinuationEstimateLevel::NONE);
+	REQUIRE(empty.kind == ContinuationEstimateKind::INVALID);
+}
+
+TEST_CASE("Query request continuation uses task completion without an independent finish event", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+
+	auto pipeline = PipelineProfile(1000);
+	pipeline.source_operator_type = PhysicalOperatorType::HASH_JOIN;
+	pipeline.sink_operator_type = PhysicalOperatorType::HASH_JOIN;
+	pipeline.source_work_class.source_type = PhysicalOperatorType::HASH_JOIN;
+	pipeline.source_work_class.work_kind = SourceThroughputKind::NO_SOURCE_SCAN;
+	pipeline.source_type = "HASH_JOIN";
+	pipeline.sink_type = "HASH_JOIN";
+	pipeline.source_input_kind = SourceThroughputKindToString(SourceThroughputKind::NO_SOURCE_SCAN);
+	pipeline.planned_input_native_unit = "none";
+	pipeline.planned_input_rows = 0;
+	pipeline.planned_input_chunks_equiv = 0;
+	pipeline.finish_done_ns = 0;
+	pipeline.pipeline_signature = PipelineSignature(pipeline);
+	pipeline.pipeline_signature_hash = StableStringHash64(pipeline.pipeline_signature);
+
+	duckdb::vector<PipelineProfilingInfo> pipelines;
+	pipelines.push_back(pipeline);
+	store.RecordQueryCompletion(Metadata(1, 101, 10, 500, 100000), 5000, pipelines);
+
+	auto instances = store.GetPipelineInstancesSnapshot();
+	REQUIRE(instances.size() == 1);
+	REQUIRE(instances[0].tasks_done_ns == 1700);
+	REQUIRE(instances[0].finish_done_ns == 0);
+	REQUIRE(instances[0].lifecycle_runtime_ns == 700);
+	REQUIRE_FALSE(instances[0].continuation_valid);
+
+	QueryRequestPipelineProfileEstimate profile;
+	REQUIRE(store.TryGetPipelineEstimate(101, 10, pipeline.pipeline_id, pipeline.pipeline_signature_hash, profile));
+	REQUIRE(profile.mean_lifecycle_runtime_ns == 700.0);
+	REQUIRE(profile.continuation_sample_count == 0);
+
+	auto estimate = store.ResolvePipelineContinuation(101, 10, PipelineIdentity(pipeline), 0);
+	REQUIRE(estimate.valid);
+	REQUIRE(estimate.level == ContinuationEstimateLevel::EXACT);
+	REQUIRE(estimate.kind == ContinuationEstimateKind::RAW_LATENCY_NS);
+	REQUIRE(estimate.sample_count == 1);
+	REQUIRE(estimate.mean == 700.0);
+	REQUIRE(estimate.p50 == 700.0);
+	REQUIRE(estimate.p90 == 700.0);
+
+	store.Clear();
+}
+
+TEST_CASE("Query request continuation fallbacks reject incompatible native units", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+
+	auto rows_pipeline = PipelineProfile(1000);
+	duckdb::vector<PipelineProfilingInfo> rows_pipelines;
+	rows_pipelines.push_back(rows_pipeline);
+	store.RecordQueryCompletion(Metadata(1, 101, 10, 500, 100000), 5000, rows_pipelines);
+
+	auto partition_pipeline = PipelineProfile(3000);
+	partition_pipeline.planned_input_native_unit = "partition";
+	partition_pipeline.pipeline_signature = PipelineSignature(partition_pipeline);
+	partition_pipeline.pipeline_signature_hash = StableStringHash64(partition_pipeline.pipeline_signature);
+	duckdb::vector<PipelineProfilingInfo> partition_pipelines;
+	partition_pipelines.push_back(partition_pipeline);
+	store.RecordQueryCompletion(Metadata(2, 202, 30, 2500, 100000), 7000, partition_pipelines);
+
+	auto identity = PipelineIdentity(rows_pipeline);
+	identity.planned_input_native_unit = "partition";
+	auto fallback = store.ResolvePipelineContinuation(303, 100, identity, 8);
+	REQUIRE(fallback.valid);
+	REQUIRE(fallback.level == ContinuationEstimateLevel::GLOBAL_RAW);
+	REQUIRE(fallback.kind == ContinuationEstimateKind::RAW_LATENCY_NS);
+
+	auto profiles = store.GetContinuationProfilesSnapshot();
+	idx_t mismatches = 0;
+	for (const auto &profile : profiles) {
+		mismatches += profile.native_unit_mismatch_count;
+	}
+	REQUIRE(mismatches == 2);
 
 	store.Clear();
 }
@@ -317,6 +471,42 @@ TEST_CASE("Query request profile store records repeated metadata queries", "[api
 	REQUIRE(CHECK_COLUMN(pipeline_instances, 2, {Value::BIGINT(static_cast<int64_t>(store.PipelineProfileCount()))}));
 
 	store.Clear();
+}
+
+TEST_CASE("Query continuation profiles train in activation scheduler mode", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+	QueryPipelineDebug::ClearDebugSnapshot();
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE continuation_scheduler_t AS "
+	                          "SELECT i, i % 7 AS g FROM range(200000) tbl(i)"));
+
+	string body = "SELECT g, count(*), sum(i) FROM continuation_scheduler_t GROUP BY g ORDER BY g";
+	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9001, 6, 10, body)));
+	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9002, 6, 10, body)));
+
+	REQUIRE(store.QueryProfileCount() == 1);
+	REQUIRE(store.PipelineProfileCount() > 0);
+	auto exact_events = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_pipeline_events() "
+	    "WHERE request_id=9002 AND event_kind='pipeline' AND continuation_valid "
+	    "AND continuation_level='exact' AND continuation_kind='ns_per_work_unit'");
+	REQUIRE(!exact_events->HasError());
+	REQUIRE(exact_events->GetValue(0, 0).GetValue<int64_t>() > 0);
+
+	auto cohorts = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_request_continuation_profiles() "
+	    "WHERE profile_level IN ('source_sink', 'source', 'global_raw')");
+	REQUIRE(!cohorts->HasError());
+	REQUIRE(cohorts->GetValue(0, 0).GetValue<int64_t>() > 0);
+
+	store.Clear();
+	QueryPipelineDebug::ClearDebugSnapshot();
 }
 
 TEST_CASE("Query request profile store records concurrent metadata queries", "[api]") {

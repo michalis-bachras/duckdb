@@ -183,7 +183,7 @@ public:
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
 		auto &gstate = op.sink_state->Cast<PerfectHashAggregateGlobalState>();
-		volume.kind = SourceThroughputKindToString(SourceThroughputKind::PERFECT_HASH_GROUPS);
+		volume.kind = SourceThroughputKind::PERFECT_HASH_GROUPS;
 		volume.confidence = "exact";
 		volume.rows = gstate.ht->Count();
 		volume.chunks_equiv = volume.rows == 0 ? 0 : (volume.rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;

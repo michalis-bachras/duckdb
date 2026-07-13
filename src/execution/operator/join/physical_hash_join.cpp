@@ -1174,7 +1174,7 @@ public:
 			if (gstate.external) {
 				hash_table.GetRemainingPartitionWork(remaining_partition_rows, remaining_partition_chunks);
 			}
-			volume.kind = SourceThroughputKindToString(SourceThroughputKind::HASH_JOIN_BUILD_ROWS);
+			volume.kind = SourceThroughputKind::HASH_JOIN_BUILD_ROWS;
 			volume.confidence = "exact";
 			volume.rows = data_collection.Count() + remaining_partition_rows;
 			volume.chunks_equiv = data_collection.ChunkCount() + remaining_partition_chunks;
@@ -1183,7 +1183,7 @@ public:
 			return volume;
 		}
 		if (gstate.probe_spill) {
-			volume.kind = SourceThroughputKindToString(SourceThroughputKind::HASH_JOIN_PROBE_ROWS);
+			volume.kind = SourceThroughputKind::HASH_JOIN_PROBE_ROWS;
 			volume.confidence = "estimate";
 			volume.rows = probe_count;
 			volume.chunks_equiv = HashJoinRowsToStandardChunks(probe_count);
@@ -1191,7 +1191,7 @@ public:
 			volume.native_unit = "standard_chunk";
 			return volume;
 		}
-		volume.kind = "hash_join_no_source_scan";
+		volume.kind = SourceThroughputKind::NO_SOURCE_SCAN;
 		volume.confidence = "exact";
 		volume.native_unit = "none";
 		return volume;

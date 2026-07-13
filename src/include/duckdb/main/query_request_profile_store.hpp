@@ -34,6 +34,7 @@ struct QueryRequestPipelineProfileEstimate {
 	string operator_type_sequence;
 	string source_type;
 	string sink_type;
+	string source_work_class;
 	string source_input_kind;
 	string source_input_confidence;
 	string planned_input_native_unit;
@@ -93,6 +94,7 @@ struct QueryRequestPipelineInstanceSnapshot {
 	string operator_type_sequence;
 	string source_type;
 	string sink_type;
+	string source_work_class;
 	string source_input_kind;
 	string source_input_confidence;
 	string planned_input_native_unit;
@@ -116,6 +118,18 @@ struct QueryRequestPipelineInstanceSnapshot {
 	bool continuation_valid = false;
 };
 
+struct QueryRequestContinuationProfileSnapshot {
+	ContinuationEstimateLevel level = ContinuationEstimateLevel::NONE;
+	SourceWorkClass source_work_class;
+	PhysicalOperatorType sink_type = PhysicalOperatorType::INVALID;
+	ContinuationEstimateKind kind = ContinuationEstimateKind::INVALID;
+	idx_t sample_count = 0;
+	double mean = 0;
+	double p50 = 0;
+	double p90 = 0;
+	idx_t native_unit_mismatch_count = 0;
+};
+
 class QueryRequestProfileStore {
 public:
 	static QueryRequestProfileStore &Get();
@@ -125,10 +139,14 @@ public:
 	bool TryGetQueryEstimate(uint64_t template_id, uint64_t scale_factor, QueryRequestProfileEstimate &estimate) const;
 	bool TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor, idx_t pipeline_id,
 	                            uint64_t pipeline_signature_hash, QueryRequestPipelineProfileEstimate &estimate) const;
+	PipelineContinuationEstimate ResolvePipelineContinuation(uint64_t template_id, uint64_t scale_factor,
+	                                                         const PipelineProfileIdentity &identity,
+	                                                         idx_t planned_work_units) const;
 	vector<QueryRequestProfileSnapshot> GetQueryProfilesSnapshot() const;
 	vector<QueryRequestPipelineProfileSnapshot> GetPipelineProfilesSnapshot() const;
 	vector<QueryRequestSampleSnapshot> GetQuerySamplesSnapshot() const;
 	vector<QueryRequestPipelineInstanceSnapshot> GetPipelineInstancesSnapshot() const;
+	vector<QueryRequestContinuationProfileSnapshot> GetContinuationProfilesSnapshot() const;
 	idx_t QueryProfileCount() const;
 	idx_t PipelineProfileCount() const;
 	void Clear();

@@ -7,6 +7,9 @@
 
 #include "duckdb/execution/source_throughput.hpp"
 
+#include "duckdb/common/enum_util.hpp"
+#include "duckdb/execution/pipeline_continuation.hpp"
+
 namespace duckdb {
 
 const char *SourceThroughputKindToString(SourceThroughputKind kind) {
@@ -63,6 +66,10 @@ const char *SourceThroughputKindToString(SourceThroughputKind kind) {
 		return "reservoir_sample_rows";
 	case SourceThroughputKind::RECURSIVE_CTE_ROWS:
 		return "recursive_cte_rows";
+	case SourceThroughputKind::COLUMN_DATA_ROWS:
+		return "column_data_rows";
+	case SourceThroughputKind::SORT_SOURCE_TASKS:
+		return "sort_source_tasks";
 	case SourceThroughputKind::DUMMY_ROW:
 		return "dummy_row";
 	case SourceThroughputKind::EMPTY_RESULT:
@@ -148,6 +155,12 @@ SourceThroughputKind SourceThroughputKindFromString(const string &kind) {
 	if (kind == "recursive_cte_rows") {
 		return SourceThroughputKind::RECURSIVE_CTE_ROWS;
 	}
+	if (kind == "column_data_rows") {
+		return SourceThroughputKind::COLUMN_DATA_ROWS;
+	}
+	if (kind == "sort_source_tasks") {
+		return SourceThroughputKind::SORT_SOURCE_TASKS;
+	}
 	if (kind == "dummy_row") {
 		return SourceThroughputKind::DUMMY_ROW;
 	}
@@ -155,6 +168,39 @@ SourceThroughputKind SourceThroughputKindFromString(const string &kind) {
 		return SourceThroughputKind::EMPTY_RESULT;
 	}
 	return SourceThroughputKind::UNKNOWN;
+}
+
+string SourceWorkClassToString(const SourceWorkClass &work_class) {
+	if (!work_class.IsValid()) {
+		return "unknown";
+	}
+	return EnumUtil::ToString(work_class.source_type) + "::" + SourceThroughputKindToString(work_class.work_kind);
+}
+
+const char *ContinuationEstimateLevelToString(ContinuationEstimateLevel level) {
+	switch (level) {
+	case ContinuationEstimateLevel::EXACT:
+		return "exact";
+	case ContinuationEstimateLevel::SOURCE_SINK:
+		return "source_sink";
+	case ContinuationEstimateLevel::SOURCE:
+		return "source";
+	case ContinuationEstimateLevel::GLOBAL_RAW:
+		return "global_raw";
+	default:
+		return "none";
+	}
+}
+
+const char *ContinuationEstimateKindToString(ContinuationEstimateKind kind) {
+	switch (kind) {
+	case ContinuationEstimateKind::NS_PER_WORK_UNIT:
+		return "ns_per_work_unit";
+	case ContinuationEstimateKind::RAW_LATENCY_NS:
+		return "raw_latency_ns";
+	default:
+		return "invalid";
+	}
 }
 
 idx_t SourceThroughputCounters::EstimateStandardChunks(idx_t tuples) {

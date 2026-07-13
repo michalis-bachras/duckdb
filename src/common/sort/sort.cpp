@@ -379,7 +379,7 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = "sorted_rows";
+		volume.kind = SourceThroughputKind::SORTED_ROWS;
 		volume.confidence = "exact";
 		volume.rows = merger.total_count;
 		volume.chunks_equiv =

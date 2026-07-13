@@ -563,7 +563,7 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = SourceThroughputKindToString(SourceThroughputKind::TOP_N_HEAP_ROWS);
+		volume.kind = SourceThroughputKind::TOP_N_HEAP_ROWS;
 		volume.confidence = "exact";
 		volume.rows = sink.heap.heap.size();
 		volume.chunks_equiv = volume.rows == 0 ? 0 : (volume.rows + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;

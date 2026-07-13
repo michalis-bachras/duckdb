@@ -29,7 +29,7 @@ class MetaPipeline;
 class InterruptState;
 
 struct SourceInputVolume {
-	string kind = "unknown";
+	SourceThroughputKind kind = SourceThroughputKind::UNKNOWN;
 	string confidence = "unknown";
 	idx_t rows = 0;
 	idx_t chunks_equiv = 0;

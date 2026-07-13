@@ -81,6 +81,9 @@ static void PopulatePipelineInfo(QueryPipelineDebugEventSnapshot &snapshot, Pipe
 		snapshot.sink_type = PhysicalOperatorToString(sink->type);
 		AppendOperatorType(snapshot.operator_type_sequence, snapshot.sink_type);
 	}
+	if (!snapshot.source_type.empty() && !snapshot.source_input_kind.empty()) {
+		snapshot.source_work_class = snapshot.source_type + "::" + snapshot.source_input_kind;
+	}
 }
 
 static bool PopulateMetadata(ClientContext &context, QueryPipelineDebugEventSnapshot &snapshot) {
@@ -134,6 +137,13 @@ static void PopulateWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, const Pi
 	snapshot.throughput_worker_time_ns = work.throughput_worker_time_ns;
 	snapshot.single_worker_chunks_per_s = work.single_worker_chunks_per_s;
 	snapshot.throughput_valid = work.throughput_valid;
+	snapshot.continuation_valid = work.continuation_estimate.valid;
+	snapshot.continuation_level = ContinuationEstimateLevelToString(work.continuation_estimate.level);
+	snapshot.continuation_kind = ContinuationEstimateKindToString(work.continuation_estimate.kind);
+	snapshot.continuation_sample_count = work.continuation_estimate.sample_count;
+	snapshot.continuation_mean = work.continuation_estimate.mean;
+	snapshot.continuation_p50 = work.continuation_estimate.p50;
+	snapshot.continuation_p90 = work.continuation_estimate.p90;
 	if (work.parallelism_valid && !snapshot.parallelism_valid) {
 		snapshot.remaining_tasks = work.remaining_tasks;
 		snapshot.preferred_parallelism = work.preferred_parallelism;

@@ -11,6 +11,7 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/set.hpp"
+#include "duckdb/execution/pipeline_continuation.hpp"
 #include "duckdb/execution/source_throughput.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -52,6 +53,7 @@ struct PipelineWorkSnapshot {
 	bool valid = false;
 	bool parallelism_valid = false;
 	bool throughput_valid = false;
+	PipelineContinuationEstimate continuation_estimate;
 };
 
 struct SourceWorkCounterSnapshot {
@@ -235,6 +237,7 @@ private:
 	idx_t source_work_source_max_threads = 0;
 	idx_t source_work_effective_max_threads = 0;
 	bool source_work_scalable = false;
+	PipelineContinuationEstimate continuation_estimate;
 	atomic<idx_t> source_work_completed_rows {0};
 	atomic<idx_t> source_work_completed_chunks_equiv {0};
 	atomic<idx_t> source_work_completed_native_units {0};

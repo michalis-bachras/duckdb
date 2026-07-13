@@ -23,6 +23,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/winapi.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/execution/pipeline_continuation.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/source_throughput.hpp"
 #include "duckdb/main/pipeline_dvfs_profiler.hpp"
@@ -112,6 +113,11 @@ struct PipelineTaskProfilingInfo {
 //! Coarse pipeline-level timing information emitted into the existing JSON query profile.
 struct PipelineProfilingInfo {
 	idx_t pipeline_id = 0;
+	uint64_t pipeline_signature_hash = 0;
+	string pipeline_signature;
+	SourceWorkClass source_work_class;
+	PhysicalOperatorType source_operator_type = PhysicalOperatorType::INVALID;
+	PhysicalOperatorType sink_operator_type = PhysicalOperatorType::INVALID;
 
 	string source_name;
 	string source_type;
@@ -284,8 +290,9 @@ public:
 	DUCKDB_API idx_t RegisterPipelineProfile(const PhysicalOperator &source,
 	                                         const vector<reference<PhysicalOperator>> &operators,
 	                                         optional_ptr<PhysicalOperator> sink);
-	DUCKDB_API void RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_count, idx_t source_max_threads,
-	                                           const SourceInputVolume &source_input_volume);
+	DUCKDB_API PipelineProfileIdentity RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_count,
+	                                                               idx_t source_max_threads,
+	                                                               const SourceInputVolume &source_input_volume);
 	DUCKDB_API void RecordPipelineProfileTasksDone(idx_t pipeline_id);
 	DUCKDB_API void RecordPipelineProfileFinishDone(idx_t pipeline_id);
 	DUCKDB_API idx_t RecordPipelineTaskStart(idx_t pipeline_id, uint64_t thread_id, int start_cpu);

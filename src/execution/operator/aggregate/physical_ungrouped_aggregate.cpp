@@ -99,7 +99,7 @@ class UngroupedAggregateGlobalSourceState : public GlobalSourceState {
 public:
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = SourceThroughputKindToString(SourceThroughputKind::SINGLE_AGGREGATE_ROW);
+		volume.kind = SourceThroughputKind::SINGLE_AGGREGATE_ROW;
 		volume.confidence = "exact";
 		volume.rows = 1;
 		volume.chunks_equiv = 1;

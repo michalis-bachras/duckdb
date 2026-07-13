@@ -164,14 +164,8 @@ static void ValidateAsyncStrategyResult(const PhysicalTableScanExecutionStrategy
 }
 
 static SourceThroughputKind TableScanThroughputKind(const SourceInputVolume &volume) {
-	if (volume.kind == "index_scan_row_ids") {
-		return SourceThroughputKind::INDEX_ROWIDS;
-	}
-	if (volume.kind == "table_rows_upper_bound") {
-		return SourceThroughputKind::BASE_TABLE_ROWS;
-	}
-	if (volume.kind != "unknown") {
-		return SourceThroughputKindFromString(volume.kind);
+	if (volume.kind != SourceThroughputKind::UNKNOWN) {
+		return volume.kind;
 	}
 	return SourceThroughputKind::TABLE_SCAN_ROWS;
 }

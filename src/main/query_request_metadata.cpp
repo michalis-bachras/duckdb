@@ -117,7 +117,8 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 } // namespace
 
 bool QueryRequestMetadataManager::ProfilingEnabled(ClientContext &context) {
-	return ClientConfig::GetConfig(context).query_request_profiling_enabled;
+	const auto &config = ClientConfig::GetConfig(context);
+	return config.query_request_profiling_enabled || config.query_activation_scheduler_enabled;
 }
 
 bool QueryRequestMetadataManager::NeedsMetadata(ClientContext &context) {

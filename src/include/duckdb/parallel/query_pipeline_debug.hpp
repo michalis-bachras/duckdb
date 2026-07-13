@@ -52,6 +52,14 @@ struct QueryPipelineDebugEventSnapshot {
 	double single_worker_chunks_per_s = 0;
 	bool parallelism_valid = false;
 	bool throughput_valid = false;
+	string source_work_class;
+	bool continuation_valid = false;
+	string continuation_level;
+	string continuation_kind;
+	idx_t continuation_sample_count = 0;
+	double continuation_mean = 0;
+	double continuation_p50 = 0;
+	double continuation_p90 = 0;
 	string source_type;
 	string sink_type;
 	string operator_type_sequence;

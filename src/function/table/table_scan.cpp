@@ -260,7 +260,7 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = "index_scan_row_ids";
+		volume.kind = SourceThroughputKind::INDEX_ROWIDS;
 		volume.confidence = "exact";
 		volume.rows = row_id_count;
 		volume.chunks_equiv = RowsToStandardChunks(row_id_count);
@@ -392,7 +392,7 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = "table_rows_upper_bound";
+		volume.kind = SourceThroughputKind::BASE_TABLE_ROWS;
 		volume.confidence = "upper_bound";
 		volume.rows = total_rows;
 		volume.chunks_equiv = RowsToStandardChunks(total_rows);

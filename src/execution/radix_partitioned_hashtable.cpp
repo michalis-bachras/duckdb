@@ -692,7 +692,7 @@ idx_t RadixPartitionedHashTable::MaxThreads(GlobalSinkState &sink_p) const {
 SourceInputVolume RadixPartitionedHashTable::GetSourceInputVolume(GlobalSinkState &sink_p) const {
 	auto &sink = sink_p.Cast<RadixHTGlobalSinkState>();
 	SourceInputVolume volume;
-	volume.kind = SourceThroughputKindToString(SourceThroughputKind::PARTITIONED_AGGREGATE_GROUPS);
+	volume.kind = SourceThroughputKind::PARTITIONED_AGGREGATE_GROUPS;
 	volume.confidence = "exact";
 	volume.native_unit = "aggregate_partition_phase";
 	volume.native_units = 3 * sink.partitions.size();

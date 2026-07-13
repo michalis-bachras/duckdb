@@ -91,10 +91,10 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		auto volume = state->GetSourceInputVolume();
-		if (volume.kind != "unknown") {
+		if (volume.kind != SourceThroughputKind::UNKNOWN) {
 			return volume;
 		}
-		volume.kind = "sort_source_units";
+		volume.kind = SourceThroughputKind::SORT_SOURCE_TASKS;
 		volume.confidence = "estimate";
 		volume.native_units = state->MaxThreads();
 		volume.native_unit = "sort_source_task_bound";

@@ -9,7 +9,6 @@
 namespace duckdb {
 
 namespace {
-constexpr const char *COLUMN_DATA_ROWS_KIND = "column_data_rows";
 constexpr const char *COLUMN_DATA_CHUNK_UNIT = "column_data_chunk";
 } // namespace
 
@@ -41,7 +40,7 @@ public:
 
 	SourceInputVolume GetSourceInputVolume() const override {
 		SourceInputVolume volume;
-		volume.kind = COLUMN_DATA_ROWS_KIND;
+		volume.kind = SourceThroughputKind::COLUMN_DATA_ROWS;
 		volume.confidence = "exact";
 		volume.rows = row_count;
 		volume.chunks_equiv = chunk_count;
@@ -78,9 +77,9 @@ SourceResultType PhysicalColumnDataScan::GetDataInternal(ExecutionContext &conte
 	auto &lstate = input.local_state.Cast<PhysicalColumnDataLocalScanState>();
 	collection->Scan(gstate.global_scan_state, lstate.local_scan_state, chunk);
 	if (chunk.size() > 0) {
-		input.ReportSourceTuplesTouched(chunk.size(), COLUMN_DATA_ROWS_KIND, "exact", true, 1, 1,
+		input.ReportSourceTuplesTouched(chunk.size(), SourceThroughputKind::COLUMN_DATA_ROWS, "exact", true, 1, 1,
 		                                COLUMN_DATA_CHUNK_UNIT);
-		input.ReportSourceWorkUnits(1, COLUMN_DATA_ROWS_KIND, "exact", COLUMN_DATA_CHUNK_UNIT);
+		input.ReportSourceWorkUnits(1, SourceThroughputKind::COLUMN_DATA_ROWS, "exact", COLUMN_DATA_CHUNK_UNIT);
 	}
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }

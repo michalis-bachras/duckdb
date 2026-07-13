@@ -34,6 +34,11 @@ struct DuckDBQueryRequestPipelineInstancesData : public GlobalTableFunctionState
 	idx_t offset = 0;
 };
 
+struct DuckDBQueryRequestContinuationProfilesData : public GlobalTableFunctionState {
+	vector<QueryRequestContinuationProfileSnapshot> profiles;
+	idx_t offset = 0;
+};
+
 struct DuckDBQueryAdmissionData : public GlobalTableFunctionState {
 	vector<QueryAdmissionSnapshot> snapshots;
 	idx_t offset = 0;
@@ -131,6 +136,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineProfilesBind(ClientCon
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("sink_type");
 	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("source_work_class");
+	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("source_input_kind");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("source_input_confidence");
@@ -194,6 +201,7 @@ static void DuckDBQueryRequestPipelineProfilesFunction(ClientContext &context, T
 		output.SetValue(col++, count, Value(estimate.operator_type_sequence));
 		output.SetValue(col++, count, Value(estimate.source_type));
 		output.SetValue(col++, count, Value(estimate.sink_type));
+		output.SetValue(col++, count, Value(estimate.source_work_class));
 		output.SetValue(col++, count, Value(estimate.source_input_kind));
 		output.SetValue(col++, count, Value(estimate.source_input_confidence));
 		output.SetValue(col++, count, Value(estimate.planned_input_native_unit));
@@ -304,6 +312,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineInstancesBind(ClientCo
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("sink_type");
 	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("source_work_class");
+	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("source_input_kind");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("source_input_confidence");
@@ -373,6 +383,7 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 		output.SetValue(col++, count, Value(instance.operator_type_sequence));
 		output.SetValue(col++, count, Value(instance.source_type));
 		output.SetValue(col++, count, Value(instance.sink_type));
+		output.SetValue(col++, count, Value(instance.source_work_class));
 		output.SetValue(col++, count, Value(instance.source_input_kind));
 		output.SetValue(col++, count, Value(instance.source_input_confidence));
 		output.SetValue(col++, count, Value(instance.planned_input_native_unit));
@@ -394,6 +405,59 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 		output.SetValue(col++, count, Value::UBIGINT(instance.downstream_suffix_ns));
 		output.SetValue(col++, count, Value::DOUBLE(instance.effective_ns_per_work_unit));
 		output.SetValue(col++, count, Value::BOOLEAN(instance.continuation_valid));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryRequestContinuationProfilesBind(ClientContext &context,
+                                                                           TableFunctionBindInput &input,
+                                                                           vector<LogicalType> &return_types,
+                                                                           vector<string> &names) {
+	names.emplace_back("profile_level");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("source_work_class");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sink_type");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("estimate_kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("mean");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("p50");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("p90");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("native_unit_mismatch_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState>
+DuckDBQueryRequestContinuationProfilesInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryRequestContinuationProfilesData>();
+	result->profiles = QueryRequestProfileStore::Get().GetContinuationProfilesSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryRequestContinuationProfilesFunction(ClientContext &context, TableFunctionInput &data_p,
+                                                           DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryRequestContinuationProfilesData>();
+	idx_t count = 0;
+	while (data.offset < data.profiles.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &profile = data.profiles[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value(ContinuationEstimateLevelToString(profile.level)));
+		output.SetValue(col++, count, Value(SourceWorkClassToString(profile.source_work_class)));
+		output.SetValue(col++, count, Value(PhysicalOperatorToString(profile.sink_type)));
+		output.SetValue(col++, count, Value(ContinuationEstimateKindToString(profile.kind)));
+		output.SetValue(col++, count, Value::UBIGINT(profile.sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(profile.mean));
+		output.SetValue(col++, count, Value::DOUBLE(profile.p50));
+		output.SetValue(col++, count, Value::DOUBLE(profile.p90));
+		output.SetValue(col++, count, Value::UBIGINT(profile.native_unit_mismatch_count));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -648,6 +712,22 @@ static unique_ptr<FunctionData> DuckDBQueryPipelineEventsBind(ClientContext &con
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("throughput_valid");
 	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("source_work_class");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("continuation_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("continuation_level");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("continuation_kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("continuation_sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("continuation_mean");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("continuation_p50");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("continuation_p90");
+	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("source_type");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("sink_type");
@@ -705,6 +785,14 @@ static void DuckDBQueryPipelineEventsFunction(ClientContext &context, TableFunct
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.throughput_worker_time_ns));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.single_worker_chunks_per_s));
 		output.SetValue(col++, count, Value::BOOLEAN(snapshot.throughput_valid));
+		output.SetValue(col++, count, Value(snapshot.source_work_class));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.continuation_valid));
+		output.SetValue(col++, count, Value(snapshot.continuation_level));
+		output.SetValue(col++, count, Value(snapshot.continuation_kind));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.continuation_sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.continuation_mean));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.continuation_p50));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.continuation_p90));
 		output.SetValue(col++, count, Value(snapshot.source_type));
 		output.SetValue(col++, count, Value(snapshot.sink_type));
 		output.SetValue(col++, count, Value(snapshot.operator_type_sequence));
@@ -725,6 +813,10 @@ void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	                              DuckDBQueryRequestPipelineInstancesFunction,
 	                              DuckDBQueryRequestPipelineInstancesBind,
 	                              DuckDBQueryRequestPipelineInstancesInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_request_continuation_profiles", {},
+	                              DuckDBQueryRequestContinuationProfilesFunction,
+	                              DuckDBQueryRequestContinuationProfilesBind,
+	                              DuckDBQueryRequestContinuationProfilesInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_admission", {}, DuckDBQueryAdmissionFunction,
 	                              DuckDBQueryAdmissionBind, DuckDBQueryAdmissionInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_admission_events", {}, DuckDBQueryAdmissionEventsFunction,

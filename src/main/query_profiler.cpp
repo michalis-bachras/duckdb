@@ -154,12 +154,30 @@ static string SourceThroughputSignatureKey(const PipelineProfilingInfo &profile)
 	                          profile.planned_task_input_chunks_bucket);
 }
 
+static uint64_t StablePipelineSignatureHash(const string &value) {
+	uint64_t hash = 1469598103934665603ULL;
+	for (idx_t i = 0; i < value.size(); i++) {
+		hash ^= static_cast<unsigned char>(value[i]);
+		hash *= 1099511628211ULL;
+	}
+	return hash;
+}
+
+static string BuildPipelineSignature(const PipelineProfilingInfo &profile) {
+	return StringUtil::Format(
+	    "%s|source=%s|sink=%s|input=%s|confidence=%s|native=%s|source_card=%llu|sink_card=%llu",
+	    profile.operator_type_sequence, profile.source_type, profile.sink_type, profile.source_input_kind,
+	    profile.source_input_confidence, profile.planned_input_native_unit,
+	    static_cast<unsigned long long>(profile.source_estimated_cardinality),
+	    static_cast<unsigned long long>(profile.sink_estimated_cardinality));
+}
+
 static SourceThroughputCounters ApplySourceThroughputFallback(const PipelineProfilingInfo &profile,
                                                               SourceThroughputCounters counters) {
 	if (counters.reported) {
 		return counters;
 	}
-	if (profile.source_input_kind == "hash_join_no_source_scan") {
+	if (profile.source_input_kind == SourceThroughputKindToString(SourceThroughputKind::NO_SOURCE_SCAN)) {
 		counters.AddTuples(0, SourceThroughputKind::NO_SOURCE_SCAN, "exact", false, 0, 0, "none");
 		return counters;
 	}
@@ -216,6 +234,7 @@ idx_t QueryProfiler::RegisterPipelineProfile(const PhysicalOperator &source,
 	profile.pipeline_id = next_pipeline_profile_id++;
 	profile.estimated_task_input_rows_bucket = "unknown";
 	profile.source_name = source.GetName();
+	profile.source_operator_type = source.type;
 	profile.source_type = EnumUtil::ToString(source.type);
 	profile.source_estimated_cardinality = source.estimated_cardinality;
 	profile.operator_count = 1;
@@ -230,6 +249,7 @@ idx_t QueryProfiler::RegisterPipelineProfile(const PhysicalOperator &source,
 	}
 	if (sink) {
 		profile.sink_name = sink->GetName();
+		profile.sink_operator_type = sink->type;
 		profile.sink_type = EnumUtil::ToString(sink->type);
 		profile.sink_estimated_cardinality = sink->estimated_cardinality;
 		profile.operator_count++;
@@ -240,22 +260,23 @@ idx_t QueryProfiler::RegisterPipelineProfile(const PhysicalOperator &source,
 	return pipeline_profiles.back().pipeline_id;
 }
 
-void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_count, idx_t source_max_threads,
-                                               const SourceInputVolume &source_input_volume) {
+PipelineProfileIdentity QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_count,
+                                                                  idx_t source_max_threads,
+                                                                  const SourceInputVolume &source_input_volume) {
 	if (!pipeline_id) {
-		return;
+		return PipelineProfileIdentity();
 	}
 	lock_guard<std::mutex> guard(lock);
 	auto profile = GetPipelineProfile(pipeline_id);
 	if (!profile) {
-		return;
+		return PipelineProfileIdentity();
 	}
 	if (!profile->start_ns) {
 		profile->dvfs_metrics_enabled = pipeline_dvfs_profiler.MetricsEnabled();
 		profile->throughput_enabled = ClientConfig::GetConfig(context).pipeline_profiling.throughput;
 		profile->source_max_threads = source_max_threads;
 		const auto &planned_volume = source_input_volume;
-		profile->source_input_kind = planned_volume.kind;
+		profile->source_input_kind = SourceThroughputKindToString(planned_volume.kind);
 		profile->source_input_confidence = planned_volume.confidence;
 		profile->planned_input_rows = planned_volume.rows;
 		// Historical counterpart of live remaining work. Scheduler ETA should derive native-unit throughput as
@@ -263,6 +284,8 @@ void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_cou
 		profile->planned_input_chunks_equiv = planned_volume.chunks_equiv;
 		profile->planned_input_native_units = planned_volume.native_units;
 		profile->planned_input_native_unit = planned_volume.native_unit;
+		profile->source_work_class.source_type = profile->source_operator_type;
+		profile->source_work_class.work_kind = planned_volume.kind;
 		if (task_count > 0) {
 			profile->estimated_task_input_rows =
 			    static_cast<double>(profile->source_estimated_cardinality) / static_cast<double>(task_count);
@@ -273,12 +296,14 @@ void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_cou
 				    static_cast<double>(profile->planned_input_chunks_equiv) / static_cast<double>(task_count);
 				profile->planned_task_input_chunks_bucket =
 				    EstimatedTaskInputRowsBucket(profile->planned_task_input_chunks_equiv);
-			} else if (profile->source_input_kind == "hash_join_no_source_scan") {
+			} else if (planned_volume.kind == SourceThroughputKind::NO_SOURCE_SCAN) {
 				profile->planned_task_input_chunks_bucket =
 				    SourceThroughputKindToString(SourceThroughputKind::NO_SOURCE_SCAN);
 			}
 		}
 		profile->task_signature_key = SourceThroughputSignatureKey(*profile);
+		profile->pipeline_signature = BuildPipelineSignature(*profile);
+		profile->pipeline_signature_hash = StablePipelineSignatureHash(profile->pipeline_signature);
 		auto measurement_begin_ns = PipelineDVFSProfiler::TimestampNs();
 		if (profile->dvfs_metrics_enabled) {
 			pipeline_dvfs_profiler.Start(*profile);
@@ -288,6 +313,14 @@ void QueryProfiler::RecordPipelineProfileStart(idx_t pipeline_id, idx_t task_cou
 	}
 	profile->schedule_count++;
 	profile->task_count += task_count;
+	PipelineProfileIdentity identity;
+	identity.pipeline_id = profile->pipeline_id;
+	identity.pipeline_signature_hash = profile->pipeline_signature_hash;
+	identity.source_work_class = profile->source_work_class;
+	identity.sink_type = profile->sink_operator_type;
+	identity.planned_input_native_unit = profile->planned_input_native_unit;
+	identity.valid = identity.pipeline_id != 0 && identity.pipeline_signature_hash != 0;
+	return identity;
 }
 
 void QueryProfiler::RecordPipelineProfileTasksDone(idx_t pipeline_id) {
