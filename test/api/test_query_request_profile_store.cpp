@@ -95,6 +95,21 @@ static PipelineProfileIdentity PipelineIdentity(const PipelineProfilingInfo &pro
 	return identity;
 }
 
+static DownstreamSuffixEstimate PrepareDownstreamSuffix(QueryRequestProfileStore &store, uint64_t template_id,
+                                                        uint64_t scale_factor, idx_t pipeline_id,
+                                                        uint64_t pipeline_signature_hash,
+                                                        idx_t remaining_suffix_stages) {
+	DownstreamSuffixEpochRequest request;
+	request.template_id = template_id;
+	request.scale_factor = scale_factor;
+	request.pipeline_id = pipeline_id;
+	request.pipeline_signature_hash = pipeline_signature_hash;
+	request.remaining_suffix_stages = remaining_suffix_stages;
+	auto estimates = store.PrepareDownstreamSuffixEpoch({request});
+	REQUIRE(estimates.size() == 1);
+	return estimates[0];
+}
+
 static string MetadataQuery(uint64_t request_id, uint64_t template_id, uint64_t scale_factor, const string &body) {
 	auto deadline_ns = CurrentNs() + 60000000000ULL;
 	return StringUtil::Format(
@@ -148,7 +163,11 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_instances[0].single_worker_chunks_per_s == 2000000.0);
 	REQUIRE(pipeline_instances[0].task_runtime_ns == 700);
 	REQUIRE(pipeline_instances[0].lifecycle_runtime_ns == 900);
-	REQUIRE(pipeline_instances[0].downstream_suffix_ns == 8300);
+	REQUIRE(pipeline_instances[0].downstream_suffix_ns == 8100);
+	REQUIRE(pipeline_instances[0].pipeline_completion_ordinal == 1);
+	REQUIRE(pipeline_instances[0].total_pipeline_count == 1);
+	REQUIRE(pipeline_instances[0].remaining_suffix_stages == 1);
+	REQUIRE(pipeline_instances[0].normalized_downstream_suffix_ns == 8100.0);
 	REQUIRE(pipeline_instances[0].continuation_valid);
 	REQUIRE(pipeline_instances[0].effective_ns_per_work_unit == 112.5);
 
@@ -177,7 +196,8 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 	REQUIRE(pipeline_estimate.mean_planned_input_rows == 1000);
 	REQUIRE(pipeline_estimate.mean_task_runtime_ns == 700);
 	REQUIRE(pipeline_estimate.mean_lifecycle_runtime_ns == 900);
-	REQUIRE(pipeline_estimate.mean_downstream_suffix_ns == 8300);
+	REQUIRE(pipeline_estimate.mean_downstream_suffix_ns == 8100);
+	REQUIRE(pipeline_estimate.downstream_suffix_sample_count == 2);
 	REQUIRE(pipeline_estimate.throughput_sample_count == 2);
 	REQUIRE(pipeline_estimate.mean_single_worker_chunks_per_s == 1500000.0);
 	REQUIRE(pipeline_estimate.ewma_single_worker_chunks_per_s == 1300000.0);
@@ -234,6 +254,318 @@ TEST_CASE("Query request profile store tracks bounded continuation percentiles",
 	REQUIRE(pipeline_estimate.p50_effective_ns_per_work_unit == 55000.0);
 	REQUIRE(pipeline_estimate.p90_effective_ns_per_work_unit == 95000.0);
 
+	store.Clear();
+}
+
+TEST_CASE("Query request profile store records lifecycle suffix progress", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+	auto make_pipeline = [](idx_t pipeline_id, uint64_t finish_ns) {
+		auto pipeline = PipelineProfile(1000);
+		pipeline.pipeline_id = pipeline_id;
+		pipeline.tasks_done_ns = finish_ns - 100;
+		pipeline.finish_done_ns = finish_ns;
+		pipeline.pipeline_signature = PipelineSignature(pipeline);
+		pipeline.pipeline_signature_hash = StableStringHash64(pipeline.pipeline_signature);
+		return pipeline;
+	};
+	duckdb::vector<PipelineProfilingInfo> pipelines;
+	pipelines.push_back(make_pipeline(30, 8000));
+	pipelines.push_back(make_pipeline(10, 2000));
+	pipelines.push_back(make_pipeline(20, 5000));
+	store.RecordQueryCompletion(Metadata(1, 404, 10, 500, 20000), 10000, pipelines);
+
+	auto instances = store.GetPipelineInstancesSnapshot();
+	REQUIRE(instances.size() == 3);
+	REQUIRE(instances[0].pipeline_id == 10);
+	REQUIRE(instances[0].pipeline_completion_ordinal == 1);
+	REQUIRE(instances[0].total_pipeline_count == 3);
+	REQUIRE(instances[0].remaining_suffix_stages == 3);
+	REQUIRE(instances[0].downstream_suffix_ns == 8000);
+	REQUIRE(instances[0].normalized_downstream_suffix_ns == Approx(8000.0 / 3.0));
+	REQUIRE(instances[1].pipeline_id == 20);
+	REQUIRE(instances[1].pipeline_completion_ordinal == 2);
+	REQUIRE(instances[1].remaining_suffix_stages == 2);
+	REQUIRE(instances[1].downstream_suffix_ns == 5000);
+	REQUIRE(instances[1].normalized_downstream_suffix_ns == 2500.0);
+	REQUIRE(instances[2].pipeline_id == 30);
+	REQUIRE(instances[2].pipeline_completion_ordinal == 3);
+	REQUIRE(instances[2].remaining_suffix_stages == 1);
+	REQUIRE(instances[2].downstream_suffix_ns == 2000);
+	REQUIRE(instances[2].normalized_downstream_suffix_ns == 2000.0);
+	store.Clear();
+}
+
+TEST_CASE("Query request downstream suffix histograms preserve sparse point masses", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+	uint64_t signature_hash = 0;
+	for (idx_t i = 0; i < 9; i++) {
+		auto start_ns = 100000 + i * 10000;
+		auto pipeline = PipelineProfile(start_ns);
+		signature_hash = pipeline.pipeline_signature_hash;
+		auto query_end_ns = pipeline.finish_done_ns + (i + 1) * 100;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(i, 505, 10, start_ns - 100, query_end_ns + 10000), query_end_ns,
+		                            pipelines);
+		if (i == 3 || i == 7) {
+			auto snapshots = store.GetDownstreamSuffixProfilesSnapshot();
+			bool found = false;
+			for (const auto &snapshot : snapshots) {
+				if (snapshot.level != DownstreamSuffixProfileLevel::EXACT || snapshot.template_id != 505 ||
+				    snapshot.pipeline_signature_hash != signature_hash) {
+					continue;
+				}
+				found = true;
+				REQUIRE(snapshot.histogram.sample_count == i + 1);
+				REQUIRE(snapshot.histogram.bucket_count == i + 1);
+				for (idx_t bucket_idx = 0; bucket_idx < snapshot.histogram.bucket_count; bucket_idx++) {
+					REQUIRE(snapshot.histogram.buckets[bucket_idx].lower_ns ==
+					        snapshot.histogram.buckets[bucket_idx].upper_ns);
+				}
+			}
+			REQUIRE(found);
+		}
+	}
+	auto snapshots = store.GetDownstreamSuffixProfilesSnapshot();
+	bool found_nine = false;
+	for (const auto &snapshot : snapshots) {
+		if (snapshot.level != DownstreamSuffixProfileLevel::EXACT || snapshot.template_id != 505 ||
+		    snapshot.pipeline_signature_hash != signature_hash) {
+			continue;
+		}
+		found_nine = true;
+		REQUIRE(snapshot.histogram.sample_count == 9);
+		REQUIRE(snapshot.histogram.bucket_count == 8);
+		double probability = 0;
+		for (idx_t bucket_idx = 0; bucket_idx < snapshot.histogram.bucket_count; bucket_idx++) {
+			const auto &bucket = snapshot.histogram.buckets[bucket_idx];
+			REQUIRE(bucket.lower_ns <= bucket.upper_ns);
+			probability += bucket.probability;
+		}
+		REQUIRE(probability == Approx(1.0));
+	}
+	REQUIRE(found_nine);
+
+	for (idx_t i = 9; i < 105; i++) {
+		auto start_ns = 100000 + i * 10000;
+		auto pipeline = PipelineProfile(start_ns);
+		auto query_end_ns = pipeline.finish_done_ns + (i + 1) * 100;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(i, 505, 10, start_ns - 100, query_end_ns + 10000), query_end_ns,
+		                            pipelines);
+	}
+	snapshots = store.GetDownstreamSuffixProfilesSnapshot();
+	for (const auto &snapshot : snapshots) {
+		if (snapshot.level == DownstreamSuffixProfileLevel::EXACT && snapshot.template_id == 505 &&
+		    snapshot.pipeline_signature_hash == signature_hash) {
+			REQUIRE(snapshot.histogram.sample_count == 100);
+			REQUIRE(snapshot.histogram.bucket_count <= 8);
+		}
+	}
+	store.Clear();
+}
+
+TEST_CASE("Query request downstream suffix epoch preparation blends exact scale and global profiles", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+	for (idx_t i = 0; i < 4; i++) {
+		auto start_ns = 10000 + i * 10000;
+		auto pipeline = PipelineProfile(start_ns);
+		auto query_end_ns = pipeline.finish_done_ns + (i + 1) * 100;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(i, 606, 30, start_ns - 100, query_end_ns + 10000), query_end_ns,
+		                            pipelines);
+	}
+	auto global = PrepareDownstreamSuffix(store, 999, 100, 77, 12345, 2);
+	REQUIRE(global.valid);
+	REQUIRE(global.primary_level == DownstreamSuffixProfileLevel::GLOBAL);
+	REQUIRE(global.global_weight == 1.0);
+	REQUIRE(global.bucket_count == 4);
+	REQUIRE(global.buckets[0].lower_ns == 200.0);
+	REQUIRE(global.buckets[3].upper_ns == 800.0);
+
+	uint64_t scale_signature = 0;
+	for (idx_t i = 0; i < 2; i++) {
+		auto start_ns = 100000 + i * 10000;
+		auto pipeline = PipelineProfile(start_ns);
+		scale_signature = pipeline.pipeline_signature_hash;
+		auto query_end_ns = pipeline.finish_done_ns + (i + 1) * 1000;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(10 + i, 707, 10, start_ns - 100, query_end_ns + 10000), query_end_ns,
+		                            pipelines);
+	}
+	auto scale_global = PrepareDownstreamSuffix(store, 999, 10, 77, 67890, 1);
+	REQUIRE(scale_global.valid);
+	REQUIRE(scale_global.primary_level == DownstreamSuffixProfileLevel::SCALE_FACTOR);
+	REQUIRE(scale_global.scale_weight == 0.5);
+	REQUIRE(scale_global.global_weight == 0.5);
+
+	auto exact = PrepareDownstreamSuffix(store, 707, 10, 7, scale_signature, 1);
+	REQUIRE(exact.valid);
+	REQUIRE(exact.primary_level == DownstreamSuffixProfileLevel::EXACT);
+	REQUIRE(exact.exact_weight == 0.5);
+	REQUIRE(exact.scale_weight == 0.25);
+	REQUIRE(exact.global_weight == 0.25);
+	for (idx_t i = 2; i < 4; i++) {
+		auto start_ns = 100000 + i * 10000;
+		auto pipeline = PipelineProfile(start_ns);
+		auto query_end_ns = pipeline.finish_done_ns + (i + 1) * 1000;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(10 + i, 707, 10, start_ns - 100, query_end_ns + 10000), query_end_ns,
+		                            pipelines);
+	}
+	exact = PrepareDownstreamSuffix(store, 707, 10, 7, scale_signature, 1);
+	REQUIRE(exact.valid);
+	REQUIRE(exact.exact_sample_count == 4);
+	REQUIRE(exact.exact_weight == 1.0);
+	REQUIRE(exact.scale_weight == 0.0);
+	REQUIRE(exact.global_weight == 0.0);
+
+	store.Clear();
+	auto missing = PrepareDownstreamSuffix(store, 999, 100, 77, 12345, 1);
+	REQUIRE_FALSE(missing.valid);
+}
+
+TEST_CASE("Query request downstream suffix epoch preparation is ordered and deduplicated", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+
+	uint64_t request_id = 1;
+	uint64_t signature_10 = 0;
+	for (idx_t i = 0; i < 4; i++) {
+		auto start_ns = 10000 + request_id * 10000;
+		auto pipeline = PipelineProfile(start_ns);
+		auto query_end_ns = pipeline.finish_done_ns + (i + 1) * 100;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(request_id++, 801, 10, start_ns - 100, query_end_ns + 10000),
+		                            query_end_ns, pipelines);
+		signature_10 = pipeline.pipeline_signature_hash;
+	}
+	for (idx_t i = 0; i < 4; i++) {
+		auto start_ns = 10000 + request_id * 10000;
+		auto pipeline = PipelineProfile(start_ns);
+		auto query_end_ns = pipeline.finish_done_ns + (i + 1) * 1000;
+		duckdb::vector<PipelineProfilingInfo> pipelines;
+		pipelines.push_back(pipeline);
+		store.RecordQueryCompletion(Metadata(request_id++, 802, 30, start_ns - 100, query_end_ns + 10000),
+		                            query_end_ns, pipelines);
+	}
+
+	DownstreamSuffixEpochRequest exact_10 {801, 10, 7, signature_10, 1};
+	DownstreamSuffixEpochRequest duplicate_10 {801, 10, 7, signature_10, 1};
+	DownstreamSuffixEpochRequest scale_30 {999, 30, 77, 54321, 2};
+	DownstreamSuffixEpochRequest invalid_pipeline {801, 10, 0, signature_10, 1};
+	DownstreamSuffixEpochRequest invalid_signature {801, 10, 7, 0, 1};
+	DownstreamSuffixEpochRequest invalid_stages {801, 10, 7, signature_10, 0};
+	auto estimates = store.PrepareDownstreamSuffixEpoch(
+	    {exact_10, duplicate_10, scale_30, invalid_pipeline, invalid_signature, invalid_stages});
+	REQUIRE(estimates.size() == 6);
+	REQUIRE(estimates[0].valid);
+	REQUIRE(estimates[0].primary_level == DownstreamSuffixProfileLevel::EXACT);
+	REQUIRE(estimates[0].exact_sample_count == 4);
+	REQUIRE(estimates[0].scale_sample_count == 4);
+	REQUIRE(estimates[0].global_sample_count == 8);
+	REQUIRE(estimates[0].exact_weight == 1.0);
+	REQUIRE(estimates[1].valid);
+	REQUIRE(estimates[1].bucket_count == estimates[0].bucket_count);
+	REQUIRE(estimates[1].exact_sample_count == estimates[0].exact_sample_count);
+	for (idx_t bucket_idx = 0; bucket_idx < estimates[0].bucket_count; bucket_idx++) {
+		REQUIRE(estimates[1].buckets[bucket_idx].lower_ns == estimates[0].buckets[bucket_idx].lower_ns);
+		REQUIRE(estimates[1].buckets[bucket_idx].upper_ns == estimates[0].buckets[bucket_idx].upper_ns);
+		REQUIRE(estimates[1].buckets[bucket_idx].probability == estimates[0].buckets[bucket_idx].probability);
+	}
+	REQUIRE(estimates[2].valid);
+	REQUIRE(estimates[2].primary_level == DownstreamSuffixProfileLevel::SCALE_FACTOR);
+	REQUIRE(estimates[2].scale_sample_count == 4);
+	REQUIRE(estimates[2].scale_weight == 1.0);
+	REQUIRE_FALSE(estimates[3].valid);
+	REQUIRE_FALSE(estimates[4].valid);
+	REQUIRE_FALSE(estimates[5].valid);
+	REQUIRE(store.PrepareDownstreamSuffixEpoch({}).empty());
+
+	auto fallback_update = PipelineProfile(200000);
+	auto fallback_update_end = fallback_update.finish_done_ns + 500;
+	duckdb::vector<PipelineProfilingInfo> fallback_update_pipelines {fallback_update};
+	store.RecordQueryCompletion(Metadata(request_id, 803, 10, fallback_update.start_ns - 100,
+	                                     fallback_update_end + 10000),
+	                            fallback_update_end, fallback_update_pipelines);
+	auto refreshed = store.PrepareDownstreamSuffixEpoch({exact_10});
+	REQUIRE(refreshed.size() == 1);
+	REQUIRE(refreshed[0].exact_weight == 1.0);
+	REQUIRE(refreshed[0].scale_sample_count == 5);
+	REQUIRE(refreshed[0].global_sample_count == 9);
+	store.Clear();
+}
+
+TEST_CASE("Query request downstream suffix epoch preparation leaves inactive profiles available", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+	uint64_t active_signature = 0;
+	uint64_t inactive_signature = 0;
+	for (idx_t i = 0; i < 4; i++) {
+		auto active = PipelineProfile(10000 + i * 20000);
+		auto active_end = active.finish_done_ns + 100 + i;
+		duckdb::vector<PipelineProfilingInfo> active_pipelines {active};
+		store.RecordQueryCompletion(Metadata(i, 901, 10, active.start_ns - 100, active_end + 10000), active_end,
+		                            active_pipelines);
+		active_signature = active.pipeline_signature_hash;
+
+		auto inactive = PipelineProfile(20000 + i * 20000);
+		auto inactive_end = inactive.finish_done_ns + 1000 + i;
+		duckdb::vector<PipelineProfilingInfo> inactive_pipelines {inactive};
+		store.RecordQueryCompletion(Metadata(100 + i, 902, 30, inactive.start_ns - 100, inactive_end + 10000),
+		                            inactive_end, inactive_pipelines);
+		inactive_signature = inactive.pipeline_signature_hash;
+	}
+
+	auto active = PrepareDownstreamSuffix(store, 901, 10, 7, active_signature, 1);
+	REQUIRE(active.valid);
+	REQUIRE(active.exact_sample_count == 4);
+	auto inactive = PrepareDownstreamSuffix(store, 902, 30, 7, inactive_signature, 1);
+	REQUIRE(inactive.valid);
+	REQUIRE(inactive.exact_sample_count == 4);
+	REQUIRE(inactive.buckets[0].lower_ns >= 1000.0);
+	store.Clear();
+}
+
+TEST_CASE("Query request downstream suffix epoch preparation tolerates concurrent completions", "[api]") {
+	auto &store = QueryRequestProfileStore::Get();
+	store.Clear();
+	auto pipeline = PipelineProfile(1000);
+	DownstreamSuffixEpochRequest request {1001, 10, pipeline.pipeline_id, pipeline.pipeline_signature_hash, 1};
+	std::thread writer([&]() {
+		for (idx_t i = 0; i < 250; i++) {
+			auto sample = PipelineProfile(10000 + i * 10000);
+			auto query_end_ns = sample.finish_done_ns + 100 + i;
+			duckdb::vector<PipelineProfilingInfo> pipelines {sample};
+			store.RecordQueryCompletion(Metadata(i, 1001, 10, sample.start_ns - 100, query_end_ns + 10000),
+			                            query_end_ns, pipelines);
+		}
+	});
+	for (idx_t i = 0; i < 250; i++) {
+		auto estimates = store.PrepareDownstreamSuffixEpoch({request});
+		REQUIRE(estimates.size() == 1);
+		if (estimates[0].valid) {
+			double probability = 0;
+			for (idx_t bucket_idx = 0; bucket_idx < estimates[0].bucket_count; bucket_idx++) {
+				probability += estimates[0].buckets[bucket_idx].probability;
+			}
+			REQUIRE(probability == Approx(1.0));
+		}
+	}
+	writer.join();
+	auto final_estimates = store.PrepareDownstreamSuffixEpoch({request});
+	REQUIRE(final_estimates.size() == 1);
+	REQUIRE(final_estimates[0].valid);
+	REQUIRE(final_estimates[0].exact_sample_count == 100);
+	REQUIRE(final_estimates[0].bucket_count == 8);
 	store.Clear();
 }
 
@@ -439,6 +771,8 @@ TEST_CASE("Query request profile store records repeated metadata queries", "[api
 		auto result = con.Query(MetadataQuery(i, 6, 10, body));
 		REQUIRE(CHECK_COLUMN(result, 0, {0, 1, 2, 3, 4, 5, 6}));
 	}
+	auto failed_result = con.Query(MetadataQuery(99, 6, 10, "SELECT * FROM metadata_profile_missing"));
+	REQUIRE(failed_result->HasError());
 
 	QueryRequestProfileEstimate query_estimate;
 	REQUIRE(store.QueryProfileCount() == 1);
@@ -469,6 +803,21 @@ TEST_CASE("Query request profile store records repeated metadata queries", "[api
 	                                                 store.GetPipelineInstancesSnapshot().size()))}));
 	REQUIRE(CHECK_COLUMN(pipeline_instances, 1, {Value::BIGINT(3)}));
 	REQUIRE(CHECK_COLUMN(pipeline_instances, 2, {Value::BIGINT(static_cast<int64_t>(store.PipelineProfileCount()))}));
+	auto suffix_levels = con.Query(
+	    "SELECT profile_level FROM duckdb_debug_query_request_downstream_suffix_profiles() "
+	    "GROUP BY profile_level ORDER BY profile_level");
+	REQUIRE(CHECK_COLUMN(suffix_levels, 0, {"exact", "global", "scale_factor"}));
+	auto exact_suffix_samples = con.Query(
+	    "SELECT min(sample_count), max(sample_count) "
+	    "FROM duckdb_debug_query_request_downstream_suffix_profiles() WHERE profile_level='exact'");
+	REQUIRE(CHECK_COLUMN(exact_suffix_samples, 0, {Value::UBIGINT(3)}));
+	REQUIRE(CHECK_COLUMN(exact_suffix_samples, 1, {Value::UBIGINT(3)}));
+	auto invalid_suffix_probabilities = con.Query(
+	    "SELECT count(*) FROM ("
+	    "SELECT profile_level, template_id, scale_factor, pipeline_id, pipeline_signature_hash "
+	    "FROM duckdb_debug_query_request_downstream_suffix_profiles() "
+	    "GROUP BY ALL HAVING abs(sum(probability) - 1.0) > 1e-9)");
+	REQUIRE(CHECK_COLUMN(invalid_suffix_probabilities, 0, {Value::BIGINT(0)}));
 
 	store.Clear();
 }

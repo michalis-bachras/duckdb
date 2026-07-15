@@ -32,7 +32,7 @@ public:
 	static bool ProfilingEnabled(ClientContext &context);
 	static void BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query);
 	static void RefreshQueryStart(ClientContext &context);
-	static void EndQuery(ClientContext &context);
+	static void EndQuery(ClientContext &context, bool success);
 	static bool HasActiveMetadata(ClientContext &context);
 	static bool TryGetActive(ClientContext &context, QueryRequestMetadata &metadata);
 };

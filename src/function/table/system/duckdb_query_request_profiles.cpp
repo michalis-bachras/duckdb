@@ -39,6 +39,12 @@ struct DuckDBQueryRequestContinuationProfilesData : public GlobalTableFunctionSt
 	idx_t offset = 0;
 };
 
+struct DuckDBQueryRequestDownstreamSuffixProfilesData : public GlobalTableFunctionState {
+	vector<QueryRequestDownstreamSuffixProfileSnapshot> profiles;
+	idx_t profile_offset = 0;
+	idx_t bucket_offset = 0;
+};
+
 struct DuckDBQueryAdmissionData : public GlobalTableFunctionState {
 	vector<QueryAdmissionSnapshot> snapshots;
 	idx_t offset = 0;
@@ -152,6 +158,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineProfilesBind(ClientCon
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("mean_downstream_suffix_ns");
 	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("downstream_suffix_sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("mean_task_count");
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("mean_source_max_threads");
@@ -209,6 +217,7 @@ static void DuckDBQueryRequestPipelineProfilesFunction(ClientContext &context, T
 		output.SetValue(col++, count, Value::DOUBLE(estimate.p90_task_runtime_ns));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_lifecycle_runtime_ns));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_downstream_suffix_ns));
+		output.SetValue(col++, count, Value::UBIGINT(estimate.downstream_suffix_sample_count));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_task_count));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_source_max_threads));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_planned_input_rows));
@@ -352,6 +361,14 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineInstancesBind(ClientCo
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("downstream_suffix_ns");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_completion_ordinal");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("total_pipeline_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("remaining_suffix_stages");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("normalized_downstream_suffix_ns");
+	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("effective_ns_per_work_unit");
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("continuation_valid");
@@ -403,6 +420,10 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 		output.SetValue(col++, count, Value::UBIGINT(instance.task_runtime_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.lifecycle_runtime_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.downstream_suffix_ns));
+		output.SetValue(col++, count, Value::UBIGINT(instance.pipeline_completion_ordinal));
+		output.SetValue(col++, count, Value::UBIGINT(instance.total_pipeline_count));
+		output.SetValue(col++, count, Value::UBIGINT(instance.remaining_suffix_stages));
+		output.SetValue(col++, count, Value::DOUBLE(instance.normalized_downstream_suffix_ns));
 		output.SetValue(col++, count, Value::DOUBLE(instance.effective_ns_per_work_unit));
 		output.SetValue(col++, count, Value::BOOLEAN(instance.continuation_valid));
 		count++;
@@ -458,6 +479,89 @@ static void DuckDBQueryRequestContinuationProfilesFunction(ClientContext &contex
 		output.SetValue(col++, count, Value::DOUBLE(profile.p50));
 		output.SetValue(col++, count, Value::DOUBLE(profile.p90));
 		output.SetValue(col++, count, Value::UBIGINT(profile.native_unit_mismatch_count));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static const char *DownstreamSuffixProfileLevelName(DownstreamSuffixProfileLevel level) {
+	switch (level) {
+	case DownstreamSuffixProfileLevel::EXACT:
+		return "exact";
+	case DownstreamSuffixProfileLevel::SCALE_FACTOR:
+		return "scale_factor";
+	case DownstreamSuffixProfileLevel::GLOBAL:
+		return "global";
+	default:
+		return "none";
+	}
+}
+
+static unique_ptr<FunctionData> DuckDBQueryRequestDownstreamSuffixProfilesBind(
+    ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names) {
+	names.emplace_back("profile_level");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("template_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("scale_factor");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_signature_hash");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("value_unit");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("generation");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("bucket_index");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("lower");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("upper");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("probability");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("point_mass");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState>
+DuckDBQueryRequestDownstreamSuffixProfilesInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryRequestDownstreamSuffixProfilesData>();
+	result->profiles = QueryRequestProfileStore::Get().GetDownstreamSuffixProfilesSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryRequestDownstreamSuffixProfilesFunction(ClientContext &context, TableFunctionInput &data_p,
+	                                                           DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryRequestDownstreamSuffixProfilesData>();
+	idx_t count = 0;
+	while (data.profile_offset < data.profiles.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &profile = data.profiles[data.profile_offset];
+		if (data.bucket_offset >= profile.histogram.bucket_count) {
+			data.profile_offset++;
+			data.bucket_offset = 0;
+			continue;
+		}
+		const auto &bucket = profile.histogram.buckets[data.bucket_offset];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value(DownstreamSuffixProfileLevelName(profile.level)));
+		output.SetValue(col++, count, Value::UBIGINT(profile.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(profile.scale_factor));
+		output.SetValue(col++, count, Value::UBIGINT(profile.pipeline_id));
+		output.SetValue(col++, count, Value::UBIGINT(profile.pipeline_signature_hash));
+		output.SetValue(col++, count, Value(profile.value_unit));
+		output.SetValue(col++, count, Value::UBIGINT(profile.histogram.sample_count));
+		output.SetValue(col++, count, Value::UBIGINT(profile.histogram.generation));
+		output.SetValue(col++, count, Value::UBIGINT(data.bucket_offset));
+		output.SetValue(col++, count, Value::DOUBLE(bucket.lower_ns));
+		output.SetValue(col++, count, Value::DOUBLE(bucket.upper_ns));
+		output.SetValue(col++, count, Value::DOUBLE(bucket.probability));
+		output.SetValue(col++, count, Value::BOOLEAN(bucket.lower_ns == bucket.upper_ns));
+		data.bucket_offset++;
 		count++;
 	}
 	output.SetCardinality(count);
@@ -817,6 +921,10 @@ void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	                              DuckDBQueryRequestContinuationProfilesFunction,
 	                              DuckDBQueryRequestContinuationProfilesBind,
 	                              DuckDBQueryRequestContinuationProfilesInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_request_downstream_suffix_profiles", {},
+	                              DuckDBQueryRequestDownstreamSuffixProfilesFunction,
+	                              DuckDBQueryRequestDownstreamSuffixProfilesBind,
+	                              DuckDBQueryRequestDownstreamSuffixProfilesInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_admission", {}, DuckDBQueryAdmissionFunction,
 	                              DuckDBQueryAdmissionBind, DuckDBQueryAdmissionInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_admission_events", {}, DuckDBQueryAdmissionEventsFunction,

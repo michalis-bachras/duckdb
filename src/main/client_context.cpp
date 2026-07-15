@@ -310,7 +310,7 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 
 	client_data->profiler->EndQuery();
 	if (QueryRequestMetadataManager::NeedsMetadata(*this)) {
-		QueryRequestMetadataManager::EndQuery(*this);
+		QueryRequestMetadataManager::EndQuery(*this, success && !error.HasError());
 	}
 	EnergyAttributionManager::EndQuery(*this);
 

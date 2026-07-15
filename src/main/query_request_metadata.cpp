@@ -148,7 +148,7 @@ void QueryRequestMetadataManager::RefreshQueryStart(ClientContext &context) {
 	entry->second.query_start_ns = TimestampNs();
 }
 
-void QueryRequestMetadataManager::EndQuery(ClientContext &context) {
+void QueryRequestMetadataManager::EndQuery(ClientContext &context, bool success) {
 	QueryRequestMetadata metadata;
 	{
 		lock_guard<std::mutex> guard(g_request_metadata_lock);
@@ -159,7 +159,7 @@ void QueryRequestMetadataManager::EndQuery(ClientContext &context) {
 		metadata = entry->second;
 		g_active_request_metadata.erase(entry);
 	}
-	if (!ProfilingEnabled(context)) {
+	if (!success || !ProfilingEnabled(context)) {
 		return;
 	}
 	auto query_end_ns = TimestampNs();
