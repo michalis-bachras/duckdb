@@ -15,6 +15,8 @@
 
 namespace duckdb {
 
+struct QueryRequestProfileStoreState;
+
 static constexpr idx_t DOWNSTREAM_SUFFIX_MAX_BUCKETS = 8;
 static constexpr idx_t DOWNSTREAM_SUFFIX_MAX_RESOLVED_BUCKETS = 16;
 
@@ -89,6 +91,8 @@ struct QueryRequestPipelineProfileEstimate {
 	double mean_task_runtime_ns = 0;
 	double p90_task_runtime_ns = 0;
 	double mean_lifecycle_runtime_ns = 0;
+	double mean_finish_tail_ns = 0;
+	double p90_finish_tail_ns = 0;
 	double mean_downstream_suffix_ns = 0;
 	idx_t downstream_suffix_sample_count = 0;
 	double mean_task_count = 0;
@@ -161,6 +165,7 @@ struct QueryRequestPipelineInstanceSnapshot {
 	uint64_t finish_done_ns = 0;
 	uint64_t task_runtime_ns = 0;
 	uint64_t lifecycle_runtime_ns = 0;
+	uint64_t finish_tail_ns = 0;
 	uint64_t downstream_suffix_ns = 0;
 	idx_t pipeline_completion_ordinal = 0;
 	idx_t total_pipeline_count = 0;
@@ -183,6 +188,17 @@ struct QueryRequestContinuationProfileSnapshot {
 	idx_t native_unit_mismatch_count = 0;
 };
 
+struct QueryRequestThroughputProfileSnapshot {
+	PipelineThroughputEstimateLevel level = PipelineThroughputEstimateLevel::NONE;
+	SourceWorkClass source_work_class;
+	PhysicalOperatorType sink_type = PhysicalOperatorType::INVALID;
+	SourceThroughputKind work_kind = SourceThroughputKind::UNKNOWN;
+	string native_unit;
+	idx_t sample_count = 0;
+	double mean_work_units_per_s = 0;
+	double ewma_work_units_per_s = 0;
+};
+
 struct QueryRequestDownstreamSuffixProfileSnapshot {
 	DownstreamSuffixProfileLevel level = DownstreamSuffixProfileLevel::NONE;
 	uint64_t template_id = 0;
@@ -195,7 +211,11 @@ struct QueryRequestDownstreamSuffixProfileSnapshot {
 
 class QueryRequestProfileStore {
 public:
-	static QueryRequestProfileStore &Get();
+	QueryRequestProfileStore();
+	~QueryRequestProfileStore();
+
+	QueryRequestProfileStore(const QueryRequestProfileStore &) = delete;
+	QueryRequestProfileStore &operator=(const QueryRequestProfileStore &) = delete;
 
 	void RecordQueryCompletion(const QueryRequestMetadata &metadata, uint64_t query_end_ns,
 	                           const vector<PipelineProfilingInfo> &pipeline_profiles);
@@ -205,6 +225,10 @@ public:
 	PipelineContinuationEstimate ResolvePipelineContinuation(uint64_t template_id, uint64_t scale_factor,
 	                                                         const PipelineProfileIdentity &identity,
 	                                                         idx_t planned_work_units) const;
+	PipelineThroughputEstimate ResolvePipelineThroughput(uint64_t template_id, uint64_t scale_factor,
+	                                                     const PipelineProfileIdentity &identity) const;
+	PipelineLifecycleTailEstimate ResolvePipelineLifecycleTail(uint64_t template_id, uint64_t scale_factor,
+	                                                           const PipelineProfileIdentity &identity) const;
 	vector<DownstreamSuffixEstimate>
 	PrepareDownstreamSuffixEpoch(const vector<DownstreamSuffixEpochRequest> &requests) const;
 	vector<QueryRequestProfileSnapshot> GetQueryProfilesSnapshot() const;
@@ -212,10 +236,14 @@ public:
 	vector<QueryRequestSampleSnapshot> GetQuerySamplesSnapshot() const;
 	vector<QueryRequestPipelineInstanceSnapshot> GetPipelineInstancesSnapshot() const;
 	vector<QueryRequestContinuationProfileSnapshot> GetContinuationProfilesSnapshot() const;
+	vector<QueryRequestThroughputProfileSnapshot> GetThroughputProfilesSnapshot() const;
 	vector<QueryRequestDownstreamSuffixProfileSnapshot> GetDownstreamSuffixProfilesSnapshot() const;
 	idx_t QueryProfileCount() const;
 	idx_t PipelineProfileCount() const;
 	void Clear();
+
+private:
+	unique_ptr<QueryRequestProfileStoreState> state;
 };
 
 } // namespace duckdb

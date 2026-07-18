@@ -1085,6 +1085,27 @@ struct QueryWorkerOnlyExecutionEnableSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct QuerySLASchedulerEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_sla_scheduler_enable";
+	static constexpr const char *Description =
+	    "Enable database-scoped SLA-aware worker allocation for tagged analytical queries";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QuerySLASchedulerEpochMsSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "query_sla_scheduler_epoch_ms";
+	static constexpr const char *Description = "SLA scheduler epoch length in milliseconds";
+	static constexpr const char *InputType = "UBIGINT";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct ErrorsAsJSONSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "errors_as_json";

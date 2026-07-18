@@ -37,6 +37,37 @@ struct PipelineProfileIdentity {
 	bool valid = false;
 };
 
+enum class PipelineThroughputEstimateLevel : uint8_t {
+	NONE = 0,
+	EXACT,
+	SOURCE_SINK,
+	SOURCE,
+	GLOBAL_COMPATIBLE
+};
+
+const char *PipelineThroughputEstimateLevelToString(PipelineThroughputEstimateLevel level);
+
+struct PipelineThroughputEstimate {
+	bool valid = false;
+	PipelineThroughputEstimateLevel level = PipelineThroughputEstimateLevel::NONE;
+	idx_t sample_count = 0;
+	double mean_work_units_per_s = 0;
+	double ewma_work_units_per_s = 0;
+};
+
+enum class PipelineLifecycleTailEstimateLevel : uint8_t { NONE = 0, EXACT, GLOBAL };
+
+const char *PipelineLifecycleTailEstimateLevelToString(PipelineLifecycleTailEstimateLevel level);
+
+struct PipelineLifecycleTailEstimate {
+	bool valid = false;
+	PipelineLifecycleTailEstimateLevel level = PipelineLifecycleTailEstimateLevel::NONE;
+	idx_t sample_count = 0;
+	double mean_ns = 0;
+	double p50_ns = 0;
+	double p90_ns = 0;
+};
+
 enum class ContinuationEstimateLevel : uint8_t {
 	NONE = 0,
 	EXACT,

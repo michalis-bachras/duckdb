@@ -10,6 +10,7 @@
 
 #include "duckdb/parallel/task.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/atomic.hpp"
 
 namespace duckdb {
 class Event;
@@ -33,6 +34,7 @@ public:
 	shared_ptr<Event> event;
 	unique_ptr<ThreadContext> thread_context;
 	optional_ptr<const PhysicalOperator> op;
+	atomic<bool> task_blocked {false};
 
 private:
 	ClientContext &context;

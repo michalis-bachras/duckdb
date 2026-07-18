@@ -1,5 +1,6 @@
 #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/parallel/task_notifier.hpp"
+#include "duckdb/parallel/event.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
@@ -25,11 +26,17 @@ ExecutorTask::~ExecutorTask() {
 }
 
 void ExecutorTask::Deschedule() {
+	if (event && !task_blocked.exchange(true)) {
+		event->MarkTaskBlocked();
+	}
 	auto this_ptr = shared_from_this();
 	executor.AddToBeRescheduled(this_ptr);
 }
 
 void ExecutorTask::Reschedule() {
+	if (event && task_blocked.exchange(false)) {
+		event->MarkTaskUnblocked();
+	}
 	auto this_ptr = shared_from_this();
 	executor.RescheduleTask(this_ptr);
 }

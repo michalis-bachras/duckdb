@@ -18,6 +18,8 @@
 #include "duckdb/main/error_manager.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/query_admission_controller.hpp"
+#include "duckdb/main/query_request_profile_store.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -97,6 +99,8 @@ DatabaseInstance::~DatabaseInstance() {
 	external_file_cache.reset();
 	result_set_manager.reset();
 	query_admission_controller.reset();
+	query_request_profile_store.reset();
+	query_sla_scheduler.reset();
 
 	buffer_manager.reset();
 
@@ -298,6 +302,8 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	external_file_cache = make_uniq<ExternalFileCache>(*this, enable_external_file_cache);
 	result_set_manager = make_uniq<ResultSetManager>(*this);
 	query_admission_controller = make_uniq<QueryAdmissionController>(*this);
+	query_request_profile_store = make_uniq<QueryRequestProfileStore>();
+	query_sla_scheduler = make_uniq<QuerySLAScheduler>(*this);
 
 	scheduler = make_uniq<TaskScheduler>(*this);
 	object_cache = make_uniq<ObjectCache>(*config.buffer_pool);
@@ -403,6 +409,20 @@ QueryAdmissionController &DatabaseInstance::GetQueryAdmissionController() {
 		throw InternalException("Missing query admission controller");
 	}
 	return *query_admission_controller;
+}
+
+QueryRequestProfileStore &DatabaseInstance::GetQueryRequestProfileStore() {
+	if (!query_request_profile_store) {
+		throw InternalException("Missing query request profile store");
+	}
+	return *query_request_profile_store;
+}
+
+QuerySLAScheduler &DatabaseInstance::GetQuerySLAScheduler() {
+	if (!query_sla_scheduler) {
+		throw InternalException("Query SLA scheduler is not initialized");
+	}
+	return *query_sla_scheduler;
 }
 
 ConnectionManager &DatabaseInstance::GetConnectionManager() {

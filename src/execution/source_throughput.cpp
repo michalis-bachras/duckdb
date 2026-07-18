@@ -177,6 +177,32 @@ string SourceWorkClassToString(const SourceWorkClass &work_class) {
 	return EnumUtil::ToString(work_class.source_type) + "::" + SourceThroughputKindToString(work_class.work_kind);
 }
 
+const char *PipelineThroughputEstimateLevelToString(PipelineThroughputEstimateLevel level) {
+	switch (level) {
+	case PipelineThroughputEstimateLevel::EXACT:
+		return "exact";
+	case PipelineThroughputEstimateLevel::SOURCE_SINK:
+		return "source_sink";
+	case PipelineThroughputEstimateLevel::SOURCE:
+		return "source";
+	case PipelineThroughputEstimateLevel::GLOBAL_COMPATIBLE:
+		return "global_compatible";
+	default:
+		return "none";
+	}
+}
+
+const char *PipelineLifecycleTailEstimateLevelToString(PipelineLifecycleTailEstimateLevel level) {
+	switch (level) {
+	case PipelineLifecycleTailEstimateLevel::EXACT:
+		return "exact";
+	case PipelineLifecycleTailEstimateLevel::GLOBAL:
+		return "global";
+	default:
+		return "none";
+	}
+}
+
 const char *ContinuationEstimateLevelToString(ContinuationEstimateLevel level) {
 	switch (level) {
 	case ContinuationEstimateLevel::EXACT:

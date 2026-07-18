@@ -16,6 +16,7 @@ add_library_unity(
   pipeline_initialize_event.cpp
   pipeline_prepare_finish_event.cpp
   query_activation_scheduler.cpp
+  query_sla_scheduler.cpp
   query_pipeline_debug.cpp
   task_executor.cpp
   task_notifier.cpp

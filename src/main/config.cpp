@@ -157,6 +157,8 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_LOCAL(QueryActivationSchedulerEnableSetting),
     DUCKDB_LOCAL(QueryActivationDebugEnableSetting),
     DUCKDB_GLOBAL(QueryWorkerOnlyExecutionEnableSetting),
+    DUCKDB_GLOBAL(QuerySLASchedulerEnableSetting),
+    DUCKDB_GLOBAL(QuerySLASchedulerEpochMsSetting),
     DUCKDB_SETTING(ErrorsAsJSONSetting),
     DUCKDB_SETTING(ExperimentalMetadataReuseSetting),
     DUCKDB_SETTING_CALLBACK(ExplainOutputSetting),

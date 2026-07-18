@@ -8,7 +8,8 @@
 namespace duckdb {
 
 Event::Event(Executor &executor_p)
-    : executor(executor_p), finished_tasks(0), total_tasks(0), finished_dependencies(0), total_dependencies(0),
+    : executor(executor_p), finished_tasks(0), total_tasks(0), blocked_tasks(0), finished_dependencies(0),
+      total_dependencies(0),
       finished(false), activation_registered(false), activation_group_id(0), activation_pipeline_id(0),
       activation_kind(QueryActivationEventKind::UNREGISTERED), energy_lifecycle_registered(false),
       energy_lifecycle_group_id(0) {
@@ -65,6 +66,17 @@ void Event::FinishTask() {
 	}
 }
 
+void Event::MarkTaskBlocked() {
+	auto blocked = ++blocked_tasks;
+	D_ASSERT(blocked <= total_tasks.load() - finished_tasks.load());
+}
+
+void Event::MarkTaskUnblocked() {
+	auto blocked = blocked_tasks.load();
+	while (blocked > 0 && !blocked_tasks.compare_exchange_weak(blocked, blocked - 1)) {
+	}
+}
+
 ClientContext &Event::GetClientContext() {
 	return executor.context;
 }
@@ -100,6 +112,12 @@ void Event::SetTasks(vector<shared_ptr<Task>> tasks) {
 	D_ASSERT(total_tasks == 0);
 	D_ASSERT(!tasks.empty());
 	this->total_tasks = tasks.size();
+	try {
+		executor.NotifyEventTasksScheduled(*this);
+	} catch (...) {
+		this->total_tasks = 0;
+		throw;
+	}
 	ts.ScheduleTasks(executor.GetToken(), tasks);
 }
 

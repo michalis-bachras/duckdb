@@ -1465,6 +1465,9 @@ bool EnableProgressBarSetting::OnLocalReset(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 void ExternalThreadsSetting::OnSet(SettingCallbackInfo &info, Value &input) {
 	auto new_external_threads = input.GetValue<uint64_t>();
+	if (new_external_threads > 0 && info.config.options.query_sla_scheduler_enabled) {
+		throw InvalidInputException("external_threads must remain zero while query_sla_scheduler_enable=true");
+	}
 	if (info.db) {
 		TaskScheduler::GetScheduler(*info.db).SetThreads(info.config.options.maximum_threads, new_external_threads);
 	}
@@ -1899,15 +1902,59 @@ Value QueryActivationDebugEnableSetting::GetSetting(const ClientContext &context
 
 void QueryWorkerOnlyExecutionEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
 	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
-	config.options.query_worker_only_execution_enabled = BooleanValue::Get(value);
+	auto enabled = BooleanValue::Get(value);
+	if (!enabled && config.options.query_sla_scheduler_enabled) {
+		throw InvalidInputException(
+		    "query_worker_only_execution_enable must remain true while query_sla_scheduler_enable=true");
+	}
+	config.options.query_worker_only_execution_enabled = enabled;
 }
 
 void QueryWorkerOnlyExecutionEnableSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	if (config.options.query_sla_scheduler_enabled && !DBConfigOptions().query_worker_only_execution_enabled) {
+		throw InvalidInputException(
+		    "query_worker_only_execution_enable must remain true while query_sla_scheduler_enable=true");
+	}
 	config.options.query_worker_only_execution_enabled = DBConfigOptions().query_worker_only_execution_enabled;
 }
 
 Value QueryWorkerOnlyExecutionEnableSetting::GetSetting(const ClientContext &context) {
 	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_worker_only_execution_enabled);
+}
+
+void QuerySLASchedulerEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto value = BooleanValue::Get(input.DefaultCastAs(LogicalType::BOOLEAN));
+	if (value && !config.options.query_worker_only_execution_enabled) {
+		throw InvalidInputException("query_sla_scheduler_enable requires query_worker_only_execution_enable=true");
+	}
+	if (value && db && TaskScheduler::GetScheduler(*db).ExternalThreads() != 0) {
+		throw InvalidInputException("query_sla_scheduler_enable requires external_threads=0");
+	}
+	config.options.query_sla_scheduler_enabled = value;
+}
+
+void QuerySLASchedulerEnableSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.query_sla_scheduler_enabled = DBConfigOptions().query_sla_scheduler_enabled;
+}
+
+Value QuerySLASchedulerEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_sla_scheduler_enabled);
+}
+
+void QuerySLASchedulerEpochMsSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto value = input.GetValue<idx_t>();
+	if (value == 0) {
+		throw InvalidInputException("query_sla_scheduler_epoch_ms must be greater than zero");
+	}
+	config.options.query_sla_scheduler_epoch_ms = value;
+}
+
+void QuerySLASchedulerEpochMsSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.query_sla_scheduler_epoch_ms = DBConfigOptions().query_sla_scheduler_epoch_ms;
+}
+
+Value QuerySLASchedulerEpochMsSetting::GetSetting(const ClientContext &context) {
+	return Value::UBIGINT(DBConfig::GetConfig(context).options.query_sla_scheduler_epoch_ms);
 }
 
 //===----------------------------------------------------------------------===//

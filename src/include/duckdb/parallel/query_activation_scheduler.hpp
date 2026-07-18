@@ -38,6 +38,7 @@ public:
 	~QueryActivationScheduler();
 
 	shared_ptr<Event> OnEventReady(shared_ptr<Event> event);
+	void OnEventTasksScheduled(Event &event);
 	shared_ptr<Event> OnEventFinished(Event &event);
 	bool GetActivePipelineWorkSnapshot(PipelineWorkSnapshot &snapshot);
 
@@ -60,11 +61,13 @@ private:
 	void MarkFinishedLocked(Event &event);
 
 private:
+	Executor &executor;
 	QueryRequestMetadata metadata;
 	bool debug_enabled;
 	mutex scheduler_lock;
 	idx_t active_group_id = 0;
 	idx_t active_event_count = 0;
+	idx_t completed_pipeline_count = 0;
 	weak_ptr<Event> active_event;
 	std::deque<idx_t> deferred_group_order;
 	std::unordered_map<idx_t, std::deque<shared_ptr<Event>>> deferred_events_by_group;

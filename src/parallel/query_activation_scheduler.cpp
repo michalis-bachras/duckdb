@@ -8,6 +8,8 @@
 #include "duckdb/parallel/query_activation_scheduler.hpp"
 
 #include "duckdb/execution/executor.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 
 #include <chrono>
 
@@ -27,12 +29,16 @@ static QueryActivationDebugStore &GetDebugStore() {
 
 } // namespace
 
-QueryActivationScheduler::QueryActivationScheduler(Executor &, QueryRequestMetadata metadata_p,
+QueryActivationScheduler::QueryActivationScheduler(Executor &executor_p, QueryRequestMetadata metadata_p,
                                                    bool debug_enabled_p)
-    : metadata(std::move(metadata_p)), debug_enabled(debug_enabled_p) {
+    : executor(executor_p), metadata(std::move(metadata_p)), debug_enabled(debug_enabled_p) {
+	DatabaseInstance::GetDatabase(executor.context)
+	    .GetQuerySLAScheduler()
+	    .RegisterQuery(metadata, executor.GetToken(), debug_enabled);
 }
 
 QueryActivationScheduler::~QueryActivationScheduler() {
+	DatabaseInstance::GetDatabase(executor.context).GetQuerySLAScheduler().UnregisterQuery(metadata.db_query_id);
 }
 
 uint64_t QueryActivationScheduler::TimestampNs() {
@@ -218,14 +224,30 @@ shared_ptr<Event> QueryActivationScheduler::OnEventReady(shared_ptr<Event> event
 	return std::move(event);
 }
 
+void QueryActivationScheduler::OnEventTasksScheduled(Event &event) {
+	idx_t remaining_suffix_stages;
+	{
+		lock_guard<mutex> guard(scheduler_lock);
+		auto pipeline_count = executor.GetPhysicalPipelineCount();
+		remaining_suffix_stages = completed_pipeline_count < pipeline_count ? pipeline_count - completed_pipeline_count : 1;
+	}
+	DatabaseInstance::GetDatabase(executor.context)
+	    .GetQuerySLAScheduler()
+	    .OnEventScheduled(metadata.db_query_id, event.shared_from_this(), remaining_suffix_stages);
+}
+
 shared_ptr<Event> QueryActivationScheduler::OnEventFinished(Event &event) {
 	if (!event.HasQueryActivationInfo()) {
 		return nullptr;
 	}
+	DatabaseInstance::GetDatabase(executor.context).GetQuerySLAScheduler().OnEventFinished(metadata.db_query_id, event);
 	lock_guard<mutex> guard(scheduler_lock);
 	LogEventLocked(event, "finished");
 
 	MarkFinishedLocked(event);
+	if (event.GetQueryActivationKind() == QueryActivationEventKind::PIPELINE) {
+		completed_pipeline_count++;
+	}
 	return PopReadyEventLocked();
 }
 

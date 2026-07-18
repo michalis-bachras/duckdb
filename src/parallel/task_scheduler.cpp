@@ -7,6 +7,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 #include "duckdb/storage/block_allocator.hpp"
 #ifndef DUCKDB_NO_THREADS
 #include "concurrentqueue.h"
@@ -230,7 +231,7 @@ TaskScheduler::TaskScheduler(DatabaseInstance &db)
     : db(db), queue(make_uniq<ConcurrentQueue>()),
       allocator_flush_threshold(db.config.options.allocator_flush_threshold),
       allocator_background_threads(Settings::Get<AllocatorBackgroundThreadsSetting>(db)), requested_thread_count(0),
-      current_thread_count(1) {
+      current_thread_count(1), external_thread_count(1) {
 	SetAllocatorBackgroundThreads(allocator_background_threads);
 }
 
@@ -271,8 +272,13 @@ bool TaskScheduler::GetTaskFromProducer(ProducerToken &token, shared_ptr<Task> &
 }
 
 void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
+	ExecuteForever(marker, DConstants::INVALID_INDEX);
+}
+
+void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 #ifndef DUCKDB_NO_THREADS
 	static constexpr const int64_t INITIAL_FLUSH_WAIT = 500000; // initial wait time of 0.5s (in mus) before flushing
+	static constexpr const int64_t SLA_NO_TASK_RETRY_WAIT = 100; // avoid a hot retry loop on temporarily ineligible work
 
 	const auto &block_allocator = BlockAllocator::Get(db);
 	const auto &config = DBConfig::GetConfig(db);
@@ -301,9 +307,16 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				}
 			}
 		}
-		if (queue->Dequeue(task)) {
+		auto sla_result = worker_id == DConstants::INVALID_INDEX
+		                      ? QuerySLADequeueResult::NOT_ACTIVE
+		                      : db.GetQuerySLAScheduler().TryDequeueTask(worker_id, task);
+		auto has_task = sla_result == QuerySLADequeueResult::TASK_FOUND;
+		if (sla_result == QuerySLADequeueResult::NOT_ACTIVE) {
+			has_task = queue->Dequeue(task);
+		}
+		if (has_task) {
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
-			if (Settings::Get<SchedulerProcessPartialSetting>(config)) {
+			if (Settings::Get<SchedulerProcessPartialSetting>(config) || db.GetQuerySLAScheduler().Enabled()) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 			}
 			auto execute_result = task->Execute(process_mode);
@@ -326,6 +339,9 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			}
 		} else if (queue->GetTasksInQueue() > 0) {
 			// failed to dequeue but there are still tasks remaining - signal again to retry
+			if (sla_result == QuerySLADequeueResult::NO_TASK) {
+				std::this_thread::sleep_for(std::chrono::microseconds(SLA_NO_TASK_RETRY_WAIT));
+			}
 			queue->semaphore.signal(1);
 		}
 	}
@@ -429,13 +445,17 @@ static void ThreadExecuteTasks(TaskScheduler *scheduler, atomic<bool> *marker, i
 	auto &db = scheduler->GetDatabase();
 	auto linux_tid = SchedulerThreadTID();
 	EnergyAttributionManager::RegisterSchedulerWorker(db, static_cast<uint64_t>(worker_id), linux_tid, intended_cpu);
-	scheduler->ExecuteForever(marker);
+	scheduler->ExecuteForever(marker, worker_id);
 	EnergyAttributionManager::UnregisterSchedulerWorker(db, static_cast<uint64_t>(worker_id), linux_tid);
 }
 #endif
 
 int32_t TaskScheduler::NumberOfThreads() {
 	return current_thread_count.load();
+}
+
+idx_t TaskScheduler::ExternalThreads() const {
+	return external_thread_count.load();
 }
 
 DatabaseInstance &TaskScheduler::GetDatabase() {
@@ -469,6 +489,7 @@ void TaskScheduler::SetThreads(idx_t total_threads, idx_t external_threads) {
 	}
 #endif
 	requested_thread_count = NumericCast<int32_t>(total_threads - external_threads);
+	external_thread_count = external_threads;
 }
 
 void TaskScheduler::SetAllocatorFlushTreshold(idx_t threshold) {

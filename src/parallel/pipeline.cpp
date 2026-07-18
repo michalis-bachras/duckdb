@@ -269,6 +269,9 @@ void Pipeline::ResetSourceWorkTracking() {
 	source_work_source_max_threads = 0;
 	source_work_effective_max_threads = 0;
 	source_work_scalable = false;
+	profile_identity = PipelineProfileIdentity();
+	historical_throughput_estimate = PipelineThroughputEstimate();
+	lifecycle_tail_estimate = PipelineLifecycleTailEstimate();
 	continuation_estimate = PipelineContinuationEstimate();
 	source_work_completed_rows.store(0);
 	source_work_completed_chunks_equiv.store(0);
@@ -431,6 +434,17 @@ bool Pipeline::GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const {
 		    static_cast<double>(snapshot.throughput_worker_time_ns);
 		snapshot.throughput_valid = true;
 	}
+	snapshot.historical_throughput_estimate = historical_throughput_estimate;
+	snapshot.profile_identity = profile_identity;
+	if (snapshot.throughput_valid) {
+		snapshot.selected_throughput_valid = true;
+		snapshot.selected_throughput_is_live = true;
+		snapshot.selected_single_worker_chunks_per_s = snapshot.single_worker_chunks_per_s;
+	} else if (historical_throughput_estimate.valid) {
+		snapshot.selected_throughput_valid = true;
+		snapshot.selected_single_worker_chunks_per_s =
+		    historical_throughput_estimate.ewma_work_units_per_s;
+	}
 	snapshot.remaining_chunks_equiv =
 	    snapshot.completed_chunks_equiv >= snapshot.total_chunks_equiv
 	        ? 0
@@ -438,6 +452,7 @@ bool Pipeline::GetWorkSnapshot(PipelineWorkSnapshot &snapshot) const {
 	snapshot.source_max_threads = source_work_source_max_threads;
 	snapshot.effective_max_threads = source_work_effective_max_threads;
 	snapshot.scalable = source_work_scalable;
+	snapshot.lifecycle_tail_estimate = lifecycle_tail_estimate;
 	snapshot.continuation_estimate = continuation_estimate;
 	return true;
 }
@@ -650,10 +665,17 @@ void Pipeline::RecordProfilerStart(idx_t task_count, idx_t source_max_threads,
 		if (!identity.valid || !QueryRequestMetadataManager::TryGetActive(context, metadata)) {
 			return;
 		}
-		auto estimate = QueryRequestProfileStore::Get().ResolvePipelineContinuation(
-		    metadata.template_id, metadata.scale_factor, identity, SourceInputChunksEquiv(source_input_volume));
+		auto &store = DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore();
+		auto continuation = store.ResolvePipelineContinuation(metadata.template_id, metadata.scale_factor, identity,
+		                                                       SourceInputChunksEquiv(source_input_volume));
+		auto throughput = store.ResolvePipelineThroughput(metadata.template_id, metadata.scale_factor, identity);
+		auto lifecycle_tail =
+		    store.ResolvePipelineLifecycleTail(metadata.template_id, metadata.scale_factor, identity);
 		lock_guard<mutex> guard(source_work_lock);
-		continuation_estimate = estimate;
+		profile_identity = identity;
+		continuation_estimate = continuation;
+		historical_throughput_estimate = throughput;
+		lifecycle_tail_estimate = lifecycle_tail;
 	}
 }
 

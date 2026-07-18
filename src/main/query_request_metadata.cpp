@@ -7,6 +7,8 @@
 
 #include "duckdb/main/query_request_metadata.hpp"
 
+#include "duckdb/main/database.hpp"
+
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -118,13 +120,15 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 
 bool QueryRequestMetadataManager::ProfilingEnabled(ClientContext &context) {
 	const auto &config = ClientConfig::GetConfig(context);
-	return config.query_request_profiling_enabled || config.query_activation_scheduler_enabled;
+	return config.query_request_profiling_enabled || config.query_activation_scheduler_enabled ||
+	       DBConfig::GetConfig(context).options.query_sla_scheduler_enabled;
 }
 
 bool QueryRequestMetadataManager::NeedsMetadata(ClientContext &context) {
 	const auto &config = ClientConfig::GetConfig(context);
 	return config.query_request_profiling_enabled || config.query_admission_max_active > 0 ||
-	       config.query_activation_scheduler_enabled || config.query_activation_debug_enabled;
+	       config.query_activation_scheduler_enabled || config.query_activation_debug_enabled ||
+	       DBConfig::GetConfig(context).options.query_sla_scheduler_enabled;
 }
 
 void QueryRequestMetadataManager::BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query) {
@@ -164,7 +168,8 @@ void QueryRequestMetadataManager::EndQuery(ClientContext &context, bool success)
 	}
 	auto query_end_ns = TimestampNs();
 	auto pipeline_profiles = QueryProfiler::Get(context).GetPipelineProfilesSnapshot();
-	QueryRequestProfileStore::Get().RecordQueryCompletion(metadata, query_end_ns, pipeline_profiles);
+	DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().RecordQueryCompletion(
+	    metadata, query_end_ns, pipeline_profiles);
 }
 
 bool QueryRequestMetadataManager::HasActiveMetadata(ClientContext &context) {

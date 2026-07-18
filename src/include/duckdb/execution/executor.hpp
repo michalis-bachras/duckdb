@@ -101,6 +101,7 @@ public:
 	void ScheduleEvent(shared_ptr<Event> event);
 	void ScheduleEventNow(shared_ptr<Event> event);
 	void RegisterActivationEvent(Event &event, idx_t group_id, QueryActivationEventKind kind, idx_t pipeline_id = 0);
+	void NotifyEventTasksScheduled(Event &event);
 	void NotifyEventFinished(Event &event);
 
 	void AddRecursiveCTE(PhysicalOperator &rec_cte);
@@ -125,6 +126,10 @@ public:
 
 	idx_t GetCompletedPipelines() const {
 		return completed_pipelines.load();
+	}
+
+	idx_t GetPhysicalPipelineCount() const {
+		return pipelines.size();
 	}
 
 private:

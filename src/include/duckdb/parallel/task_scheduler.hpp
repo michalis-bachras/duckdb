@@ -53,6 +53,7 @@ public:
 	bool GetTaskFromProducer(ProducerToken &token, shared_ptr<Task> &task);
 	//! Run tasks forever until "marker" is set to false, "marker" must remain valid until the thread is joined
 	void ExecuteForever(atomic<bool> *marker);
+	void ExecuteForever(atomic<bool> *marker, idx_t worker_id);
 	//! Run tasks until `marker` is set to false, `max_tasks` have been completed, or until there are no more tasks
 	//! available. Returns the number of tasks that were completed.
 	idx_t ExecuteTasks(atomic<bool> *marker, idx_t max_tasks);
@@ -68,6 +69,7 @@ public:
 
 	//! Returns the number of threads
 	DUCKDB_API int32_t NumberOfThreads();
+	DUCKDB_API idx_t ExternalThreads() const;
 	//! Returns the database instance this scheduler belongs to
 	DUCKDB_API DatabaseInstance &GetDatabase();
 
@@ -112,6 +114,7 @@ private:
 	atomic<int32_t> requested_thread_count;
 	//! The amount of threads currently running
 	atomic<int32_t> current_thread_count;
+	atomic<idx_t> external_thread_count;
 };
 
 } // namespace duckdb

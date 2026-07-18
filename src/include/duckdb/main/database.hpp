@@ -36,6 +36,8 @@ class LogManager;
 class ExternalFileCache;
 class ResultSetManager;
 class QueryAdmissionController;
+class QueryRequestProfileStore;
+class QuerySLAScheduler;
 
 class DatabaseInstance : public enable_shared_from_this<DatabaseInstance> {
 	friend class DuckDB;
@@ -62,6 +64,8 @@ public:
 	DUCKDB_API ValidChecker &GetValidChecker();
 	DUCKDB_API LogManager &GetLogManager() const;
 	DUCKDB_API QueryAdmissionController &GetQueryAdmissionController();
+	DUCKDB_API QueryRequestProfileStore &GetQueryRequestProfileStore();
+	DUCKDB_API QuerySLAScheduler &GetQuerySLAScheduler();
 
 	DUCKDB_API const duckdb_ext_api_v1 GetExtensionAPIV1();
 
@@ -100,6 +104,8 @@ private:
 	unique_ptr<ExternalFileCache> external_file_cache;
 	unique_ptr<ResultSetManager> result_set_manager;
 	unique_ptr<QueryAdmissionController> query_admission_controller;
+	unique_ptr<QueryRequestProfileStore> query_request_profile_store;
+	unique_ptr<QuerySLAScheduler> query_sla_scheduler;
 
 	duckdb_ext_api_v1 (*create_api_v1)();
 };

@@ -5,6 +5,7 @@
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/query_pipeline_debug.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 #include "test_helpers.hpp"
 
 #include <chrono>
@@ -110,19 +111,24 @@ static DownstreamSuffixEstimate PrepareDownstreamSuffix(QueryRequestProfileStore
 	return estimates[0];
 }
 
-static string MetadataQuery(uint64_t request_id, uint64_t template_id, uint64_t scale_factor, const string &body) {
+static string MetadataQuery(uint64_t request_id, uint64_t template_id, uint64_t scale_factor, double penalty_per_s,
+                            const string &body) {
 	auto deadline_ns = CurrentNs() + 60000000000ULL;
 	return StringUtil::Format(
-	    "/* duckdb_sla_v1 request_id=%llu template_id=%llu scale_factor=%llu sla_tag=30 penalty_per_s=1.0 "
+	    "/* duckdb_sla_v1 request_id=%llu template_id=%llu scale_factor=%llu sla_tag=30 penalty_per_s=%.17g "
 	    "deadline_ns=%llu */ %s",
 	    static_cast<unsigned long long>(request_id), static_cast<unsigned long long>(template_id),
-	    static_cast<unsigned long long>(scale_factor), static_cast<unsigned long long>(deadline_ns), body);
+	    static_cast<unsigned long long>(scale_factor), penalty_per_s, static_cast<unsigned long long>(deadline_ns), body);
+}
+
+static string MetadataQuery(uint64_t request_id, uint64_t template_id, uint64_t scale_factor, const string &body) {
+	return MetadataQuery(request_id, template_id, scale_factor, 1.0, body);
 }
 
 } // namespace
 
 TEST_CASE("Query request profile store aggregates direct observations", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 
 	auto pipeline = PipelineProfile(2000);
@@ -219,7 +225,7 @@ TEST_CASE("Query request profile store aggregates direct observations", "[api]")
 }
 
 TEST_CASE("Query request profile store tracks bounded continuation percentiles", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 
 	auto signature_hash = StableStringHash64(PipelineSignature(PipelineProfile(1000)));
@@ -258,7 +264,7 @@ TEST_CASE("Query request profile store tracks bounded continuation percentiles",
 }
 
 TEST_CASE("Query request profile store records lifecycle suffix progress", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 	auto make_pipeline = [](idx_t pipeline_id, uint64_t finish_ns) {
 		auto pipeline = PipelineProfile(1000);
@@ -297,7 +303,7 @@ TEST_CASE("Query request profile store records lifecycle suffix progress", "[api
 }
 
 TEST_CASE("Query request downstream suffix histograms preserve sparse point masses", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 	uint64_t signature_hash = 0;
 	for (idx_t i = 0; i < 9; i++) {
@@ -369,7 +375,7 @@ TEST_CASE("Query request downstream suffix histograms preserve sparse point mass
 }
 
 TEST_CASE("Query request downstream suffix epoch preparation blends exact scale and global profiles", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 	for (idx_t i = 0; i < 4; i++) {
 		auto start_ns = 10000 + i * 10000;
@@ -433,7 +439,7 @@ TEST_CASE("Query request downstream suffix epoch preparation blends exact scale 
 }
 
 TEST_CASE("Query request downstream suffix epoch preparation is ordered and deduplicated", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 
 	uint64_t request_id = 1;
@@ -505,7 +511,7 @@ TEST_CASE("Query request downstream suffix epoch preparation is ordered and dedu
 }
 
 TEST_CASE("Query request downstream suffix epoch preparation leaves inactive profiles available", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 	uint64_t active_signature = 0;
 	uint64_t inactive_signature = 0;
@@ -536,7 +542,7 @@ TEST_CASE("Query request downstream suffix epoch preparation leaves inactive pro
 }
 
 TEST_CASE("Query request downstream suffix epoch preparation tolerates concurrent completions", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 	auto pipeline = PipelineProfile(1000);
 	DownstreamSuffixEpochRequest request {1001, 10, pipeline.pipeline_id, pipeline.pipeline_signature_hash, 1};
@@ -570,7 +576,7 @@ TEST_CASE("Query request downstream suffix epoch preparation tolerates concurren
 }
 
 TEST_CASE("Query request continuation resolver uses hierarchical fallbacks", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 
 	auto pipeline = PipelineProfile(1000);
@@ -623,7 +629,7 @@ TEST_CASE("Query request continuation resolver uses hierarchical fallbacks", "[a
 }
 
 TEST_CASE("Query request continuation uses task completion without an independent finish event", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 
 	auto pipeline = PipelineProfile(1000);
@@ -670,7 +676,7 @@ TEST_CASE("Query request continuation uses task completion without an independen
 }
 
 TEST_CASE("Query request continuation fallbacks reject incompatible native units", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 
 	auto rows_pipeline = PipelineProfile(1000);
@@ -703,8 +709,80 @@ TEST_CASE("Query request continuation fallbacks reject incompatible native units
 	store.Clear();
 }
 
+TEST_CASE("Query request throughput resolver uses compatible hierarchical fallbacks", "[api]") {
+	QueryRequestProfileStore store;
+	store.Clear();
+
+	auto first = PipelineProfile(1000);
+	auto second = PipelineProfile(3000);
+	second.worker_task_duration_ns = 8000;
+	duckdb::vector<PipelineProfilingInfo> first_observation {first};
+	duckdb::vector<PipelineProfilingInfo> second_observation {second};
+	store.RecordQueryCompletion(Metadata(1, 101, 10, 500, 100000), 5000, first_observation);
+	store.RecordQueryCompletion(Metadata(2, 101, 10, 2500, 100000), 7000, second_observation);
+
+	auto identity = PipelineIdentity(first);
+	auto exact = store.ResolvePipelineThroughput(101, 10, identity);
+	REQUIRE(exact.valid);
+	REQUIRE(exact.level == PipelineThroughputEstimateLevel::EXACT);
+	REQUIRE(exact.sample_count == 2);
+	REQUIRE(exact.mean_work_units_per_s == 1500000.0);
+	REQUIRE(exact.ewma_work_units_per_s == 1300000.0);
+
+	auto source_sink = store.ResolvePipelineThroughput(202, 30, identity);
+	REQUIRE(source_sink.valid);
+	REQUIRE(source_sink.level == PipelineThroughputEstimateLevel::SOURCE_SINK);
+	REQUIRE(source_sink.sample_count == 2);
+	REQUIRE(source_sink.ewma_work_units_per_s == exact.ewma_work_units_per_s);
+
+	auto different_sink = identity;
+	different_sink.sink_type = PhysicalOperatorType::ORDER_BY;
+	auto source = store.ResolvePipelineThroughput(202, 30, different_sink);
+	REQUIRE(source.valid);
+	REQUIRE(source.level == PipelineThroughputEstimateLevel::SOURCE);
+	REQUIRE(source.ewma_work_units_per_s == exact.ewma_work_units_per_s);
+
+	auto different_source = different_sink;
+	different_source.source_work_class.source_type = PhysicalOperatorType::FILTER;
+	auto global = store.ResolvePipelineThroughput(202, 30, different_source);
+	REQUIRE(global.valid);
+	REQUIRE(global.level == PipelineThroughputEstimateLevel::GLOBAL_COMPATIBLE);
+	REQUIRE(global.ewma_work_units_per_s == exact.ewma_work_units_per_s);
+
+	auto incompatible_unit = different_source;
+	incompatible_unit.planned_input_native_unit = "partition";
+	auto incompatible = store.ResolvePipelineThroughput(202, 30, incompatible_unit);
+	REQUIRE_FALSE(incompatible.valid);
+	REQUIRE(incompatible.level == PipelineThroughputEstimateLevel::NONE);
+
+	auto snapshots = store.GetThroughputProfilesSnapshot();
+	REQUIRE(snapshots.size() == 3);
+	for (const auto &snapshot : snapshots) {
+		REQUIRE(snapshot.sample_count == 2);
+		REQUIRE(snapshot.native_unit == "row");
+		REQUIRE(snapshot.ewma_work_units_per_s == 1300000.0);
+	}
+
+	auto exact_tail = store.ResolvePipelineLifecycleTail(101, 10, identity);
+	REQUIRE(exact_tail.valid);
+	REQUIRE(exact_tail.level == PipelineLifecycleTailEstimateLevel::EXACT);
+	REQUIRE(exact_tail.sample_count == 2);
+	REQUIRE(exact_tail.mean_ns == 200.0);
+	REQUIRE(exact_tail.p90_ns == 200.0);
+	auto global_tail = store.ResolvePipelineLifecycleTail(202, 30, identity);
+	REQUIRE(global_tail.valid);
+	REQUIRE(global_tail.level == PipelineLifecycleTailEstimateLevel::GLOBAL);
+	REQUIRE(global_tail.sample_count == 2);
+	REQUIRE(global_tail.p90_ns == 200.0);
+
+	store.Clear();
+	REQUIRE(store.GetThroughputProfilesSnapshot().empty());
+	REQUIRE_FALSE(store.ResolvePipelineThroughput(101, 10, identity).valid);
+	REQUIRE_FALSE(store.ResolvePipelineLifecycleTail(101, 10, identity).valid);
+}
+
 TEST_CASE("Query request profile store separates repeated local pipeline signatures by pipeline id", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	QueryRequestProfileStore store;
 	store.Clear();
 
 	auto first_pipeline = PipelineProfile(2000);
@@ -735,10 +813,9 @@ TEST_CASE("Query request profile store separates repeated local pipeline signatu
 }
 
 TEST_CASE("Query request profile store is disabled by default for metadata comments", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
-	store.Clear();
-
 	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE metadata_disabled_t AS SELECT i FROM range(1000) tbl(i)"));
 
@@ -753,11 +830,37 @@ TEST_CASE("Query request profile store is disabled by default for metadata comme
 	REQUIRE(CHECK_COLUMN(pipeline_profiles, 0, {0}));
 }
 
-TEST_CASE("Query request profile store records repeated metadata queries", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
-	store.Clear();
+TEST_CASE("Query request profile stores are isolated by database instance", "[api]") {
+	DuckDB first_db(nullptr);
+	DuckDB second_db(nullptr);
+	auto &first_store = first_db.instance->GetQueryRequestProfileStore();
+	auto &second_store = second_db.instance->GetQueryRequestProfileStore();
 
+	auto pipeline = PipelineProfile(2000);
+	duckdb::vector<PipelineProfilingInfo> pipelines;
+	pipelines.push_back(pipeline);
+	first_store.RecordQueryCompletion(Metadata(1, 101, 10, 1000, 9000), 11000, pipelines);
+
+	REQUIRE(first_store.QueryProfileCount() == 1);
+	REQUIRE(first_store.PipelineProfileCount() == 1);
+	REQUIRE(second_store.QueryProfileCount() == 0);
+	REQUIRE(second_store.PipelineProfileCount() == 0);
+
+	Connection first_connection(first_db);
+	Connection second_connection(second_db);
+	auto first_count = first_connection.Query("SELECT count(*) FROM duckdb_debug_query_request_profiles()");
+	auto second_count = second_connection.Query("SELECT count(*) FROM duckdb_debug_query_request_profiles()");
+	REQUIRE(CHECK_COLUMN(first_count, 0, {1}));
+	REQUIRE(CHECK_COLUMN(second_count, 0, {0}));
+
+	second_store.Clear();
+	REQUIRE(first_store.QueryProfileCount() == 1);
+}
+
+TEST_CASE("Query request profile store records repeated metadata queries", "[api]") {
 	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE metadata_profile_t AS SELECT i, i % 7 AS g FROM range(10000) tbl(i)"));
 
@@ -823,11 +926,10 @@ TEST_CASE("Query request profile store records repeated metadata queries", "[api
 }
 
 TEST_CASE("Query continuation profiles train in activation scheduler mode", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
 	store.Clear();
 	QueryPipelineDebug::ClearDebugSnapshot();
-
-	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
 	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
@@ -853,16 +955,309 @@ TEST_CASE("Query continuation profiles train in activation scheduler mode", "[ap
 	    "WHERE profile_level IN ('source_sink', 'source', 'global_raw')");
 	REQUIRE(!cohorts->HasError());
 	REQUIRE(cohorts->GetValue(0, 0).GetValue<int64_t>() > 0);
+	auto historical_throughput = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_pipeline_events() "
+	    "WHERE request_id=9002 AND event_kind='pipeline' AND selected_throughput_valid "
+	    "AND historical_throughput_level='exact' AND historical_throughput_sample_count > 0");
+	REQUIRE(!historical_throughput->HasError());
+	REQUIRE(historical_throughput->GetValue(0, 0).GetValue<int64_t>() > 0);
+	auto throughput_cohorts = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_request_throughput_profiles() "
+	    "WHERE profile_level IN ('source_sink', 'source', 'global_compatible')");
+	REQUIRE(!throughput_cohorts->HasError());
+	REQUIRE(throughput_cohorts->GetValue(0, 0).GetValue<int64_t>() > 0);
 
 	store.Clear();
 	QueryPipelineDebug::ClearDebugSnapshot();
 }
 
-TEST_CASE("Query request profile store records concurrent metadata queries", "[api]") {
-	auto &store = QueryRequestProfileStore::Get();
-	store.Clear();
-
+TEST_CASE("SLA scheduler preserves worker-only database invariants", "[api]") {
 	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=1"));
+	REQUIRE_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_FAIL(con.Query("SET external_threads=1"));
+	REQUIRE_FAIL(con.Query("SET query_worker_only_execution_enable=false"));
+	REQUIRE_FAIL(con.Query("RESET query_worker_only_execution_enable"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=false"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=false"));
+}
+
+TEST_CASE("SLA scheduler rejects an untrained tagged data pipeline", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sla_untrained_t AS SELECT i FROM range(100000) tbl(i)"));
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_FAIL(con.Query(MetadataQuery(9101, 91, 10, "SELECT sum(i) FROM sla_untrained_t")));
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("SLA scheduler executes a trained tagged query without debug mode", "[api]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_debug_enable=false"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sla_trained_t AS "
+	                          "SELECT i, i % 101 AS g FROM range(1000000) tbl(i)"));
+
+	const string body = "SELECT g, count(*), sum(i) FROM sla_trained_t GROUP BY g ORDER BY g";
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE_NO_FAIL(con.Query(MetadataQuery(9200 + i, 92, 10, body)));
+	}
+	REQUIRE(store.PipelineProfileCount() > 0);
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=10"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	auto &scheduler = db.instance->GetQuerySLAScheduler();
+	scheduler.ClearEpochTrace();
+	auto epochs_before = scheduler.EpochRunCount();
+	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9210, 92, 10, body)));
+	REQUIRE(scheduler.EpochRunCount() > epochs_before);
+	REQUIRE(scheduler.GetSnapshot().empty());
+	REQUIRE(scheduler.GetEpochTrace().empty());
+	auto debug_rows = con.Query("SELECT count(*) FROM duckdb_debug_query_sla_scheduler()");
+	REQUIRE(!debug_rows->HasError());
+	REQUIRE(debug_rows->GetValue(0, 0).GetValue<int64_t>() == 0);
+}
+
+TEST_CASE("SLA scheduler records bounded epoch predictions only for debug queries", "[api]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sla_trace_t AS "
+	                          "SELECT i, i % 1009 AS g FROM range(2000000) tbl(i)"));
+
+	const string body = "SELECT g, count(*), sum(i) FROM sla_trace_t GROUP BY g ORDER BY g";
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE_NO_FAIL(con.Query(MetadataQuery(9250 + i, 95, 10, body)));
+	}
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=5"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	auto &scheduler = db.instance->GetQuerySLAScheduler();
+	scheduler.ClearEpochTrace();
+	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9260, 95, 10, body)));
+
+	auto trace = scheduler.GetEpochTrace();
+	REQUIRE(!trace.empty());
+	REQUIRE(scheduler.EpochTraceDroppedCount() == 0);
+	bool saw_valid_pipeline = false;
+	for (const auto &row : trace) {
+		REQUIRE(row.epoch_wall_ns > 0);
+#ifdef __linux__
+		REQUIRE(row.epoch_thread_cpu_ns > 0);
+		REQUIRE(row.epoch_thread_cpu_ns <= row.epoch_wall_ns);
+#else
+		REQUIRE(row.epoch_thread_cpu_ns == 0);
+#endif
+		REQUIRE(row.capture_lock_wait_ns <= row.epoch_wall_ns);
+		REQUIRE(row.capture_lock_hold_ns <= row.epoch_wall_ns);
+		REQUIRE(row.work_snapshot_ns <= row.epoch_wall_ns);
+		REQUIRE(row.suffix_prepare_ns <= row.epoch_wall_ns);
+		REQUIRE(row.model_build_ns <= row.epoch_wall_ns);
+		REQUIRE(row.allocation_ns <= row.epoch_wall_ns);
+		REQUIRE(row.publish_lock_wait_ns <= row.epoch_wall_ns);
+		REQUIRE(row.publish_lock_hold_ns <= row.epoch_wall_ns);
+		REQUIRE(row.trace_build_ns > 0);
+		REQUIRE(row.trace_lock_hold_ns > 0);
+		REQUIRE(row.planned_workers <= row.demand_cap);
+		if (row.event_kind != "pipeline" || !row.model_valid || row.remaining_work_units == 0) {
+			continue;
+		}
+		saw_valid_pipeline = true;
+		REQUIRE(row.pipeline_signature_hash != 0);
+		REQUIRE(row.selected_throughput > 0);
+		REQUIRE(row.historical_throughput_sample_count >= 4);
+		REQUIRE(row.continuation_sample_count >= 4);
+		REQUIRE(row.suffix_bucket_count > 0);
+		REQUIRE(row.suffix_exact_sample_count >= 4);
+		REQUIRE(row.predicted_pipeline_finish_ns > row.epoch_timestamp_ns);
+		REQUIRE(row.predicted_query_finish_mean_ns >= row.predicted_pipeline_finish_ns);
+		REQUIRE(row.predicted_query_finish_p90_ns >= row.predicted_pipeline_finish_ns);
+		REQUIRE(row.predicted_sla_cost >= 0);
+	}
+	REQUIRE(saw_valid_pipeline);
+	auto exported = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_sla_scheduler_epochs() "
+	    "WHERE request_id=9260 AND event_kind='pipeline' AND model_valid AND predicted_pipeline_finish_ns>0 "
+	    "AND epoch_wall_ns>0 "
+	    "AND capture_lock_wait_ns<=epoch_wall_ns AND publish_lock_wait_ns<=epoch_wall_ns "
+	    "AND trace_build_ns>0 AND trace_lock_hold_ns>0");
+	REQUIRE(!exported->HasError());
+	REQUIRE(exported->GetValue(0, 0).GetValue<int64_t>() > 0);
+}
+
+TEST_CASE("SLA scheduler remains work-conserving when modeled SLA gains are zero", "[api]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sla_zero_gain_t AS "
+	                          "SELECT i, i % 1009 AS g FROM range(2000000) tbl(i)"));
+
+	const string body = "SELECT g, count(*), sum(i) FROM sla_zero_gain_t GROUP BY g ORDER BY g";
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE_NO_FAIL(con.Query(MetadataQuery(9270 + i, 96, 10, body)));
+	}
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=5"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	auto &scheduler = db.instance->GetQuerySLAScheduler();
+	scheduler.ClearEpochTrace();
+	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9280, 96, 10, 0.0, body)));
+
+	auto trace = scheduler.GetEpochTrace();
+	bool saw_work_conserving_pipeline = false;
+	for (const auto &row : trace) {
+		REQUIRE(row.planned_workers <= row.demand_cap);
+		if (row.request_id == 9280 && row.event_kind == "pipeline" && row.model_valid &&
+		    row.remaining_work_units > 0 && row.demand_cap > 0 && row.planned_workers > 0) {
+			saw_work_conserving_pipeline = true;
+		}
+	}
+	REQUIRE(saw_work_conserving_pipeline);
+	REQUIRE(scheduler.GetSnapshot().empty());
+}
+
+TEST_CASE("SLA scheduler coordinates concurrent trained queries within demand caps", "[api]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(setup.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE sla_concurrent_t AS "
+	                            "SELECT i, i % 1009 AS g FROM range(3000000) tbl(i)"));
+	const string body = "SELECT g, count(*), sum(i) FROM sla_concurrent_t GROUP BY g ORDER BY g";
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE_NO_FAIL(setup.Query(MetadataQuery(9300 + i, 93, 10, body)));
+		REQUIRE_NO_FAIL(setup.Query(MetadataQuery(9400 + i, 94, 10, body)));
+	}
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_scheduler_epoch_ms=5"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_scheduler_enable=true"));
+
+	Connection first(db);
+	Connection second(db);
+	REQUIRE_NO_FAIL(first.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(second.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(first.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(second.Query("SET query_activation_debug_enable=true"));
+	atomic<bool> first_done(false);
+	atomic<bool> second_done(false);
+	string first_error;
+	string second_error;
+	thread first_thread([&]() {
+		auto result = first.Query(MetadataQuery(9310, 93, 10, body));
+		if (result->HasError()) {
+			first_error = result->GetError();
+		}
+		first_done = true;
+	});
+	thread second_thread([&]() {
+		auto result = second.Query(MetadataQuery(9410, 94, 10, body));
+		if (result->HasError()) {
+			second_error = result->GetError();
+		}
+		second_done = true;
+	});
+	atomic<idx_t> trace_reads(0);
+	thread trace_reader([&]() {
+		while (!first_done.load() || !second_done.load()) {
+			auto trace = db.instance->GetQuerySLAScheduler().GetEpochTrace();
+			(void)db.instance->GetQuerySLAScheduler().EpochTraceDroppedCount();
+			if ((trace_reads.fetch_add(1) % 8) == 7) {
+				db.instance->GetQuerySLAScheduler().ClearEpochTrace();
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	});
+
+	bool saw_two_queries = false;
+	bool saw_valid_data_models = false;
+	bool per_query_bounds_valid = true;
+	bool global_budget_valid = true;
+	string first_bound_violation;
+	while (!first_done.load() || !second_done.load()) {
+		auto snapshots = db.instance->GetQuerySLAScheduler().GetSnapshot();
+		if (snapshots.size() >= 2) {
+			saw_two_queries = true;
+		}
+		idx_t total_assigned = 0;
+		idx_t valid_data_models = 0;
+		for (const auto &snapshot : snapshots) {
+			total_assigned += snapshot.assigned_workers;
+			if (snapshot.assigned_workers > snapshot.demand_cap) {
+				per_query_bounds_valid = false;
+				if (first_bound_violation.empty()) {
+					first_bound_violation = StringUtil::Format(
+					    "query=%llu event=%s generation=%llu assigned=%llu demand=%llu",
+					    static_cast<unsigned long long>(snapshot.db_query_id), snapshot.event_kind,
+					    static_cast<unsigned long long>(snapshot.pipeline_generation),
+					    static_cast<unsigned long long>(snapshot.assigned_workers),
+					    static_cast<unsigned long long>(snapshot.demand_cap));
+				}
+			}
+			if (snapshot.event_kind == "pipeline" && snapshot.model_valid && snapshot.remaining_work_units > 0 &&
+			    snapshot.selected_throughput > 0) {
+				valid_data_models++;
+			}
+		}
+		if (valid_data_models >= 2) {
+			saw_valid_data_models = true;
+		}
+		if (total_assigned > 4) {
+			global_budget_valid = false;
+			if (first_bound_violation.empty()) {
+				first_bound_violation =
+				    StringUtil::Format("total_assigned=%llu", static_cast<unsigned long long>(total_assigned));
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	first_thread.join();
+	second_thread.join();
+	trace_reader.join();
+
+	REQUIRE(first_error.empty());
+	REQUIRE(second_error.empty());
+	REQUIRE(trace_reads.load() > 0);
+	REQUIRE(saw_two_queries);
+	REQUIRE(saw_valid_data_models);
+	INFO(first_bound_violation);
+	REQUIRE(per_query_bounds_valid);
+	REQUIRE(global_budget_valid);
+	REQUIRE(db.instance->GetQuerySLAScheduler().GetSnapshot().empty());
+}
+
+TEST_CASE("Query request profile store records concurrent metadata queries", "[api]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
 	Connection setup(db);
 	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE concurrent_metadata_profile_t AS "
 	                            "SELECT i, i % 5 AS g FROM range(20000) tbl(i)"));

@@ -66,6 +66,11 @@ public:
 	idx_t GetFinishedTasks() const {
 		return finished_tasks.load();
 	}
+	idx_t GetBlockedTasks() const {
+		return blocked_tasks.load();
+	}
+	void MarkTaskBlocked();
+	void MarkTaskUnblocked();
 
 	void SetQueryActivationInfo(idx_t group_id, QueryActivationEventKind kind, idx_t pipeline_id = 0);
 	bool HasQueryActivationInfo() const {
@@ -117,6 +122,8 @@ protected:
 	atomic<idx_t> finished_tasks;
 	//! The maximum amount of threads that can work on the event
 	atomic<idx_t> total_tasks;
+	//! Tasks currently blocked on asynchronous work and therefore unable to use a worker.
+	atomic<idx_t> blocked_tasks;
 
 	//! The amount of completed dependencies
 	//! The event can only be started after the dependencies have finished executing

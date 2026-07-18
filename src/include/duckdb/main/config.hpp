@@ -111,6 +111,10 @@ struct DBConfigOptions {
 	idx_t maximum_threads = DConstants::INVALID_INDEX;
 	//! Enable materialized query execution where client threads wait instead of executing tasks.
 	bool query_worker_only_execution_enabled = false;
+	//! Enable the database-scoped SLA worker-allocation scheduler for tagged analytical queries.
+	bool query_sla_scheduler_enabled = false;
+	//! SLA scheduler epoch length in milliseconds.
+	idx_t query_sla_scheduler_epoch_ms = 200;
 	//! Whether or not to create and use a temporary directory to store intermediates that do not fit in memory
 	bool use_temporary_directory = true;
 	//! Directory to store temporary structures that do not fit in memory

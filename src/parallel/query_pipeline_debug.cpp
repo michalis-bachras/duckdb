@@ -137,6 +137,20 @@ static void PopulateWorkInfo(QueryPipelineDebugEventSnapshot &snapshot, const Pi
 	snapshot.throughput_worker_time_ns = work.throughput_worker_time_ns;
 	snapshot.single_worker_chunks_per_s = work.single_worker_chunks_per_s;
 	snapshot.throughput_valid = work.throughput_valid;
+	snapshot.selected_throughput_valid = work.selected_throughput_valid;
+	snapshot.selected_throughput_is_live = work.selected_throughput_is_live;
+	snapshot.selected_single_worker_chunks_per_s = work.selected_single_worker_chunks_per_s;
+	snapshot.historical_throughput_level =
+	    PipelineThroughputEstimateLevelToString(work.historical_throughput_estimate.level);
+	snapshot.historical_throughput_sample_count = work.historical_throughput_estimate.sample_count;
+	snapshot.historical_throughput_mean = work.historical_throughput_estimate.mean_work_units_per_s;
+	snapshot.historical_throughput_ewma = work.historical_throughput_estimate.ewma_work_units_per_s;
+	snapshot.lifecycle_tail_valid = work.lifecycle_tail_estimate.valid;
+	snapshot.lifecycle_tail_level = PipelineLifecycleTailEstimateLevelToString(work.lifecycle_tail_estimate.level);
+	snapshot.lifecycle_tail_sample_count = work.lifecycle_tail_estimate.sample_count;
+	snapshot.lifecycle_tail_mean_ns = work.lifecycle_tail_estimate.mean_ns;
+	snapshot.lifecycle_tail_p50_ns = work.lifecycle_tail_estimate.p50_ns;
+	snapshot.lifecycle_tail_p90_ns = work.lifecycle_tail_estimate.p90_ns;
 	snapshot.continuation_valid = work.continuation_estimate.valid;
 	snapshot.continuation_level = ContinuationEstimateLevelToString(work.continuation_estimate.level);
 	snapshot.continuation_kind = ContinuationEstimateKindToString(work.continuation_estimate.kind);

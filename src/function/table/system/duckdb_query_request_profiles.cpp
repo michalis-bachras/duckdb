@@ -11,6 +11,7 @@
 #include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/query_activation_scheduler.hpp"
 #include "duckdb/parallel/query_pipeline_debug.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 
 namespace duckdb {
 
@@ -39,6 +40,11 @@ struct DuckDBQueryRequestContinuationProfilesData : public GlobalTableFunctionSt
 	idx_t offset = 0;
 };
 
+struct DuckDBQueryRequestThroughputProfilesData : public GlobalTableFunctionState {
+	vector<QueryRequestThroughputProfileSnapshot> profiles;
+	idx_t offset = 0;
+};
+
 struct DuckDBQueryRequestDownstreamSuffixProfilesData : public GlobalTableFunctionState {
 	vector<QueryRequestDownstreamSuffixProfileSnapshot> profiles;
 	idx_t profile_offset = 0;
@@ -62,6 +68,17 @@ struct DuckDBQueryActivationEventsData : public GlobalTableFunctionState {
 
 struct DuckDBQueryPipelineEventsData : public GlobalTableFunctionState {
 	vector<QueryPipelineDebugEventSnapshot> snapshots;
+	idx_t offset = 0;
+};
+
+struct DuckDBQuerySLASchedulerData : public GlobalTableFunctionState {
+	vector<QuerySLASchedulerSnapshot> snapshots;
+	idx_t offset = 0;
+};
+
+struct DuckDBQuerySLASchedulerEpochsData : public GlobalTableFunctionState {
+	vector<QuerySLASchedulerEpochSnapshot> snapshots;
+	uint64_t dropped_count = 0;
 	idx_t offset = 0;
 };
 
@@ -94,7 +111,7 @@ static unique_ptr<FunctionData> DuckDBQueryRequestProfilesBind(ClientContext &co
 static unique_ptr<GlobalTableFunctionState> DuckDBQueryRequestProfilesInit(ClientContext &context,
                                                                            TableFunctionInitInput &input) {
 	auto result = make_uniq<DuckDBQueryRequestProfilesData>();
-	result->profiles = QueryRequestProfileStore::Get().GetQueryProfilesSnapshot();
+	result->profiles = DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetQueryProfilesSnapshot();
 	return std::move(result);
 }
 
@@ -156,6 +173,10 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineProfilesBind(ClientCon
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("mean_lifecycle_runtime_ns");
 	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("mean_finish_tail_ns");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("p90_finish_tail_ns");
+	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("mean_downstream_suffix_ns");
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("downstream_suffix_sample_count");
@@ -188,7 +209,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineProfilesBind(ClientCon
 static unique_ptr<GlobalTableFunctionState> DuckDBQueryRequestPipelineProfilesInit(ClientContext &context,
                                                                                    TableFunctionInitInput &input) {
 	auto result = make_uniq<DuckDBQueryRequestPipelineProfilesData>();
-	result->profiles = QueryRequestProfileStore::Get().GetPipelineProfilesSnapshot();
+	result->profiles =
+	    DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetPipelineProfilesSnapshot();
 	return std::move(result);
 }
 
@@ -216,6 +238,8 @@ static void DuckDBQueryRequestPipelineProfilesFunction(ClientContext &context, T
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_task_runtime_ns));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.p90_task_runtime_ns));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_lifecycle_runtime_ns));
+		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_finish_tail_ns));
+		output.SetValue(col++, count, Value::DOUBLE(estimate.p90_finish_tail_ns));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_downstream_suffix_ns));
 		output.SetValue(col++, count, Value::UBIGINT(estimate.downstream_suffix_sample_count));
 		output.SetValue(col++, count, Value::DOUBLE(estimate.mean_task_count));
@@ -269,7 +293,7 @@ static unique_ptr<FunctionData> DuckDBQueryRequestSamplesBind(ClientContext &con
 static unique_ptr<GlobalTableFunctionState> DuckDBQueryRequestSamplesInit(ClientContext &context,
                                                                           TableFunctionInitInput &input) {
 	auto result = make_uniq<DuckDBQueryRequestSamplesData>();
-	result->samples = QueryRequestProfileStore::Get().GetQuerySamplesSnapshot();
+	result->samples = DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetQuerySamplesSnapshot();
 	return std::move(result);
 }
 
@@ -359,6 +383,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineInstancesBind(ClientCo
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("lifecycle_runtime_ns");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("finish_tail_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("downstream_suffix_ns");
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("pipeline_completion_ordinal");
@@ -379,7 +405,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineInstancesBind(ClientCo
 static unique_ptr<GlobalTableFunctionState> DuckDBQueryRequestPipelineInstancesInit(ClientContext &context,
                                                                                     TableFunctionInitInput &input) {
 	auto result = make_uniq<DuckDBQueryRequestPipelineInstancesData>();
-	result->instances = QueryRequestProfileStore::Get().GetPipelineInstancesSnapshot();
+	result->instances =
+	    DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetPipelineInstancesSnapshot();
 	return std::move(result);
 }
 
@@ -419,6 +446,7 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 		output.SetValue(col++, count, Value::UBIGINT(instance.finish_done_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.task_runtime_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.lifecycle_runtime_ns));
+		output.SetValue(col++, count, Value::UBIGINT(instance.finish_tail_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.downstream_suffix_ns));
 		output.SetValue(col++, count, Value::UBIGINT(instance.pipeline_completion_ordinal));
 		output.SetValue(col++, count, Value::UBIGINT(instance.total_pipeline_count));
@@ -459,7 +487,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestContinuationProfilesBind(Clien
 static unique_ptr<GlobalTableFunctionState>
 DuckDBQueryRequestContinuationProfilesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_uniq<DuckDBQueryRequestContinuationProfilesData>();
-	result->profiles = QueryRequestProfileStore::Get().GetContinuationProfilesSnapshot();
+	result->profiles =
+	    DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetContinuationProfilesSnapshot();
 	return std::move(result);
 }
 
@@ -479,6 +508,57 @@ static void DuckDBQueryRequestContinuationProfilesFunction(ClientContext &contex
 		output.SetValue(col++, count, Value::DOUBLE(profile.p50));
 		output.SetValue(col++, count, Value::DOUBLE(profile.p90));
 		output.SetValue(col++, count, Value::UBIGINT(profile.native_unit_mismatch_count));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryRequestThroughputProfilesBind(ClientContext &context,
+	                                                                      TableFunctionBindInput &input,
+	                                                                      vector<LogicalType> &return_types,
+	                                                                      vector<string> &names) {
+	names.emplace_back("profile_level");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("source_work_class");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sink_type");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("work_kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("native_unit");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("mean_work_units_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("ewma_work_units_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState>
+DuckDBQueryRequestThroughputProfilesInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryRequestThroughputProfilesData>();
+	result->profiles =
+	    DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetThroughputProfilesSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryRequestThroughputProfilesFunction(ClientContext &context, TableFunctionInput &data_p,
+	                                                       DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryRequestThroughputProfilesData>();
+	idx_t count = 0;
+	while (data.offset < data.profiles.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &profile = data.profiles[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value(PipelineThroughputEstimateLevelToString(profile.level)));
+		output.SetValue(col++, count, Value(SourceWorkClassToString(profile.source_work_class)));
+		output.SetValue(col++, count, Value(PhysicalOperatorToString(profile.sink_type)));
+		output.SetValue(col++, count, Value(SourceThroughputKindToString(profile.work_kind)));
+		output.SetValue(col++, count, Value(profile.native_unit));
+		output.SetValue(col++, count, Value::UBIGINT(profile.sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(profile.mean_work_units_per_s));
+		output.SetValue(col++, count, Value::DOUBLE(profile.ewma_work_units_per_s));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -531,7 +611,8 @@ static unique_ptr<FunctionData> DuckDBQueryRequestDownstreamSuffixProfilesBind(
 static unique_ptr<GlobalTableFunctionState>
 DuckDBQueryRequestDownstreamSuffixProfilesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_uniq<DuckDBQueryRequestDownstreamSuffixProfilesData>();
-	result->profiles = QueryRequestProfileStore::Get().GetDownstreamSuffixProfilesSnapshot();
+	result->profiles =
+	    DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetDownstreamSuffixProfilesSnapshot();
 	return std::move(result);
 }
 
@@ -743,6 +824,225 @@ static void DuckDBQueryActivationEventsFunction(ClientContext &context, TableFun
 	output.SetCardinality(count);
 }
 
+static unique_ptr<FunctionData> DuckDBQuerySLASchedulerBind(ClientContext &context, TableFunctionBindInput &input,
+	                                                        vector<LogicalType> &return_types,
+	                                                        vector<string> &names) {
+	names.emplace_back("epoch_generation");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("db_query_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("request_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_id");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("pipeline_generation");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("event_kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("model_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("model_error");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("demand_cap");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("remaining_work_units");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("selected_throughput");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("throughput_is_live");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("mandatory_workers");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("optional_workers");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("assigned_workers");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("next_mandatory_gain");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("next_optional_gain");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQuerySLASchedulerInit(ClientContext &context,
+	                                                                    TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQuerySLASchedulerData>();
+	result->snapshots = DatabaseInstance::GetDatabase(context).GetQuerySLAScheduler().GetSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQuerySLASchedulerFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQuerySLASchedulerData>();
+	idx_t count = 0;
+	while (data.offset < data.snapshots.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &snapshot = data.snapshots[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.epoch_generation));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.db_query_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.request_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.pipeline_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.pipeline_generation));
+		output.SetValue(col++, count, Value(snapshot.event_kind));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.model_valid));
+		output.SetValue(col++, count, Value(snapshot.model_error));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.demand_cap));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.remaining_work_units));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.selected_throughput));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.throughput_is_live));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.mandatory_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.optional_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.assigned_workers));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.next_mandatory_gain));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.next_optional_gain));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext &context,
+	                                                              TableFunctionBindInput &input,
+	                                                              vector<LogicalType> &return_types,
+	                                                              vector<string> &names) {
+#define SLA_EPOCH_COLUMN(name, type) \
+	names.emplace_back(name);              \
+	return_types.emplace_back(type)
+	SLA_EPOCH_COLUMN("epoch_generation", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("epoch_timestamp_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("epoch_compute_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("epoch_wall_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("epoch_thread_cpu_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("capture_lock_wait_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("capture_lock_hold_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("work_snapshot_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("suffix_prepare_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("model_build_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("allocation_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("publish_lock_wait_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("publish_lock_hold_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("trace_build_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("trace_lock_wait_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("trace_lock_hold_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("db_query_id", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("request_id", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("template_id", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("scale_factor", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("deadline_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("pipeline_id", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("pipeline_signature_hash", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("pipeline_generation", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("event_kind", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("model_valid", LogicalType::BOOLEAN);
+	SLA_EPOCH_COLUMN("model_error", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("demand_cap", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("remaining_work_units", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("selected_throughput", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("throughput_is_live", LogicalType::BOOLEAN);
+	SLA_EPOCH_COLUMN("historical_throughput_level", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("historical_throughput_sample_count", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("continuation_level", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("continuation_kind", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("continuation_sample_count", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("continuation_p90", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("suffix_primary_level", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("suffix_exact_sample_count", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("suffix_scale_sample_count", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("suffix_global_sample_count", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("suffix_exact_weight", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("suffix_scale_weight", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("suffix_global_weight", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("suffix_bucket_count", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("suffix_mean_ns", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("suffix_p90_ns", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("mandatory_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("optional_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("planned_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("assigned_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("predicted_pipeline_finish_ns", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("predicted_query_finish_mean_ns", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("predicted_query_finish_p90_ns", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("predicted_sla_cost", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("trace_dropped_count", LogicalType::UBIGINT);
+#undef SLA_EPOCH_COLUMN
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQuerySLASchedulerEpochsInit(ClientContext &context,
+	                                                                         TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQuerySLASchedulerEpochsData>();
+	auto &scheduler = DatabaseInstance::GetDatabase(context).GetQuerySLAScheduler();
+	result->snapshots = scheduler.GetEpochTrace();
+	result->dropped_count = scheduler.EpochTraceDroppedCount();
+	return std::move(result);
+}
+
+static void DuckDBQuerySLASchedulerEpochsFunction(ClientContext &context, TableFunctionInput &data_p,
+	                                               DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQuerySLASchedulerEpochsData>();
+	idx_t count = 0;
+	while (data.offset < data.snapshots.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &snapshot = data.snapshots[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.epoch_generation));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.epoch_timestamp_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.epoch_compute_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.epoch_wall_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.epoch_thread_cpu_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.capture_lock_wait_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.capture_lock_hold_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.work_snapshot_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_prepare_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.model_build_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.allocation_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.publish_lock_wait_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.publish_lock_hold_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.trace_build_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.trace_lock_wait_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.trace_lock_hold_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.db_query_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.request_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.scale_factor));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.deadline_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.pipeline_id));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.pipeline_signature_hash));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.pipeline_generation));
+		output.SetValue(col++, count, Value(snapshot.event_kind));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.model_valid));
+		output.SetValue(col++, count, Value(snapshot.model_error));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.demand_cap));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.remaining_work_units));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.selected_throughput));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.throughput_is_live));
+		output.SetValue(col++, count, Value(snapshot.historical_throughput_level));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.historical_throughput_sample_count));
+		output.SetValue(col++, count, Value(snapshot.continuation_level));
+		output.SetValue(col++, count, Value(snapshot.continuation_kind));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.continuation_sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.continuation_p90));
+		output.SetValue(col++, count, Value(snapshot.suffix_primary_level));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_exact_sample_count));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_scale_sample_count));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_global_sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.suffix_exact_weight));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.suffix_scale_weight));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.suffix_global_weight));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_bucket_count));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.suffix_mean_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.suffix_p90_ns));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.mandatory_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.optional_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.planned_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.assigned_workers));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_pipeline_finish_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_query_finish_mean_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_query_finish_p90_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_sla_cost));
+		output.SetValue(col++, count, Value::UBIGINT(data.dropped_count));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 static unique_ptr<FunctionData> DuckDBQueryPipelineEventsBind(ClientContext &context, TableFunctionBindInput &input,
                                                               vector<LogicalType> &return_types,
                                                               vector<string> &names) {
@@ -816,6 +1116,32 @@ static unique_ptr<FunctionData> DuckDBQueryPipelineEventsBind(ClientContext &con
 	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("throughput_valid");
 	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("selected_throughput_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("selected_throughput_is_live");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("selected_single_worker_chunks_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("historical_throughput_level");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("historical_throughput_sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("historical_throughput_mean");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("historical_throughput_ewma");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("lifecycle_tail_valid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("lifecycle_tail_level");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("lifecycle_tail_sample_count");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("lifecycle_tail_mean_ns");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("lifecycle_tail_p50_ns");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("lifecycle_tail_p90_ns");
+	return_types.emplace_back(LogicalType::DOUBLE);
 	names.emplace_back("source_work_class");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("continuation_valid");
@@ -889,6 +1215,19 @@ static void DuckDBQueryPipelineEventsFunction(ClientContext &context, TableFunct
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.throughput_worker_time_ns));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.single_worker_chunks_per_s));
 		output.SetValue(col++, count, Value::BOOLEAN(snapshot.throughput_valid));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.selected_throughput_valid));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.selected_throughput_is_live));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.selected_single_worker_chunks_per_s));
+		output.SetValue(col++, count, Value(snapshot.historical_throughput_level));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.historical_throughput_sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.historical_throughput_mean));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.historical_throughput_ewma));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.lifecycle_tail_valid));
+		output.SetValue(col++, count, Value(snapshot.lifecycle_tail_level));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.lifecycle_tail_sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.lifecycle_tail_mean_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.lifecycle_tail_p50_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.lifecycle_tail_p90_ns));
 		output.SetValue(col++, count, Value(snapshot.source_work_class));
 		output.SetValue(col++, count, Value::BOOLEAN(snapshot.continuation_valid));
 		output.SetValue(col++, count, Value(snapshot.continuation_level));
@@ -921,6 +1260,10 @@ void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	                              DuckDBQueryRequestContinuationProfilesFunction,
 	                              DuckDBQueryRequestContinuationProfilesBind,
 	                              DuckDBQueryRequestContinuationProfilesInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_request_throughput_profiles", {},
+	                              DuckDBQueryRequestThroughputProfilesFunction,
+	                              DuckDBQueryRequestThroughputProfilesBind,
+	                              DuckDBQueryRequestThroughputProfilesInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_request_downstream_suffix_profiles", {},
 	                              DuckDBQueryRequestDownstreamSuffixProfilesFunction,
 	                              DuckDBQueryRequestDownstreamSuffixProfilesBind,
@@ -931,6 +1274,11 @@ void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	                              DuckDBQueryAdmissionEventsBind, DuckDBQueryAdmissionEventsInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_activation_events", {}, DuckDBQueryActivationEventsFunction,
 	                              DuckDBQueryActivationEventsBind, DuckDBQueryActivationEventsInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_sla_scheduler", {}, DuckDBQuerySLASchedulerFunction,
+	                              DuckDBQuerySLASchedulerBind, DuckDBQuerySLASchedulerInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_sla_scheduler_epochs", {},
+	                              DuckDBQuerySLASchedulerEpochsFunction, DuckDBQuerySLASchedulerEpochsBind,
+	                              DuckDBQuerySLASchedulerEpochsInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_pipeline_events", {}, DuckDBQueryPipelineEventsFunction,
 	                              DuckDBQueryPipelineEventsBind, DuckDBQueryPipelineEventsInit));
 }

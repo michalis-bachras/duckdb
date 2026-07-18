@@ -19,7 +19,7 @@
 
 namespace duckdb {
 
-namespace {
+namespace query_request_profile_store_internal {
 
 static const idx_t PROFILE_SAMPLE_LIMIT = 100;
 static const idx_t DOWNSTREAM_SUFFIX_MIN_EXACT_SAMPLES = 4;
@@ -386,6 +386,75 @@ struct SourceSinkContinuationKeyHash {
 	}
 };
 
+struct SourceSinkThroughputKey {
+	SourceWorkClass source_work_class;
+	PhysicalOperatorType sink_type = PhysicalOperatorType::INVALID;
+	string native_unit;
+
+	bool operator==(const SourceSinkThroughputKey &other) const {
+		return source_work_class == other.source_work_class && sink_type == other.sink_type &&
+		       native_unit == other.native_unit;
+	}
+};
+
+struct SourceSinkThroughputKeyHash {
+	size_t operator()(const SourceSinkThroughputKey &key) const {
+		size_t result = SourceWorkClassHash {}(key.source_work_class);
+		result ^= std::hash<uint8_t> {}(static_cast<uint8_t>(key.sink_type)) + 0x9e3779b97f4a7c15ULL +
+		          (result << 6) + (result >> 2);
+		result ^= std::hash<string> {}(key.native_unit) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		return result;
+	}
+};
+
+struct SourceThroughputKey {
+	SourceWorkClass source_work_class;
+	string native_unit;
+
+	bool operator==(const SourceThroughputKey &other) const {
+		return source_work_class == other.source_work_class && native_unit == other.native_unit;
+	}
+};
+
+struct SourceThroughputKeyHash {
+	size_t operator()(const SourceThroughputKey &key) const {
+		size_t result = SourceWorkClassHash {}(key.source_work_class);
+		result ^= std::hash<string> {}(key.native_unit) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		return result;
+	}
+};
+
+struct CompatibleThroughputKey {
+	SourceThroughputKind work_kind = SourceThroughputKind::UNKNOWN;
+	string native_unit;
+
+	bool operator==(const CompatibleThroughputKey &other) const {
+		return work_kind == other.work_kind && native_unit == other.native_unit;
+	}
+};
+
+struct CompatibleThroughputKeyHash {
+	size_t operator()(const CompatibleThroughputKey &key) const {
+		size_t result = std::hash<uint8_t> {}(static_cast<uint8_t>(key.work_kind));
+		result ^= std::hash<string> {}(key.native_unit) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		return result;
+	}
+};
+
+struct ThroughputAggregate {
+	BoundedSamples values;
+	double ewma = 0;
+
+	void Add(double value) {
+		if (!std::isfinite(value) || value <= 0) {
+			return;
+		}
+		auto first = values.Count() == 0;
+		values.Add(value);
+		ewma = first ? value : THROUGHPUT_EWMA_ALPHA * value + (1.0 - THROUGHPUT_EWMA_ALPHA) * ewma;
+	}
+};
+
 struct QueryProfileAggregate {
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
@@ -413,23 +482,38 @@ struct PipelineProfileAggregate {
 	BoundedSamples task_count;
 	BoundedSamples task_runtime_ns;
 	ContinuationAggregate lifecycle_runtime_ns;
+	ContinuationAggregate finish_tail_ns;
 	SuffixHistogramAggregate downstream_suffix_ns;
 	BoundedSamples single_worker_chunks_per_s;
 	ContinuationAggregate continuation;
 	double ewma_single_worker_chunks_per_s = 0;
 };
 
-static std::mutex g_profile_store_lock;
-static std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> g_query_profiles;
-static std::unordered_map<PipelineProfileKey, PipelineProfileAggregate, PipelineProfileKeyHash> g_pipeline_profiles;
-static std::unordered_map<uint64_t, SuffixHistogramAggregate> g_scale_downstream_suffix_profiles;
-static SuffixHistogramAggregate g_global_downstream_suffix_profile;
-static std::unordered_map<SourceSinkContinuationKey, ContinuationAggregate, SourceSinkContinuationKeyHash>
-    g_source_sink_continuation_profiles;
-static std::unordered_map<SourceWorkClass, ContinuationAggregate, SourceWorkClassHash> g_source_continuation_profiles;
-static ContinuationAggregate g_global_raw_continuation_profile;
-static vector<QueryRequestSampleSnapshot> g_query_samples;
-static vector<QueryRequestPipelineInstanceSnapshot> g_pipeline_instances;
+} // namespace query_request_profile_store_internal
+
+using namespace query_request_profile_store_internal;
+
+struct QueryRequestProfileStoreState {
+	std::mutex lock;
+	std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> query_profiles;
+	std::unordered_map<PipelineProfileKey, PipelineProfileAggregate, PipelineProfileKeyHash> pipeline_profiles;
+	std::unordered_map<uint64_t, SuffixHistogramAggregate> scale_downstream_suffix_profiles;
+	SuffixHistogramAggregate global_downstream_suffix_profile;
+	std::unordered_map<SourceSinkContinuationKey, ContinuationAggregate, SourceSinkContinuationKeyHash>
+	    source_sink_continuation_profiles;
+	std::unordered_map<SourceWorkClass, ContinuationAggregate, SourceWorkClassHash> source_continuation_profiles;
+	ContinuationAggregate global_raw_continuation_profile;
+	std::unordered_map<SourceSinkThroughputKey, ThroughputAggregate, SourceSinkThroughputKeyHash>
+	    source_sink_throughput_profiles;
+	std::unordered_map<SourceThroughputKey, ThroughputAggregate, SourceThroughputKeyHash> source_throughput_profiles;
+	std::unordered_map<CompatibleThroughputKey, ThroughputAggregate, CompatibleThroughputKeyHash>
+	    global_compatible_throughput_profiles;
+	ContinuationAggregate global_finish_tail_profile;
+	vector<QueryRequestSampleSnapshot> query_samples;
+	vector<QueryRequestPipelineInstanceSnapshot> pipeline_instances;
+};
+
+namespace query_request_profile_store_internal {
 
 static uint64_t DurationNs(uint64_t end_ns, uint64_t start_ns) {
 	if (end_ns <= start_ns) {
@@ -494,6 +578,8 @@ static void PopulatePipelineEstimate(const PipelineProfileAggregate &profile,
 	estimate.mean_task_runtime_ns = profile.task_runtime_ns.Mean();
 	estimate.p90_task_runtime_ns = profile.task_runtime_ns.Percentile(0.9);
 	estimate.mean_lifecycle_runtime_ns = profile.lifecycle_runtime_ns.values.Mean();
+	estimate.mean_finish_tail_ns = profile.finish_tail_ns.values.Mean();
+	estimate.p90_finish_tail_ns = profile.finish_tail_ns.p90.Quantile();
 	estimate.mean_downstream_suffix_ns = profile.downstream_suffix_ns.samples.Mean();
 	estimate.downstream_suffix_sample_count = profile.downstream_suffix_ns.samples.Count();
 	estimate.mean_task_count = profile.task_count.Mean();
@@ -524,6 +610,47 @@ static PipelineContinuationEstimate BuildContinuationEstimate(const Continuation
 	result.p50 = profile.p50.Quantile();
 	result.p90 = profile.p90.Quantile();
 	return result;
+}
+
+static PipelineThroughputEstimate BuildThroughputEstimate(const BoundedSamples &values, double ewma,
+	                                                       PipelineThroughputEstimateLevel level) {
+	PipelineThroughputEstimate result;
+	if (values.Count() == 0 || !std::isfinite(ewma) || ewma <= 0) {
+		return result;
+	}
+	result.valid = true;
+	result.level = level;
+	result.sample_count = values.Count();
+	result.mean_work_units_per_s = values.Mean();
+	result.ewma_work_units_per_s = ewma;
+	return result;
+}
+
+static PipelineThroughputEstimate BuildThroughputEstimate(const ThroughputAggregate &profile,
+	                                                       PipelineThroughputEstimateLevel level) {
+	return BuildThroughputEstimate(profile.values, profile.ewma, level);
+}
+
+static PipelineLifecycleTailEstimate BuildLifecycleTailEstimate(const ContinuationAggregate &profile,
+	                                                             PipelineLifecycleTailEstimateLevel level) {
+	PipelineLifecycleTailEstimate result;
+	if (profile.values.Count() == 0) {
+		return result;
+	}
+	result.valid = true;
+	result.level = level;
+	result.sample_count = profile.values.Count();
+	result.mean_ns = profile.values.Mean();
+	result.p50_ns = profile.p50.Quantile();
+	result.p90_ns = profile.p90.Quantile();
+	return result;
+}
+
+static string ThroughputNativeUnit(const PipelineProfileIdentity &identity) {
+	if (!identity.planned_input_native_unit.empty()) {
+		return identity.planned_input_native_unit;
+	}
+	return SourceThroughputKindToString(identity.source_work_class.work_kind);
 }
 
 struct SuffixHistogramRead {
@@ -668,11 +795,12 @@ struct EpochScaleSuffixProfile {
 	SuffixHistogramRead read;
 };
 
-} // namespace
+} // namespace query_request_profile_store_internal
 
-QueryRequestProfileStore &QueryRequestProfileStore::Get() {
-	static QueryRequestProfileStore store;
-	return store;
+QueryRequestProfileStore::QueryRequestProfileStore() : state(make_uniq<QueryRequestProfileStoreState>()) {
+}
+
+QueryRequestProfileStore::~QueryRequestProfileStore() {
 }
 
 void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata &metadata, uint64_t query_end_ns,
@@ -718,7 +846,7 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		                                    static_cast<double>(observation.remaining_suffix_stages);
 	}
 
-	lock_guard<std::mutex> guard(g_profile_store_lock);
+	lock_guard<std::mutex> guard(state->lock);
 	QueryRequestSampleSnapshot query_sample;
 	query_sample.db_query_id = metadata.db_query_id;
 	query_sample.request_id = metadata.request_id;
@@ -733,12 +861,12 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 	query_sample.lateness_ns = lateness_ns;
 	query_sample.sla_cost = sla_cost;
 	query_sample.deadline_met = lateness_ns == 0;
-	g_query_samples.push_back(std::move(query_sample));
+	state->query_samples.push_back(std::move(query_sample));
 
 	QueryProfileKey query_key;
 	query_key.template_id = metadata.template_id;
 	query_key.scale_factor = metadata.scale_factor;
-	auto &query_profile = g_query_profiles[query_key];
+	auto &query_profile = state->query_profiles[query_key];
 	query_profile.template_id = metadata.template_id;
 	query_profile.scale_factor = metadata.scale_factor;
 	query_profile.runtime_ns.Add(static_cast<double>(runtime_ns));
@@ -755,7 +883,7 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		pipeline_key.scale_factor = metadata.scale_factor;
 		pipeline_key.pipeline_id = profile.pipeline_id;
 		pipeline_key.pipeline_signature_hash = profile.pipeline_signature_hash;
-		auto &pipeline_profile = g_pipeline_profiles[pipeline_key];
+		auto &pipeline_profile = state->pipeline_profiles[pipeline_key];
 		pipeline_profile.template_id = metadata.template_id;
 		pipeline_profile.scale_factor = metadata.scale_factor;
 		pipeline_profile.pipeline_id = profile.pipeline_id;
@@ -806,6 +934,24 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 			              (1.0 - THROUGHPUT_EWMA_ALPHA) * pipeline_profile.ewma_single_worker_chunks_per_s;
 			pipeline_instance.single_worker_chunks_per_s = single_worker_chunks_per_s;
 			pipeline_instance.throughput_valid = true;
+			if (profile.source_work_class.IsValid()) {
+				auto native_unit = profile.planned_input_native_unit.empty()
+				                       ? string(SourceThroughputKindToString(profile.source_work_class.work_kind))
+				                       : profile.planned_input_native_unit;
+				SourceSinkThroughputKey source_sink_key;
+				source_sink_key.source_work_class = profile.source_work_class;
+				source_sink_key.sink_type = profile.sink_operator_type;
+				source_sink_key.native_unit = native_unit;
+				state->source_sink_throughput_profiles[source_sink_key].Add(single_worker_chunks_per_s);
+				SourceThroughputKey source_key;
+				source_key.source_work_class = profile.source_work_class;
+				source_key.native_unit = native_unit;
+				state->source_throughput_profiles[source_key].Add(single_worker_chunks_per_s);
+				CompatibleThroughputKey global_key;
+				global_key.work_kind = profile.source_work_class.work_kind;
+				global_key.native_unit = native_unit;
+				state->global_compatible_throughput_profiles[global_key].Add(single_worker_chunks_per_s);
+			}
 		}
 		pipeline_instance.source_estimated_cardinality = profile.source_estimated_cardinality;
 		pipeline_instance.sink_estimated_cardinality = profile.sink_estimated_cardinality;
@@ -817,11 +963,17 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 			pipeline_profile.task_runtime_ns.Add(static_cast<double>(task_runtime_ns));
 			pipeline_instance.task_runtime_ns = task_runtime_ns;
 		}
+		if (profile.tasks_done_ns > 0 && profile.finish_done_ns >= profile.tasks_done_ns) {
+			auto finish_tail_ns = profile.finish_done_ns - profile.tasks_done_ns;
+			pipeline_profile.finish_tail_ns.Add(static_cast<double>(finish_tail_ns));
+			state->global_finish_tail_profile.Add(static_cast<double>(finish_tail_ns));
+			pipeline_instance.finish_tail_ns = finish_tail_ns;
+		}
 		auto lifecycle_end_ns = PipelineLifecycleEndNs(profile);
 		if (profile.start_ns > 0 && lifecycle_end_ns >= profile.start_ns) {
 			auto lifecycle_runtime_ns = lifecycle_end_ns - profile.start_ns;
 			pipeline_profile.lifecycle_runtime_ns.Add(static_cast<double>(lifecycle_runtime_ns));
-			g_global_raw_continuation_profile.Add(static_cast<double>(lifecycle_runtime_ns));
+			state->global_raw_continuation_profile.Add(static_cast<double>(lifecycle_runtime_ns));
 			pipeline_instance.lifecycle_runtime_ns = lifecycle_runtime_ns;
 			auto effective_ns_per_work_unit =
 			    EffectiveNsPerWorkUnit(lifecycle_runtime_ns, profile.planned_input_chunks_equiv);
@@ -831,9 +983,9 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 					SourceSinkContinuationKey source_sink_key;
 					source_sink_key.source_work_class = profile.source_work_class;
 					source_sink_key.sink_type = profile.sink_operator_type;
-					g_source_sink_continuation_profiles[source_sink_key].Add(
+					state->source_sink_continuation_profiles[source_sink_key].Add(
 					    effective_ns_per_work_unit, profile.planned_input_native_unit);
-					g_source_continuation_profiles[profile.source_work_class].Add(
+					state->source_continuation_profiles[profile.source_work_class].Add(
 					    effective_ns_per_work_unit, profile.planned_input_native_unit);
 				}
 				pipeline_instance.effective_ns_per_work_unit = effective_ns_per_work_unit;
@@ -843,27 +995,27 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		const auto &suffix_observation = suffix_observations[i];
 		if (suffix_observation.valid) {
 			pipeline_profile.downstream_suffix_ns.Add(static_cast<double>(suffix_observation.suffix_ns));
-			g_scale_downstream_suffix_profiles[metadata.scale_factor].Add(
+			state->scale_downstream_suffix_profiles[metadata.scale_factor].Add(
 			    suffix_observation.normalized_suffix_ns);
-			g_global_downstream_suffix_profile.Add(suffix_observation.normalized_suffix_ns);
+			state->global_downstream_suffix_profile.Add(suffix_observation.normalized_suffix_ns);
 			pipeline_instance.downstream_suffix_ns = suffix_observation.suffix_ns;
 			pipeline_instance.pipeline_completion_ordinal = suffix_observation.completion_ordinal;
 			pipeline_instance.total_pipeline_count = suffix_observation.total_pipeline_count;
 			pipeline_instance.remaining_suffix_stages = suffix_observation.remaining_suffix_stages;
 			pipeline_instance.normalized_downstream_suffix_ns = suffix_observation.normalized_suffix_ns;
 		}
-		g_pipeline_instances.push_back(std::move(pipeline_instance));
+		state->pipeline_instances.push_back(std::move(pipeline_instance));
 	}
 }
 
 bool QueryRequestProfileStore::TryGetQueryEstimate(uint64_t template_id, uint64_t scale_factor,
                                                    QueryRequestProfileEstimate &estimate) const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
+	lock_guard<std::mutex> guard(state->lock);
 	QueryProfileKey key;
 	key.template_id = template_id;
 	key.scale_factor = scale_factor;
-	auto entry = g_query_profiles.find(key);
-	if (entry == g_query_profiles.end()) {
+	auto entry = state->query_profiles.find(key);
+	if (entry == state->query_profiles.end()) {
 		return false;
 	}
 	PopulateQueryEstimate(entry->second, estimate);
@@ -873,14 +1025,14 @@ bool QueryRequestProfileStore::TryGetQueryEstimate(uint64_t template_id, uint64_
 bool QueryRequestProfileStore::TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor, idx_t pipeline_id,
                                                       uint64_t pipeline_signature_hash,
                                                       QueryRequestPipelineProfileEstimate &estimate) const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
+	lock_guard<std::mutex> guard(state->lock);
 	PipelineProfileKey key;
 	key.template_id = template_id;
 	key.scale_factor = scale_factor;
 	key.pipeline_id = pipeline_id;
 	key.pipeline_signature_hash = pipeline_signature_hash;
-	auto entry = g_pipeline_profiles.find(key);
-	if (entry == g_pipeline_profiles.end()) {
+	auto entry = state->pipeline_profiles.find(key);
+	if (entry == state->pipeline_profiles.end()) {
 		return false;
 	}
 	PopulatePipelineEstimate(entry->second, estimate);
@@ -890,15 +1042,15 @@ bool QueryRequestProfileStore::TryGetPipelineEstimate(uint64_t template_id, uint
 PipelineContinuationEstimate QueryRequestProfileStore::ResolvePipelineContinuation(
     uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &identity,
     idx_t planned_work_units) const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
+	lock_guard<std::mutex> guard(state->lock);
 	if (identity.valid) {
 		PipelineProfileKey exact_key;
 		exact_key.template_id = template_id;
 		exact_key.scale_factor = scale_factor;
 		exact_key.pipeline_id = identity.pipeline_id;
 		exact_key.pipeline_signature_hash = identity.pipeline_signature_hash;
-		auto exact_entry = g_pipeline_profiles.find(exact_key);
-		if (exact_entry != g_pipeline_profiles.end()) {
+		auto exact_entry = state->pipeline_profiles.find(exact_key);
+		if (exact_entry != state->pipeline_profiles.end()) {
 			if (planned_work_units > 0 && exact_entry->second.continuation.values.Count() > 0) {
 				return BuildContinuationEstimate(exact_entry->second.continuation, ContinuationEstimateLevel::EXACT,
 				                                 ContinuationEstimateKind::NS_PER_WORK_UNIT);
@@ -915,23 +1067,94 @@ PipelineContinuationEstimate QueryRequestProfileStore::ResolvePipelineContinuati
 		SourceSinkContinuationKey source_sink_key;
 		source_sink_key.source_work_class = identity.source_work_class;
 		source_sink_key.sink_type = identity.sink_type;
-		auto source_sink_entry = g_source_sink_continuation_profiles.find(source_sink_key);
-		if (source_sink_entry != g_source_sink_continuation_profiles.end() &&
+		auto source_sink_entry = state->source_sink_continuation_profiles.find(source_sink_key);
+		if (source_sink_entry != state->source_sink_continuation_profiles.end() &&
 		    (identity.planned_input_native_unit.empty() || source_sink_entry->second.native_unit.empty() ||
 		     identity.planned_input_native_unit == source_sink_entry->second.native_unit)) {
 			return BuildContinuationEstimate(source_sink_entry->second, ContinuationEstimateLevel::SOURCE_SINK,
 			                                 ContinuationEstimateKind::NS_PER_WORK_UNIT);
 		}
-		auto source_entry = g_source_continuation_profiles.find(identity.source_work_class);
-		if (source_entry != g_source_continuation_profiles.end() &&
+		auto source_entry = state->source_continuation_profiles.find(identity.source_work_class);
+		if (source_entry != state->source_continuation_profiles.end() &&
 		    (identity.planned_input_native_unit.empty() || source_entry->second.native_unit.empty() ||
 		     identity.planned_input_native_unit == source_entry->second.native_unit)) {
 			return BuildContinuationEstimate(source_entry->second, ContinuationEstimateLevel::SOURCE,
 			                                 ContinuationEstimateKind::NS_PER_WORK_UNIT);
 		}
 	}
-	return BuildContinuationEstimate(g_global_raw_continuation_profile, ContinuationEstimateLevel::GLOBAL_RAW,
+	return BuildContinuationEstimate(state->global_raw_continuation_profile, ContinuationEstimateLevel::GLOBAL_RAW,
 	                                 ContinuationEstimateKind::RAW_LATENCY_NS);
+}
+
+PipelineThroughputEstimate QueryRequestProfileStore::ResolvePipelineThroughput(
+    uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &identity) const {
+	lock_guard<std::mutex> guard(state->lock);
+	if (identity.valid) {
+		PipelineProfileKey exact_key;
+		exact_key.template_id = template_id;
+		exact_key.scale_factor = scale_factor;
+		exact_key.pipeline_id = identity.pipeline_id;
+		exact_key.pipeline_signature_hash = identity.pipeline_signature_hash;
+		auto exact_entry = state->pipeline_profiles.find(exact_key);
+		if (exact_entry != state->pipeline_profiles.end()) {
+			auto exact = BuildThroughputEstimate(exact_entry->second.single_worker_chunks_per_s,
+			                                     exact_entry->second.ewma_single_worker_chunks_per_s,
+			                                     PipelineThroughputEstimateLevel::EXACT);
+			if (exact.valid) {
+				return exact;
+			}
+		}
+	}
+	if (!identity.source_work_class.IsValid()) {
+		return PipelineThroughputEstimate();
+	}
+	auto native_unit = ThroughputNativeUnit(identity);
+	SourceSinkThroughputKey source_sink_key;
+	source_sink_key.source_work_class = identity.source_work_class;
+	source_sink_key.sink_type = identity.sink_type;
+	source_sink_key.native_unit = native_unit;
+	auto source_sink_entry = state->source_sink_throughput_profiles.find(source_sink_key);
+	if (source_sink_entry != state->source_sink_throughput_profiles.end()) {
+		return BuildThroughputEstimate(source_sink_entry->second, PipelineThroughputEstimateLevel::SOURCE_SINK);
+	}
+	SourceThroughputKey source_key;
+	source_key.source_work_class = identity.source_work_class;
+	source_key.native_unit = native_unit;
+	auto source_entry = state->source_throughput_profiles.find(source_key);
+	if (source_entry != state->source_throughput_profiles.end()) {
+		return BuildThroughputEstimate(source_entry->second, PipelineThroughputEstimateLevel::SOURCE);
+	}
+	CompatibleThroughputKey global_key;
+	global_key.work_kind = identity.source_work_class.work_kind;
+	global_key.native_unit = native_unit;
+	auto global_entry = state->global_compatible_throughput_profiles.find(global_key);
+	if (global_entry != state->global_compatible_throughput_profiles.end()) {
+		return BuildThroughputEstimate(global_entry->second,
+		                               PipelineThroughputEstimateLevel::GLOBAL_COMPATIBLE);
+	}
+	return PipelineThroughputEstimate();
+}
+
+PipelineLifecycleTailEstimate QueryRequestProfileStore::ResolvePipelineLifecycleTail(
+    uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &identity) const {
+	lock_guard<std::mutex> guard(state->lock);
+	if (identity.valid) {
+		PipelineProfileKey exact_key;
+		exact_key.template_id = template_id;
+		exact_key.scale_factor = scale_factor;
+		exact_key.pipeline_id = identity.pipeline_id;
+		exact_key.pipeline_signature_hash = identity.pipeline_signature_hash;
+		auto exact_entry = state->pipeline_profiles.find(exact_key);
+		if (exact_entry != state->pipeline_profiles.end()) {
+			auto exact = BuildLifecycleTailEstimate(exact_entry->second.finish_tail_ns,
+			                                        PipelineLifecycleTailEstimateLevel::EXACT);
+			if (exact.valid) {
+				return exact;
+			}
+		}
+	}
+	return BuildLifecycleTailEstimate(state->global_finish_tail_profile,
+	                                  PipelineLifecycleTailEstimateLevel::GLOBAL);
 }
 
 vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuffixEpoch(
@@ -984,20 +1207,20 @@ vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuff
 
 	SuffixHistogramRead global;
 	{
-		lock_guard<std::mutex> guard(g_profile_store_lock);
+		lock_guard<std::mutex> guard(state->lock);
 		for (auto &profile : exact_profiles) {
-			auto entry = g_pipeline_profiles.find(profile.key);
-			profile.read = CaptureSuffixHistogram(entry == g_pipeline_profiles.end()
+			auto entry = state->pipeline_profiles.find(profile.key);
+			profile.read = CaptureSuffixHistogram(entry == state->pipeline_profiles.end()
 			                                          ? nullptr
 			                                          : &entry->second.downstream_suffix_ns);
 		}
 		for (auto &profile : scale_profiles) {
-			auto entry = g_scale_downstream_suffix_profiles.find(profile.scale_factor);
-			profile.read = CaptureSuffixHistogram(entry == g_scale_downstream_suffix_profiles.end()
+			auto entry = state->scale_downstream_suffix_profiles.find(profile.scale_factor);
+			profile.read = CaptureSuffixHistogram(entry == state->scale_downstream_suffix_profiles.end()
 			                                          ? nullptr
 			                                          : &entry->second);
 		}
-		global = CaptureSuffixHistogram(&g_global_downstream_suffix_profile);
+		global = CaptureSuffixHistogram(&state->global_downstream_suffix_profile);
 	}
 
 	bool has_rebuilt_histogram = global.needs_build;
@@ -1023,29 +1246,29 @@ vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuff
 	}
 
 	if (has_rebuilt_histogram) {
-		lock_guard<std::mutex> guard(g_profile_store_lock);
+		lock_guard<std::mutex> guard(state->lock);
 		for (const auto &profile : exact_profiles) {
-			auto entry = g_pipeline_profiles.find(profile.key);
-			if (entry != g_pipeline_profiles.end()) {
+			auto entry = state->pipeline_profiles.find(profile.key);
+			if (entry != state->pipeline_profiles.end()) {
 				PublishCapturedSuffixHistogram(entry->second.downstream_suffix_ns, profile.read);
 			}
 		}
 		for (const auto &profile : scale_profiles) {
-			auto entry = g_scale_downstream_suffix_profiles.find(profile.scale_factor);
-			if (entry != g_scale_downstream_suffix_profiles.end()) {
+			auto entry = state->scale_downstream_suffix_profiles.find(profile.scale_factor);
+			if (entry != state->scale_downstream_suffix_profiles.end()) {
 				PublishCapturedSuffixHistogram(entry->second, profile.read);
 			}
 		}
-		PublishCapturedSuffixHistogram(g_global_downstream_suffix_profile, global);
+		PublishCapturedSuffixHistogram(state->global_downstream_suffix_profile, global);
 	}
 	return results;
 }
 
 vector<QueryRequestProfileSnapshot> QueryRequestProfileStore::GetQueryProfilesSnapshot() const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
+	lock_guard<std::mutex> guard(state->lock);
 	vector<QueryRequestProfileSnapshot> result;
-	result.reserve(g_query_profiles.size());
-	for (const auto &entry : g_query_profiles) {
+	result.reserve(state->query_profiles.size());
+	for (const auto &entry : state->query_profiles) {
 		QueryRequestProfileSnapshot snapshot;
 		snapshot.template_id = entry.second.template_id;
 		snapshot.scale_factor = entry.second.scale_factor;
@@ -1063,10 +1286,10 @@ vector<QueryRequestProfileSnapshot> QueryRequestProfileStore::GetQueryProfilesSn
 }
 
 vector<QueryRequestPipelineProfileSnapshot> QueryRequestProfileStore::GetPipelineProfilesSnapshot() const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
+	lock_guard<std::mutex> guard(state->lock);
 	vector<QueryRequestPipelineProfileSnapshot> result;
-	result.reserve(g_pipeline_profiles.size());
-	for (const auto &entry : g_pipeline_profiles) {
+	result.reserve(state->pipeline_profiles.size());
+	for (const auto &entry : state->pipeline_profiles) {
 		QueryRequestPipelineProfileSnapshot snapshot;
 		snapshot.template_id = entry.second.template_id;
 		snapshot.scale_factor = entry.second.scale_factor;
@@ -1090,8 +1313,8 @@ vector<QueryRequestPipelineProfileSnapshot> QueryRequestProfileStore::GetPipelin
 }
 
 vector<QueryRequestSampleSnapshot> QueryRequestProfileStore::GetQuerySamplesSnapshot() const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
-	auto result = g_query_samples;
+	lock_guard<std::mutex> guard(state->lock);
+	auto result = state->query_samples;
 	std::sort(result.begin(), result.end(), [](const QueryRequestSampleSnapshot &left,
 	                                           const QueryRequestSampleSnapshot &right) {
 		if (left.db_query_id != right.db_query_id) {
@@ -1103,8 +1326,8 @@ vector<QueryRequestSampleSnapshot> QueryRequestProfileStore::GetQuerySamplesSnap
 }
 
 vector<QueryRequestPipelineInstanceSnapshot> QueryRequestProfileStore::GetPipelineInstancesSnapshot() const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
-	auto result = g_pipeline_instances;
+	lock_guard<std::mutex> guard(state->lock);
+	auto result = state->pipeline_instances;
 	std::sort(result.begin(), result.end(), [](const QueryRequestPipelineInstanceSnapshot &left,
 	                                           const QueryRequestPipelineInstanceSnapshot &right) {
 		if (left.db_query_id != right.db_query_id) {
@@ -1119,10 +1342,10 @@ vector<QueryRequestPipelineInstanceSnapshot> QueryRequestProfileStore::GetPipeli
 }
 
 vector<QueryRequestContinuationProfileSnapshot> QueryRequestProfileStore::GetContinuationProfilesSnapshot() const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
+	lock_guard<std::mutex> guard(state->lock);
 	vector<QueryRequestContinuationProfileSnapshot> result;
-	result.reserve(g_source_sink_continuation_profiles.size() + g_source_continuation_profiles.size() + 1);
-	for (const auto &entry : g_source_sink_continuation_profiles) {
+	result.reserve(state->source_sink_continuation_profiles.size() + state->source_continuation_profiles.size() + 1);
+	for (const auto &entry : state->source_sink_continuation_profiles) {
 		QueryRequestContinuationProfileSnapshot snapshot;
 		snapshot.level = ContinuationEstimateLevel::SOURCE_SINK;
 		snapshot.source_work_class = entry.first.source_work_class;
@@ -1135,7 +1358,7 @@ vector<QueryRequestContinuationProfileSnapshot> QueryRequestProfileStore::GetCon
 		snapshot.native_unit_mismatch_count = entry.second.native_unit_mismatch_count;
 		result.push_back(std::move(snapshot));
 	}
-	for (const auto &entry : g_source_continuation_profiles) {
+	for (const auto &entry : state->source_continuation_profiles) {
 		QueryRequestContinuationProfileSnapshot snapshot;
 		snapshot.level = ContinuationEstimateLevel::SOURCE;
 		snapshot.source_work_class = entry.first;
@@ -1147,14 +1370,14 @@ vector<QueryRequestContinuationProfileSnapshot> QueryRequestProfileStore::GetCon
 		snapshot.native_unit_mismatch_count = entry.second.native_unit_mismatch_count;
 		result.push_back(std::move(snapshot));
 	}
-	if (g_global_raw_continuation_profile.values.Count() > 0) {
+	if (state->global_raw_continuation_profile.values.Count() > 0) {
 		QueryRequestContinuationProfileSnapshot snapshot;
 		snapshot.level = ContinuationEstimateLevel::GLOBAL_RAW;
 		snapshot.kind = ContinuationEstimateKind::RAW_LATENCY_NS;
-		snapshot.sample_count = g_global_raw_continuation_profile.values.Count();
-		snapshot.mean = g_global_raw_continuation_profile.values.Mean();
-		snapshot.p50 = g_global_raw_continuation_profile.p50.Quantile();
-		snapshot.p90 = g_global_raw_continuation_profile.p90.Quantile();
+		snapshot.sample_count = state->global_raw_continuation_profile.values.Count();
+		snapshot.mean = state->global_raw_continuation_profile.values.Mean();
+		snapshot.p50 = state->global_raw_continuation_profile.p50.Quantile();
+		snapshot.p90 = state->global_raw_continuation_profile.p90.Quantile();
 		result.push_back(std::move(snapshot));
 	}
 	std::sort(result.begin(), result.end(), [](const QueryRequestContinuationProfileSnapshot &left,
@@ -1172,6 +1395,65 @@ vector<QueryRequestContinuationProfileSnapshot> QueryRequestProfileStore::GetCon
 	return result;
 }
 
+vector<QueryRequestThroughputProfileSnapshot> QueryRequestProfileStore::GetThroughputProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(state->lock);
+	vector<QueryRequestThroughputProfileSnapshot> result;
+	result.reserve(state->source_sink_throughput_profiles.size() + state->source_throughput_profiles.size() +
+	               state->global_compatible_throughput_profiles.size());
+	for (const auto &entry : state->source_sink_throughput_profiles) {
+		QueryRequestThroughputProfileSnapshot snapshot;
+		snapshot.level = PipelineThroughputEstimateLevel::SOURCE_SINK;
+		snapshot.source_work_class = entry.first.source_work_class;
+		snapshot.sink_type = entry.first.sink_type;
+		snapshot.work_kind = entry.first.source_work_class.work_kind;
+		snapshot.native_unit = entry.first.native_unit;
+		snapshot.sample_count = entry.second.values.Count();
+		snapshot.mean_work_units_per_s = entry.second.values.Mean();
+		snapshot.ewma_work_units_per_s = entry.second.ewma;
+		result.push_back(std::move(snapshot));
+	}
+	for (const auto &entry : state->source_throughput_profiles) {
+		QueryRequestThroughputProfileSnapshot snapshot;
+		snapshot.level = PipelineThroughputEstimateLevel::SOURCE;
+		snapshot.source_work_class = entry.first.source_work_class;
+		snapshot.work_kind = entry.first.source_work_class.work_kind;
+		snapshot.native_unit = entry.first.native_unit;
+		snapshot.sample_count = entry.second.values.Count();
+		snapshot.mean_work_units_per_s = entry.second.values.Mean();
+		snapshot.ewma_work_units_per_s = entry.second.ewma;
+		result.push_back(std::move(snapshot));
+	}
+	for (const auto &entry : state->global_compatible_throughput_profiles) {
+		QueryRequestThroughputProfileSnapshot snapshot;
+		snapshot.level = PipelineThroughputEstimateLevel::GLOBAL_COMPATIBLE;
+		snapshot.work_kind = entry.first.work_kind;
+		snapshot.native_unit = entry.first.native_unit;
+		snapshot.sample_count = entry.second.values.Count();
+		snapshot.mean_work_units_per_s = entry.second.values.Mean();
+		snapshot.ewma_work_units_per_s = entry.second.ewma;
+		result.push_back(std::move(snapshot));
+	}
+	std::sort(result.begin(), result.end(), [](const QueryRequestThroughputProfileSnapshot &left,
+	                                           const QueryRequestThroughputProfileSnapshot &right) {
+		if (left.level != right.level) {
+			return static_cast<uint8_t>(left.level) < static_cast<uint8_t>(right.level);
+		}
+		auto left_class = SourceWorkClassToString(left.source_work_class);
+		auto right_class = SourceWorkClassToString(right.source_work_class);
+		if (left_class != right_class) {
+			return left_class < right_class;
+		}
+		if (left.sink_type != right.sink_type) {
+			return static_cast<uint8_t>(left.sink_type) < static_cast<uint8_t>(right.sink_type);
+		}
+		if (left.work_kind != right.work_kind) {
+			return static_cast<uint8_t>(left.work_kind) < static_cast<uint8_t>(right.work_kind);
+		}
+		return left.native_unit < right.native_unit;
+	});
+	return result;
+}
+
 vector<QueryRequestDownstreamSuffixProfileSnapshot>
 QueryRequestProfileStore::GetDownstreamSuffixProfilesSnapshot() const {
 	struct PendingSnapshot {
@@ -1181,9 +1463,9 @@ QueryRequestProfileStore::GetDownstreamSuffixProfilesSnapshot() const {
 	};
 	vector<PendingSnapshot> pending;
 	{
-		lock_guard<std::mutex> guard(g_profile_store_lock);
-		pending.reserve(g_pipeline_profiles.size() + g_scale_downstream_suffix_profiles.size() + 1);
-		for (const auto &entry : g_pipeline_profiles) {
+		lock_guard<std::mutex> guard(state->lock);
+		pending.reserve(state->pipeline_profiles.size() + state->scale_downstream_suffix_profiles.size() + 1);
+		for (const auto &entry : state->pipeline_profiles) {
 			const auto &profile = entry.second.downstream_suffix_ns;
 			if (profile.samples.Count() == 0) {
 				continue;
@@ -1203,7 +1485,7 @@ QueryRequestProfileStore::GetDownstreamSuffixProfilesSnapshot() const {
 			}
 			pending.push_back(std::move(item));
 		}
-		for (const auto &entry : g_scale_downstream_suffix_profiles) {
+		for (const auto &entry : state->scale_downstream_suffix_profiles) {
 			if (entry.second.samples.Count() == 0) {
 				continue;
 			}
@@ -1219,14 +1501,14 @@ QueryRequestProfileStore::GetDownstreamSuffixProfilesSnapshot() const {
 			}
 			pending.push_back(std::move(item));
 		}
-		if (g_global_downstream_suffix_profile.samples.Count() > 0) {
+		if (state->global_downstream_suffix_profile.samples.Count() > 0) {
 			PendingSnapshot item;
 			item.snapshot.level = DownstreamSuffixProfileLevel::GLOBAL;
 			item.snapshot.value_unit = "ns_per_remaining_stage";
-			if (g_global_downstream_suffix_profile.cache_valid && !g_global_downstream_suffix_profile.dirty) {
-				item.snapshot.histogram = g_global_downstream_suffix_profile.cached;
+			if (state->global_downstream_suffix_profile.cache_valid && !state->global_downstream_suffix_profile.dirty) {
+				item.snapshot.histogram = state->global_downstream_suffix_profile.cached;
 			} else {
-				item.samples = g_global_downstream_suffix_profile.samples;
+				item.samples = state->global_downstream_suffix_profile.samples;
 				item.needs_build = true;
 			}
 			pending.push_back(std::move(item));
@@ -1260,26 +1542,30 @@ QueryRequestProfileStore::GetDownstreamSuffixProfilesSnapshot() const {
 }
 
 idx_t QueryRequestProfileStore::QueryProfileCount() const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
-	return g_query_profiles.size();
+	lock_guard<std::mutex> guard(state->lock);
+	return state->query_profiles.size();
 }
 
 idx_t QueryRequestProfileStore::PipelineProfileCount() const {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
-	return g_pipeline_profiles.size();
+	lock_guard<std::mutex> guard(state->lock);
+	return state->pipeline_profiles.size();
 }
 
 void QueryRequestProfileStore::Clear() {
-	lock_guard<std::mutex> guard(g_profile_store_lock);
-	g_query_profiles.clear();
-	g_pipeline_profiles.clear();
-	g_scale_downstream_suffix_profiles.clear();
-	g_global_downstream_suffix_profile = SuffixHistogramAggregate();
-	g_source_sink_continuation_profiles.clear();
-	g_source_continuation_profiles.clear();
-	g_global_raw_continuation_profile = ContinuationAggregate();
-	g_query_samples.clear();
-	g_pipeline_instances.clear();
+	lock_guard<std::mutex> guard(state->lock);
+	state->query_profiles.clear();
+	state->pipeline_profiles.clear();
+	state->scale_downstream_suffix_profiles.clear();
+	state->global_downstream_suffix_profile = SuffixHistogramAggregate();
+	state->source_sink_continuation_profiles.clear();
+	state->source_continuation_profiles.clear();
+	state->global_raw_continuation_profile = ContinuationAggregate();
+	state->source_sink_throughput_profiles.clear();
+	state->source_throughput_profiles.clear();
+	state->global_compatible_throughput_profiles.clear();
+	state->global_finish_tail_profile = ContinuationAggregate();
+	state->query_samples.clear();
+	state->pipeline_instances.clear();
 }
 
 } // namespace duckdb

@@ -53,6 +53,12 @@ struct PipelineWorkSnapshot {
 	bool valid = false;
 	bool parallelism_valid = false;
 	bool throughput_valid = false;
+	bool selected_throughput_valid = false;
+	bool selected_throughput_is_live = false;
+	double selected_single_worker_chunks_per_s = 0;
+	PipelineProfileIdentity profile_identity;
+	PipelineThroughputEstimate historical_throughput_estimate;
+	PipelineLifecycleTailEstimate lifecycle_tail_estimate;
 	PipelineContinuationEstimate continuation_estimate;
 };
 
@@ -237,6 +243,9 @@ private:
 	idx_t source_work_source_max_threads = 0;
 	idx_t source_work_effective_max_threads = 0;
 	bool source_work_scalable = false;
+	PipelineProfileIdentity profile_identity;
+	PipelineThroughputEstimate historical_throughput_estimate;
+	PipelineLifecycleTailEstimate lifecycle_tail_estimate;
 	PipelineContinuationEstimate continuation_estimate;
 	atomic<idx_t> source_work_completed_rows {0};
 	atomic<idx_t> source_work_completed_chunks_equiv {0};

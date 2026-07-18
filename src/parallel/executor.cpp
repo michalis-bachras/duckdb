@@ -95,6 +95,12 @@ void Executor::RegisterActivationEvent(Event &event, idx_t group_id, QueryActiva
 	event.SetQueryActivationInfo(group_id, kind, pipeline_id);
 }
 
+void Executor::NotifyEventTasksScheduled(Event &event) {
+	if (activation_scheduler && event.HasQueryActivationInfo()) {
+		activation_scheduler->OnEventTasksScheduled(event);
+	}
+}
+
 void Executor::NotifyEventFinished(Event &event) {
 	NotifyExecutionProgress();
 	if (!activation_scheduler || !event.HasQueryActivationInfo()) {
@@ -524,8 +530,20 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		root_pipeline->GetPipelines(pipelines, true);
 
 		QueryRequestMetadata request_metadata;
-		if (context.config.query_activation_scheduler_enabled &&
-		    QueryRequestMetadataManager::TryGetActive(context, request_metadata)) {
+		auto has_request_metadata = QueryRequestMetadataManager::TryGetActive(context, request_metadata);
+		auto sla_enabled = DBConfig::GetConfig(context).options.query_sla_scheduler_enabled;
+		if (sla_enabled && has_request_metadata) {
+			if (!DBConfig::GetConfig(context).options.query_worker_only_execution_enabled) {
+				throw InvalidInputException("SLA scheduling requires query_worker_only_execution_enable=true");
+			}
+			if (scheduler.ExternalThreads() != 0) {
+				throw InvalidInputException("SLA scheduling requires external_threads=0");
+			}
+			if (!context.config.query_activation_scheduler_enabled) {
+				throw InvalidInputException("SLA scheduling requires query_activation_scheduler_enable=true");
+			}
+		}
+		if (context.config.query_activation_scheduler_enabled && has_request_metadata) {
 			activation_scheduler =
 			    make_uniq<QueryActivationScheduler>(*this, request_metadata, context.config.query_activation_debug_enabled);
 		}
