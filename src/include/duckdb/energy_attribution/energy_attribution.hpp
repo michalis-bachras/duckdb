@@ -52,9 +52,17 @@ enum class EnergySegmentRole : uint8_t {
 
 enum class EnergySegmentPhase : uint8_t {
 	EXECUTE,
+	INTERNAL,
 	INITIALIZE,
 	PREPARE_FINISH,
 	FINISH
+};
+
+enum class EnergySystemCategory : uint8_t {
+	NONE,
+	SLA_SCHEDULER,
+	STRIDE_SCHEDULER,
+	ENERGY_SAMPLER
 };
 
 struct EnergySegmentRecord {
@@ -73,6 +81,7 @@ struct EnergySegmentRecord {
 	string pipeline_signature;
 	EnergySegmentRole role = EnergySegmentRole::UNKNOWN;
 	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
+	EnergySystemCategory system_category = EnergySystemCategory::NONE;
 	uint64_t lifecycle_group_id = 0;
 	uint64_t owner_pipeline_id = 0;
 	uint64_t lifecycle_member_count = 0;
@@ -140,7 +149,22 @@ private:
 	bool finished = false;
 };
 
+//! Query-independent database work is measured separately and is never charged to a query profile.
+class EnergySystemSegmentScope {
+public:
+	EnergySystemSegmentScope(DatabaseInstance &db, EnergySystemCategory category);
+	~EnergySystemSegmentScope();
+
+	EnergySystemSegmentScope(const EnergySystemSegmentScope &) = delete;
+	EnergySystemSegmentScope &operator=(const EnergySystemSegmentScope &) = delete;
+
+private:
+	EnergySegmentRecord record;
+	bool active = false;
+};
+
 const char *EnergySegmentRoleToString(EnergySegmentRole role);
 const char *EnergySegmentPhaseToString(EnergySegmentPhase phase);
+const char *EnergySystemCategoryToString(EnergySystemCategory category);
 
 } // namespace duckdb

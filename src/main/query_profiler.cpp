@@ -110,8 +110,10 @@ void QueryProfiler::Reset() {
 	tree_map.clear();
 	pipeline_profiles.clear();
 	pipeline_task_profiles.clear();
+	internal_event_profiles.clear();
 	pipeline_profile_index.clear();
 	pipeline_task_profile_index.clear();
+	internal_event_profile_index.clear();
 	next_pipeline_profile_id = 1;
 	next_pipeline_task_profile_id = 1;
 	root = nullptr;
@@ -563,6 +565,71 @@ void QueryProfiler::EndQuery() {
 vector<PipelineProfilingInfo> QueryProfiler::GetPipelineProfilesSnapshot() const {
 	lock_guard<std::mutex> guard(lock);
 	return pipeline_profiles;
+}
+
+static string InternalEventProfileMapKey(idx_t pipeline_id, idx_t event_position, const string &event_type) {
+	return StringUtil::Format("%llu:%llu:%s", static_cast<unsigned long long>(pipeline_id),
+	                          static_cast<unsigned long long>(event_position), event_type);
+}
+
+void QueryProfiler::RecordInternalEventStart(idx_t pipeline_id, uint64_t pipeline_signature_hash,
+	                                          idx_t event_position, const string &event_type,
+	                                          const string &native_unit, idx_t total_work_units) {
+	if (!pipeline_id || event_type.empty()) {
+		return;
+	}
+	lock_guard<std::mutex> guard(lock);
+	auto key = InternalEventProfileMapKey(pipeline_id, event_position, event_type);
+	if (internal_event_profile_index.count(key)) {
+		return;
+	}
+	InternalEventProfilingInfo profile;
+	profile.pipeline_id = pipeline_id;
+	profile.pipeline_signature_hash = pipeline_signature_hash;
+	profile.event_position = event_position;
+	profile.event_type = event_type;
+	profile.native_unit = native_unit;
+	profile.total_work_units = total_work_units;
+	profile.start_ns = PipelineDVFSProfiler::TimestampNs();
+	internal_event_profiles.push_back(std::move(profile));
+	internal_event_profile_index[key] = internal_event_profiles.size() - 1;
+}
+
+void QueryProfiler::RecordInternalEventWork(idx_t pipeline_id, idx_t event_position, const string &event_type,
+	                                         idx_t completed_work_units) {
+	if (completed_work_units == 0) {
+		return;
+	}
+	lock_guard<std::mutex> guard(lock);
+	auto entry = internal_event_profile_index.find(InternalEventProfileMapKey(pipeline_id, event_position, event_type));
+	if (entry != internal_event_profile_index.end()) {
+		internal_event_profiles[entry->second].completed_work_units += completed_work_units;
+	}
+}
+
+void QueryProfiler::RecordInternalEventWorkerTime(idx_t pipeline_id, idx_t event_position, const string &event_type,
+	                                               uint64_t duration_ns) {
+	if (duration_ns == 0) {
+		return;
+	}
+	lock_guard<std::mutex> guard(lock);
+	auto entry = internal_event_profile_index.find(InternalEventProfileMapKey(pipeline_id, event_position, event_type));
+	if (entry != internal_event_profile_index.end()) {
+		internal_event_profiles[entry->second].worker_time_ns += duration_ns;
+	}
+}
+
+void QueryProfiler::RecordInternalEventFinish(idx_t pipeline_id, idx_t event_position, const string &event_type) {
+	lock_guard<std::mutex> guard(lock);
+	auto entry = internal_event_profile_index.find(InternalEventProfileMapKey(pipeline_id, event_position, event_type));
+	if (entry != internal_event_profile_index.end()) {
+		internal_event_profiles[entry->second].finish_ns = PipelineDVFSProfiler::TimestampNs();
+	}
+}
+
+vector<InternalEventProfilingInfo> QueryProfiler::GetInternalEventProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(lock);
+	return internal_event_profiles;
 }
 
 void QueryProfiler::FinalizeMetrics() {

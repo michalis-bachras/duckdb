@@ -29,7 +29,7 @@ static const idx_t DOWNSTREAM_SUFFIX_MIN_EXACT_SAMPLES = 4;
 static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
 static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
 static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
-static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 1;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 2;
 static const char *PROFILE_SNAPSHOT_MAGIC = "DUCKDB_QUERY_REQUEST_PROFILE";
 
 class ProfileSnapshotWriter {
@@ -427,6 +427,56 @@ struct PipelineProfileKeyHash {
 	}
 };
 
+struct InternalEventProfileKey {
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
+	idx_t pipeline_id = 0;
+	uint64_t pipeline_signature_hash = 0;
+	idx_t event_position = 0;
+	string event_type;
+	string native_unit;
+
+	bool operator==(const InternalEventProfileKey &other) const {
+		return template_id == other.template_id && scale_factor == other.scale_factor &&
+		       pipeline_id == other.pipeline_id && pipeline_signature_hash == other.pipeline_signature_hash &&
+		       event_position == other.event_position && event_type == other.event_type && native_unit == other.native_unit;
+	}
+};
+
+struct InternalEventProfileKeyHash {
+	size_t operator()(const InternalEventProfileKey &key) const {
+		PipelineProfileKey pipeline_key;
+		pipeline_key.template_id = key.template_id;
+		pipeline_key.scale_factor = key.scale_factor;
+		pipeline_key.pipeline_id = key.pipeline_id;
+		pipeline_key.pipeline_signature_hash = key.pipeline_signature_hash;
+		size_t result = PipelineProfileKeyHash {}(pipeline_key);
+		result ^= std::hash<idx_t> {}(key.event_position) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<string> {}(key.event_type) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<string> {}(key.native_unit) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		return result;
+	}
+};
+
+struct InternalEventFallbackKey {
+	uint64_t scale_factor = 0;
+	string event_type;
+	string native_unit;
+
+	bool operator==(const InternalEventFallbackKey &other) const {
+		return scale_factor == other.scale_factor && event_type == other.event_type && native_unit == other.native_unit;
+	}
+};
+
+struct InternalEventFallbackKeyHash {
+	size_t operator()(const InternalEventFallbackKey &key) const {
+		size_t result = std::hash<uint64_t> {}(key.scale_factor);
+		result ^= std::hash<string> {}(key.event_type) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<string> {}(key.native_unit) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		return result;
+	}
+};
+
 struct SourceWorkClassHash {
 	size_t operator()(const SourceWorkClass &work_class) const {
 		size_t result = std::hash<uint8_t> {}(static_cast<uint8_t>(work_class.source_type));
@@ -557,6 +607,13 @@ struct PipelineProfileAggregate {
 	double ewma_single_worker_chunks_per_s = 0;
 };
 
+struct InternalEventProfileAggregate {
+	InternalEventProfileKey key;
+	ThroughputAggregate throughput;
+	ContinuationAggregate continuation;
+	ContinuationAggregate tail_to_pipeline_end;
+};
+
 } // namespace query_request_profile_store_internal
 
 using namespace query_request_profile_store_internal;
@@ -576,9 +633,16 @@ struct QueryRequestProfileStoreState {
 	std::unordered_map<SourceThroughputKey, ThroughputAggregate, SourceThroughputKeyHash> source_throughput_profiles;
 	std::unordered_map<CompatibleThroughputKey, ThroughputAggregate, CompatibleThroughputKeyHash>
 	    global_compatible_throughput_profiles;
+	std::unordered_map<InternalEventProfileKey, InternalEventProfileAggregate, InternalEventProfileKeyHash>
+	    internal_event_profiles;
+	std::unordered_map<InternalEventFallbackKey, InternalEventProfileAggregate, InternalEventFallbackKeyHash>
+	    scale_internal_event_profiles;
+	std::unordered_map<InternalEventFallbackKey, InternalEventProfileAggregate, InternalEventFallbackKeyHash>
+	    global_internal_event_profiles;
 	ContinuationAggregate global_finish_tail_profile;
 	vector<QueryRequestSampleSnapshot> query_samples;
 	vector<QueryRequestPipelineInstanceSnapshot> pipeline_instances;
+	vector<QueryRequestInternalEventInstanceSnapshot> internal_event_instances;
 };
 
 namespace query_request_profile_store_internal {
@@ -599,6 +663,12 @@ struct ProfileSnapshotState {
 	std::unordered_map<SourceThroughputKey, ThroughputAggregate, SourceThroughputKeyHash> source_throughput_profiles;
 	std::unordered_map<CompatibleThroughputKey, ThroughputAggregate, CompatibleThroughputKeyHash>
 	    global_compatible_throughput_profiles;
+	std::unordered_map<InternalEventProfileKey, InternalEventProfileAggregate, InternalEventProfileKeyHash>
+	    internal_event_profiles;
+	std::unordered_map<InternalEventFallbackKey, InternalEventProfileAggregate, InternalEventFallbackKeyHash>
+	    scale_internal_event_profiles;
+	std::unordered_map<InternalEventFallbackKey, InternalEventProfileAggregate, InternalEventFallbackKeyHash>
+	    global_internal_event_profiles;
 	ContinuationAggregate global_finish_tail_profile;
 };
 
@@ -766,6 +836,20 @@ static PipelineProfileAggregate ReadPipelineProfile(ProfileSnapshotReader &reade
 	return result;
 }
 
+static void WriteInternalEventAggregate(ProfileSnapshotWriter &writer, const InternalEventProfileAggregate &profile) {
+	WriteThroughput(writer, profile.throughput);
+	WriteContinuation(writer, profile.continuation);
+	WriteContinuation(writer, profile.tail_to_pipeline_end);
+}
+
+static InternalEventProfileAggregate ReadInternalEventAggregate(ProfileSnapshotReader &reader) {
+	InternalEventProfileAggregate result;
+	result.throughput = ReadThroughput(reader);
+	result.continuation = ReadContinuation(reader);
+	result.tail_to_pipeline_end = ReadContinuation(reader);
+	return result;
+}
+
 static ProfileSnapshotState CaptureSnapshotState(QueryRequestProfileStoreState &state) {
 	ProfileSnapshotState result;
 	lock_guard<std::mutex> guard(state.lock);
@@ -779,6 +863,9 @@ static ProfileSnapshotState CaptureSnapshotState(QueryRequestProfileStoreState &
 	result.source_sink_throughput_profiles = state.source_sink_throughput_profiles;
 	result.source_throughput_profiles = state.source_throughput_profiles;
 	result.global_compatible_throughput_profiles = state.global_compatible_throughput_profiles;
+	result.internal_event_profiles = state.internal_event_profiles;
+	result.scale_internal_event_profiles = state.scale_internal_event_profiles;
+	result.global_internal_event_profiles = state.global_internal_event_profiles;
 	result.global_finish_tail_profile = state.global_finish_tail_profile;
 	return result;
 }
@@ -830,6 +917,31 @@ static void WriteSnapshotState(ProfileSnapshotWriter &writer, const ProfileSnaps
 		writer.Write<uint8_t>(static_cast<uint8_t>(entry.first.work_kind));
 		writer.WriteString(entry.first.native_unit);
 		WriteThroughput(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.internal_event_profiles.size());
+	for (const auto &entry : snapshot.internal_event_profiles) {
+		writer.Write<uint64_t>(entry.first.template_id);
+		writer.Write<uint64_t>(entry.first.scale_factor);
+		writer.Write<uint64_t>(entry.first.pipeline_id);
+		writer.Write<uint64_t>(entry.first.pipeline_signature_hash);
+		writer.Write<uint64_t>(entry.first.event_position);
+		writer.WriteString(entry.first.event_type);
+		writer.WriteString(entry.first.native_unit);
+		WriteInternalEventAggregate(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.scale_internal_event_profiles.size());
+	for (const auto &entry : snapshot.scale_internal_event_profiles) {
+		writer.Write<uint64_t>(entry.first.scale_factor);
+		writer.WriteString(entry.first.event_type);
+		writer.WriteString(entry.first.native_unit);
+		WriteInternalEventAggregate(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.global_internal_event_profiles.size());
+	for (const auto &entry : snapshot.global_internal_event_profiles) {
+		writer.Write<uint64_t>(entry.first.scale_factor);
+		writer.WriteString(entry.first.event_type);
+		writer.WriteString(entry.first.native_unit);
+		WriteInternalEventAggregate(writer, entry.second);
 	}
 	WriteContinuation(writer, snapshot.global_finish_tail_profile);
 }
@@ -915,6 +1027,42 @@ static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader) {
 			throw SerializationException("Duplicate global throughput profile in query profile snapshot");
 		}
 	}
+	auto internal_event_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "internal event profile");
+	for (idx_t i = 0; i < internal_event_count; i++) {
+		InternalEventProfileKey key;
+		key.template_id = reader.Read<uint64_t>();
+		key.scale_factor = reader.Read<uint64_t>();
+		key.pipeline_id = reader.Read<uint64_t>();
+		key.pipeline_signature_hash = reader.Read<uint64_t>();
+		key.event_position = reader.Read<uint64_t>();
+		key.event_type = reader.ReadString();
+		key.native_unit = reader.ReadString();
+		auto profile = ReadInternalEventAggregate(reader);
+		profile.key = key;
+		if (!result.internal_event_profiles.emplace(key, std::move(profile)).second) {
+			throw SerializationException("Duplicate internal event profile in query profile snapshot");
+		}
+	}
+	auto scale_internal_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "scale internal event profile");
+	for (idx_t i = 0; i < scale_internal_count; i++) {
+		InternalEventFallbackKey key;
+		key.scale_factor = reader.Read<uint64_t>();
+		key.event_type = reader.ReadString();
+		key.native_unit = reader.ReadString();
+		if (!result.scale_internal_event_profiles.emplace(key, ReadInternalEventAggregate(reader)).second) {
+			throw SerializationException("Duplicate scale internal event profile in query profile snapshot");
+		}
+	}
+	auto global_internal_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "global internal event profile");
+	for (idx_t i = 0; i < global_internal_count; i++) {
+		InternalEventFallbackKey key;
+		key.scale_factor = reader.Read<uint64_t>();
+		key.event_type = reader.ReadString();
+		key.native_unit = reader.ReadString();
+		if (!result.global_internal_event_profiles.emplace(key, ReadInternalEventAggregate(reader)).second) {
+			throw SerializationException("Duplicate global internal event profile in query profile snapshot");
+		}
+	}
 	result.global_finish_tail_profile = ReadContinuation(reader);
 	return result;
 }
@@ -931,9 +1079,13 @@ static void InstallSnapshotState(QueryRequestProfileStoreState &state, ProfileSn
 	state.source_sink_throughput_profiles = std::move(snapshot.source_sink_throughput_profiles);
 	state.source_throughput_profiles = std::move(snapshot.source_throughput_profiles);
 	state.global_compatible_throughput_profiles = std::move(snapshot.global_compatible_throughput_profiles);
+	state.internal_event_profiles = std::move(snapshot.internal_event_profiles);
+	state.scale_internal_event_profiles = std::move(snapshot.scale_internal_event_profiles);
+	state.global_internal_event_profiles = std::move(snapshot.global_internal_event_profiles);
 	state.global_finish_tail_profile = std::move(snapshot.global_finish_tail_profile);
 	state.query_samples.clear();
 	state.pipeline_instances.clear();
+	state.internal_event_instances.clear();
 }
 
 static uint64_t DurationNs(uint64_t end_ns, uint64_t start_ns) {
@@ -1225,7 +1377,8 @@ QueryRequestProfileStore::~QueryRequestProfileStore() {
 }
 
 void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata &metadata, uint64_t query_end_ns,
-                                                     const vector<PipelineProfilingInfo> &pipeline_profiles) {
+                                                      const vector<PipelineProfilingInfo> &pipeline_profiles,
+                                                      const vector<InternalEventProfilingInfo> &internal_event_profiles) {
 	if (!metadata.valid || metadata.query_start_ns == 0 || query_end_ns <= metadata.query_start_ns) {
 		return;
 	}
@@ -1427,6 +1580,71 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		}
 		state->pipeline_instances.push_back(std::move(pipeline_instance));
 	}
+
+	for (const auto &event : internal_event_profiles) {
+		if (event.pipeline_id == 0 || event.pipeline_signature_hash == 0 || event.event_type.empty() ||
+		    event.native_unit.empty() || event.total_work_units == 0 || event.finish_ns <= event.start_ns) {
+			continue;
+		}
+		uint64_t pipeline_end_ns = 0;
+		for (const auto &pipeline : pipeline_profiles) {
+			if (pipeline.pipeline_id == event.pipeline_id &&
+			    pipeline.pipeline_signature_hash == event.pipeline_signature_hash) {
+				pipeline_end_ns = PipelineLifecycleEndNs(pipeline);
+				break;
+			}
+		}
+		InternalEventProfileKey key;
+		key.template_id = metadata.template_id;
+		key.scale_factor = metadata.scale_factor;
+		key.pipeline_id = event.pipeline_id;
+		key.pipeline_signature_hash = event.pipeline_signature_hash;
+		key.event_position = event.event_position;
+		key.event_type = event.event_type;
+		key.native_unit = event.native_unit;
+		auto &profile = state->internal_event_profiles[key];
+		profile.key = key;
+		InternalEventFallbackKey scale_key;
+		scale_key.scale_factor = metadata.scale_factor;
+		scale_key.event_type = event.event_type;
+		scale_key.native_unit = event.native_unit;
+		InternalEventFallbackKey global_key;
+		global_key.event_type = event.event_type;
+		global_key.native_unit = event.native_unit;
+		auto &scale_profile = state->scale_internal_event_profiles[scale_key];
+		auto &global_profile = state->global_internal_event_profiles[global_key];
+
+		double throughput = 0;
+		if (event.completed_work_units > 0 && event.worker_time_ns > 0) {
+			throughput = static_cast<double>(event.completed_work_units) * 1000000000.0 /
+			             static_cast<double>(event.worker_time_ns);
+			profile.throughput.Add(throughput);
+			scale_profile.throughput.Add(throughput);
+			global_profile.throughput.Add(throughput);
+		}
+		auto wall_ns = event.finish_ns - event.start_ns;
+		auto ns_per_unit = static_cast<double>(wall_ns) / static_cast<double>(event.total_work_units);
+		profile.continuation.Add(ns_per_unit, event.native_unit);
+		scale_profile.continuation.Add(ns_per_unit, event.native_unit);
+		global_profile.continuation.Add(ns_per_unit, event.native_unit);
+		uint64_t tail_ns = 0;
+		if (pipeline_end_ns >= event.finish_ns) {
+			tail_ns = pipeline_end_ns - event.finish_ns;
+			profile.tail_to_pipeline_end.Add(static_cast<double>(tail_ns));
+			scale_profile.tail_to_pipeline_end.Add(static_cast<double>(tail_ns));
+			global_profile.tail_to_pipeline_end.Add(static_cast<double>(tail_ns));
+		}
+		QueryRequestInternalEventInstanceSnapshot instance;
+		static_cast<InternalEventProfilingInfo &>(instance) = event;
+		instance.db_query_id = metadata.db_query_id;
+		instance.request_id = metadata.request_id;
+		instance.template_id = metadata.template_id;
+		instance.scale_factor = metadata.scale_factor;
+		instance.work_units_per_s = throughput;
+		instance.ns_per_work_unit = ns_per_unit;
+		instance.tail_to_pipeline_end_ns = tail_ns;
+		state->internal_event_instances.push_back(std::move(instance));
+	}
 }
 
 bool QueryRequestProfileStore::TryGetQueryEstimate(uint64_t template_id, uint64_t scale_factor,
@@ -1576,6 +1794,63 @@ PipelineLifecycleTailEstimate QueryRequestProfileStore::ResolvePipelineLifecycle
 	}
 	return BuildLifecycleTailEstimate(state->global_finish_tail_profile,
 	                                  PipelineLifecycleTailEstimateLevel::GLOBAL);
+}
+
+InternalEventModelEstimate QueryRequestProfileStore::ResolveInternalEvent(
+    uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &pipeline_identity,
+    idx_t event_position, const string &event_type, const string &native_unit) const {
+	InternalEventModelEstimate result;
+	if (!pipeline_identity.valid || event_type.empty() || native_unit.empty()) {
+		return result;
+	}
+	lock_guard<std::mutex> guard(state->lock);
+	auto apply_profile = [&](const InternalEventProfileAggregate &profile, PipelineThroughputEstimateLevel throughput_level,
+	                         ContinuationEstimateLevel continuation_level,
+	                         PipelineLifecycleTailEstimateLevel tail_level) {
+		if (!result.throughput.valid) {
+			result.throughput = BuildThroughputEstimate(profile.throughput, throughput_level);
+		}
+		if (!result.continuation.valid) {
+			result.continuation = BuildContinuationEstimate(profile.continuation, continuation_level,
+			                                                ContinuationEstimateKind::NS_PER_WORK_UNIT);
+		}
+		if (!result.tail_to_pipeline_end.valid) {
+			result.tail_to_pipeline_end = BuildLifecycleTailEstimate(profile.tail_to_pipeline_end, tail_level);
+		}
+	};
+
+	InternalEventProfileKey exact_key;
+	exact_key.template_id = template_id;
+	exact_key.scale_factor = scale_factor;
+	exact_key.pipeline_id = pipeline_identity.pipeline_id;
+	exact_key.pipeline_signature_hash = pipeline_identity.pipeline_signature_hash;
+	exact_key.event_position = event_position;
+	exact_key.event_type = event_type;
+	exact_key.native_unit = native_unit;
+	auto exact = state->internal_event_profiles.find(exact_key);
+	if (exact != state->internal_event_profiles.end()) {
+		apply_profile(exact->second, PipelineThroughputEstimateLevel::EXACT, ContinuationEstimateLevel::EXACT,
+		              PipelineLifecycleTailEstimateLevel::EXACT);
+	}
+
+	InternalEventFallbackKey scale_key;
+	scale_key.scale_factor = scale_factor;
+	scale_key.event_type = event_type;
+	scale_key.native_unit = native_unit;
+	auto scale = state->scale_internal_event_profiles.find(scale_key);
+	if (scale != state->scale_internal_event_profiles.end()) {
+		apply_profile(scale->second, PipelineThroughputEstimateLevel::SCALE_FACTOR,
+		              ContinuationEstimateLevel::SCALE_FACTOR, PipelineLifecycleTailEstimateLevel::SCALE_FACTOR);
+	}
+	InternalEventFallbackKey global_key;
+	global_key.event_type = event_type;
+	global_key.native_unit = native_unit;
+	auto global = state->global_internal_event_profiles.find(global_key);
+	if (global != state->global_internal_event_profiles.end()) {
+		apply_profile(global->second, PipelineThroughputEstimateLevel::GLOBAL_COMPATIBLE,
+		              ContinuationEstimateLevel::GLOBAL_RAW, PipelineLifecycleTailEstimateLevel::GLOBAL);
+	}
+	return result;
 }
 
 vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuffixEpoch(
@@ -1962,6 +2237,64 @@ QueryRequestProfileStore::GetDownstreamSuffixProfilesSnapshot() const {
 	return result;
 }
 
+vector<QueryRequestInternalEventProfileSnapshot> QueryRequestProfileStore::GetInternalEventProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(state->lock);
+	vector<QueryRequestInternalEventProfileSnapshot> result;
+	result.reserve(state->internal_event_profiles.size());
+	for (const auto &entry : state->internal_event_profiles) {
+		QueryRequestInternalEventProfileSnapshot snapshot;
+		snapshot.template_id = entry.first.template_id;
+		snapshot.scale_factor = entry.first.scale_factor;
+		snapshot.pipeline_id = entry.first.pipeline_id;
+		snapshot.pipeline_signature_hash = entry.first.pipeline_signature_hash;
+		snapshot.event_position = entry.first.event_position;
+		snapshot.event_type = entry.first.event_type;
+		snapshot.native_unit = entry.first.native_unit;
+		snapshot.sample_count = entry.second.continuation.values.Count();
+		snapshot.mean_work_units_per_s = entry.second.throughput.values.Mean();
+		snapshot.ewma_work_units_per_s = entry.second.throughput.ewma;
+		snapshot.mean_ns_per_work_unit = entry.second.continuation.values.Mean();
+		snapshot.p50_ns_per_work_unit = entry.second.continuation.p50.Quantile();
+		snapshot.p90_ns_per_work_unit = entry.second.continuation.p90.Quantile();
+		snapshot.mean_tail_ns = entry.second.tail_to_pipeline_end.values.Mean();
+		snapshot.p90_tail_ns = entry.second.tail_to_pipeline_end.p90.Quantile();
+		result.push_back(std::move(snapshot));
+	}
+	std::sort(result.begin(), result.end(), [](const QueryRequestInternalEventProfileSnapshot &left,
+	                                           const QueryRequestInternalEventProfileSnapshot &right) {
+		if (left.template_id != right.template_id) {
+			return left.template_id < right.template_id;
+		}
+		if (left.scale_factor != right.scale_factor) {
+			return left.scale_factor < right.scale_factor;
+		}
+		if (left.pipeline_id != right.pipeline_id) {
+			return left.pipeline_id < right.pipeline_id;
+		}
+		if (left.event_position != right.event_position) {
+			return left.event_position < right.event_position;
+		}
+		return left.event_type < right.event_type;
+	});
+	return result;
+}
+
+vector<QueryRequestInternalEventInstanceSnapshot> QueryRequestProfileStore::GetInternalEventInstancesSnapshot() const {
+	lock_guard<std::mutex> guard(state->lock);
+	auto result = state->internal_event_instances;
+	std::sort(result.begin(), result.end(), [](const QueryRequestInternalEventInstanceSnapshot &left,
+	                                           const QueryRequestInternalEventInstanceSnapshot &right) {
+		if (left.db_query_id != right.db_query_id) {
+			return left.db_query_id < right.db_query_id;
+		}
+		if (left.pipeline_id != right.pipeline_id) {
+			return left.pipeline_id < right.pipeline_id;
+		}
+		return left.event_position < right.event_position;
+	});
+	return result;
+}
+
 idx_t QueryRequestProfileStore::QueryProfileCount() const {
 	lock_guard<std::mutex> guard(state->lock);
 	return state->query_profiles.size();
@@ -2020,9 +2353,13 @@ void QueryRequestProfileStore::Clear() {
 	state->source_sink_throughput_profiles.clear();
 	state->source_throughput_profiles.clear();
 	state->global_compatible_throughput_profiles.clear();
+	state->internal_event_profiles.clear();
+	state->scale_internal_event_profiles.clear();
+	state->global_internal_event_profiles.clear();
 	state->global_finish_tail_profile = ContinuationAggregate();
 	state->query_samples.clear();
 	state->pipeline_instances.clear();
+	state->internal_event_instances.clear();
 }
 
 } // namespace duckdb

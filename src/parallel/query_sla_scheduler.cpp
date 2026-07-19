@@ -13,6 +13,7 @@
 #include "duckdb/parallel/event.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -197,7 +198,9 @@ static double SuffixQuantileNs(const DownstreamSuffixEstimate &suffix, double qu
 static double CurrentPipelineFinishNs(const PipelineWorkSnapshot &work, QueryActivationEventKind event_kind,
 	                                  idx_t workers, uint64_t now_ns, uint64_t epoch_ns) {
 	auto lifecycle_tail_ns = work.lifecycle_tail_estimate.valid ? work.lifecycle_tail_estimate.p90_ns : 0.0;
-	if (event_kind != QueryActivationEventKind::PIPELINE || work.remaining_chunks_equiv == 0) {
+	auto modeled_work = event_kind == QueryActivationEventKind::PIPELINE ||
+	                    event_kind == QueryActivationEventKind::INTERNAL;
+	if (!modeled_work || work.remaining_chunks_equiv == 0) {
 		return static_cast<double>(now_ns) + (workers == 0 ? static_cast<double>(epoch_ns) : 0.0) +
 		       lifecycle_tail_ns;
 	}
@@ -285,21 +288,24 @@ static QuerySLAModel BuildProvisionalQueryModel(const QueryCapture &capture, con
 	model.remaining_work_units = work.remaining_chunks_equiv;
 	model.throughput = work.selected_single_worker_chunks_per_s;
 	model.throughput_is_live = work.selected_throughput_is_live;
-	if (model.event_kind != QueryActivationEventKind::PIPELINE) {
+	if (model.event_kind != QueryActivationEventKind::PIPELINE &&
+	    model.event_kind != QueryActivationEventKind::INTERNAL) {
 		model.demand_cap = MinValue<idx_t>(idx_t(1), model.demand_cap);
 	}
 	if (model.demand_cap == 0) {
 		model.valid = true;
 		return model;
 	}
-	if (model.event_kind == QueryActivationEventKind::PIPELINE && work.remaining_chunks_equiv > 0 &&
+	auto modeled_work = model.event_kind == QueryActivationEventKind::PIPELINE ||
+	                    model.event_kind == QueryActivationEventKind::INTERNAL;
+	if (modeled_work && work.remaining_chunks_equiv > 0 &&
 	    !work.selected_throughput_valid) {
-		model.error = "active data pipeline has no compatible historical or live throughput profile";
+		model.error = "active pipeline event has no compatible historical or live throughput profile";
 		return model;
 	}
-	if (model.event_kind == QueryActivationEventKind::PIPELINE && work.remaining_chunks_equiv > 0 &&
+	if (modeled_work && work.remaining_chunks_equiv > 0 &&
 	    !work.continuation_estimate.valid) {
-		model.error = "active data pipeline has no compatible continuation profile";
+		model.error = "active pipeline event has no compatible continuation profile";
 		return model;
 	}
 	model.valid = true;
@@ -661,6 +667,7 @@ void QuerySLAScheduler::MaybeRunEpoch() {
 }
 
 void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
+	EnergySystemSegmentScope energy_scope(db, EnergySystemCategory::SLA_SCHEDULER);
 	const auto collect_diagnostics = state->debug_trace_query_count.load() > 0;
 	const auto thread_cpu_start_ns = collect_diagnostics ? SLAThreadCpuNs() : 0;
 	const auto capture_wait_start_ns = collect_diagnostics ? SLATimestampNs() : 0;
@@ -701,7 +708,8 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		if (!captures[i].event->GetPipelineWorkSnapshot(work[i])) {
 			continue;
 		}
-		if (captures[i].event->GetQueryActivationKind() != QueryActivationEventKind::PIPELINE ||
+		auto event_kind = captures[i].event->GetQueryActivationKind();
+		if ((event_kind != QueryActivationEventKind::PIPELINE && event_kind != QueryActivationEventKind::INTERNAL) ||
 		    !work[i].profile_identity.valid) {
 			continue;
 		}
@@ -722,7 +730,8 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 	models.reserve(captures.size());
 	for (idx_t i = 0; i < captures.size(); i++) {
 		DownstreamSuffixEstimate suffix;
-		if (captures[i].event->GetQueryActivationKind() == QueryActivationEventKind::PIPELINE) {
+		auto event_kind = captures[i].event->GetQueryActivationKind();
+		if (event_kind == QueryActivationEventKind::PIPELINE || event_kind == QueryActivationEventKind::INTERNAL) {
 			if (suffix_indexes[i] != DConstants::INVALID_INDEX && suffix_indexes[i] < suffix_estimates.size()) {
 					suffix = suffix_estimates[suffix_indexes[i]];
 				}

@@ -42,7 +42,8 @@ enum class PipelineThroughputEstimateLevel : uint8_t {
 	EXACT,
 	SOURCE_SINK,
 	SOURCE,
-	GLOBAL_COMPATIBLE
+	GLOBAL_COMPATIBLE,
+	SCALE_FACTOR
 };
 
 const char *PipelineThroughputEstimateLevelToString(PipelineThroughputEstimateLevel level);
@@ -55,7 +56,7 @@ struct PipelineThroughputEstimate {
 	double ewma_work_units_per_s = 0;
 };
 
-enum class PipelineLifecycleTailEstimateLevel : uint8_t { NONE = 0, EXACT, GLOBAL };
+enum class PipelineLifecycleTailEstimateLevel : uint8_t { NONE = 0, EXACT, GLOBAL, SCALE_FACTOR };
 
 const char *PipelineLifecycleTailEstimateLevelToString(PipelineLifecycleTailEstimateLevel level);
 
@@ -73,7 +74,8 @@ enum class ContinuationEstimateLevel : uint8_t {
 	EXACT,
 	SOURCE_SINK,
 	SOURCE,
-	GLOBAL_RAW
+	GLOBAL_RAW,
+	SCALE_FACTOR
 };
 
 enum class ContinuationEstimateKind : uint8_t {

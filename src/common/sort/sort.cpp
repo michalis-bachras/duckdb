@@ -532,8 +532,13 @@ SourceResultType Sort::MaterializeSortedRun(ExecutionContext &context, OperatorS
 		return SourceResultType::FINISHED;
 	}
 	auto &lstate = input.local_state.Cast<SortLocalSourceState>();
-	OperatorSourceInput merger_input {*gstate.merger_global_state, *lstate.merger_local_state, input.interrupt_state};
-	return gstate.merger.MaterializeSortedRun(context, merger_input);
+	OperatorSourceInput merger_input {*gstate.merger_global_state, *lstate.merger_local_state, input.interrupt_state,
+	                                  input.source_throughput};
+	auto result = gstate.merger.MaterializeSortedRun(context, merger_input);
+	if (result == SourceResultType::FINISHED) {
+		input.ReportSourceWorkUnits(1, SourceThroughputKind::SORTED_ROWS, "exact", "sort_partition");
+	}
+	return result;
 }
 
 unique_ptr<SortedRun> Sort::GetSortedRun(GlobalSourceState &global_state) {

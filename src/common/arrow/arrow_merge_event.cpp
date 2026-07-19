@@ -10,9 +10,10 @@ namespace duckdb {
 
 ArrowBatchTask::ArrowBatchTask(ArrowQueryResult &result, vector<idx_t> record_batch_indices, Executor &executor,
                                shared_ptr<Event> event_p, BatchCollectionChunkScanState scan_state,
-                               vector<string> names, idx_t batch_size)
+                               vector<string> names, idx_t batch_size, idx_t tuple_count_p)
     : ExecutorTask(executor, event_p), result(result), record_batch_indices(std::move(record_batch_indices)),
-      event(std::move(event_p)), batch_size(batch_size), names(std::move(names)), scan_state(std::move(scan_state)) {
+      event(std::move(event_p)), batch_size(batch_size), names(std::move(names)), scan_state(std::move(scan_state)),
+      tuple_count(tuple_count_p) {
 }
 
 void ArrowBatchTask::ProduceRecordBatches() {
@@ -31,6 +32,7 @@ void ArrowBatchTask::ProduceRecordBatches() {
 
 TaskExecutionResult ArrowBatchTask::ExecuteTask(TaskExecutionMode mode) {
 	ProduceRecordBatches();
+	event->ReportInternalWork(tuple_count);
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }
@@ -79,6 +81,7 @@ public:
 
 void ArrowMergeEvent::Schedule() {
 	vector<shared_ptr<Task>> tasks;
+	idx_t total_rows = 0;
 
 	BatchesToTaskTransformer transformer(batches);
 	vector<BatchesForTask> task_data;
@@ -104,6 +107,7 @@ void ArrowMergeEvent::Schedule() {
 		batches_for_task.tuple_count = tuples_for_task;
 		batches_for_task.batches = batches.BatchRange(start_index, end_index);
 		task_data.push_back(batches_for_task);
+		total_rows += tuples_for_task;
 	}
 
 	// Now we produce tasks from these units
@@ -125,8 +129,9 @@ void ArrowMergeEvent::Schedule() {
 		BatchCollectionChunkScanState scan_state(batches, data.batches, pipeline->executor.context);
 		tasks.push_back(make_uniq<ArrowBatchTask>(result, std::move(record_batch_indices), pipeline->executor,
 		                                          shared_from_this(), std::move(scan_state), result.names,
-		                                          record_batch_size));
+		                                          record_batch_size, tuples));
 	}
+	ConfigureInternalWork(InternalEventType::ARROW_MERGE, total_rows, "row", true);
 
 	// Allocate the list of record batches inside the query result
 	{

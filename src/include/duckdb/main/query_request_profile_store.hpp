@@ -210,6 +210,40 @@ struct QueryRequestDownstreamSuffixProfileSnapshot {
 	DownstreamSuffixHistogram histogram;
 };
 
+struct InternalEventModelEstimate {
+	PipelineThroughputEstimate throughput;
+	PipelineContinuationEstimate continuation;
+	PipelineLifecycleTailEstimate tail_to_pipeline_end;
+};
+
+struct QueryRequestInternalEventProfileSnapshot {
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
+	idx_t pipeline_id = 0;
+	uint64_t pipeline_signature_hash = 0;
+	idx_t event_position = 0;
+	string event_type;
+	string native_unit;
+	idx_t sample_count = 0;
+	double mean_work_units_per_s = 0;
+	double ewma_work_units_per_s = 0;
+	double mean_ns_per_work_unit = 0;
+	double p50_ns_per_work_unit = 0;
+	double p90_ns_per_work_unit = 0;
+	double mean_tail_ns = 0;
+	double p90_tail_ns = 0;
+};
+
+struct QueryRequestInternalEventInstanceSnapshot : public InternalEventProfilingInfo {
+	uint64_t db_query_id = 0;
+	uint64_t request_id = 0;
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
+	double work_units_per_s = 0;
+	double ns_per_work_unit = 0;
+	uint64_t tail_to_pipeline_end_ns = 0;
+};
+
 class QueryRequestProfileStore {
 public:
 	QueryRequestProfileStore();
@@ -219,7 +253,8 @@ public:
 	QueryRequestProfileStore &operator=(const QueryRequestProfileStore &) = delete;
 
 	void RecordQueryCompletion(const QueryRequestMetadata &metadata, uint64_t query_end_ns,
-	                           const vector<PipelineProfilingInfo> &pipeline_profiles);
+	                           const vector<PipelineProfilingInfo> &pipeline_profiles,
+	                           const vector<InternalEventProfilingInfo> &internal_event_profiles = {});
 	bool TryGetQueryEstimate(uint64_t template_id, uint64_t scale_factor, QueryRequestProfileEstimate &estimate) const;
 	bool TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor, idx_t pipeline_id,
 	                            uint64_t pipeline_signature_hash, QueryRequestPipelineProfileEstimate &estimate) const;
@@ -230,6 +265,10 @@ public:
 	                                                     const PipelineProfileIdentity &identity) const;
 	PipelineLifecycleTailEstimate ResolvePipelineLifecycleTail(uint64_t template_id, uint64_t scale_factor,
 	                                                           const PipelineProfileIdentity &identity) const;
+	InternalEventModelEstimate ResolveInternalEvent(uint64_t template_id, uint64_t scale_factor,
+	                                                const PipelineProfileIdentity &pipeline_identity,
+	                                                idx_t event_position, const string &event_type,
+	                                                const string &native_unit) const;
 	vector<DownstreamSuffixEstimate>
 	PrepareDownstreamSuffixEpoch(const vector<DownstreamSuffixEpochRequest> &requests) const;
 	vector<QueryRequestProfileSnapshot> GetQueryProfilesSnapshot() const;
@@ -239,6 +278,8 @@ public:
 	vector<QueryRequestContinuationProfileSnapshot> GetContinuationProfilesSnapshot() const;
 	vector<QueryRequestThroughputProfileSnapshot> GetThroughputProfilesSnapshot() const;
 	vector<QueryRequestDownstreamSuffixProfileSnapshot> GetDownstreamSuffixProfilesSnapshot() const;
+	vector<QueryRequestInternalEventProfileSnapshot> GetInternalEventProfilesSnapshot() const;
+	vector<QueryRequestInternalEventInstanceSnapshot> GetInternalEventInstancesSnapshot() const;
 	idx_t QueryProfileCount() const;
 	idx_t PipelineProfileCount() const;
 	//! Persist only bounded scheduler model state. Diagnostic instance/sample rows are intentionally excluded.

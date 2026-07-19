@@ -12,9 +12,11 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/execution/pipeline_continuation.hpp"
 
 namespace duckdb {
 class Executor;
+class Pipeline;
 class Task;
 struct PipelineWorkSnapshot;
 
@@ -27,6 +29,21 @@ enum class QueryActivationEventKind : uint8_t {
 	COMPLETE,
 	INTERNAL
 };
+
+enum class InternalEventType : uint8_t {
+	NONE = 0,
+	HASH_JOIN_TABLE_INIT,
+	HASH_JOIN_FINALIZE,
+	HASH_JOIN_REPARTITION,
+	HASH_AGGREGATE_FINALIZE,
+	HASH_AGGREGATE_DISTINCT_FINALIZE,
+	UNGROUPED_AGGREGATE_DISTINCT_FINALIZE,
+	RANGE_JOIN_MATERIALIZE,
+	ARROW_MERGE,
+	COPY_REMAINING_BATCHES
+};
+
+const char *InternalEventTypeToString(InternalEventType type);
 
 class Event : public enable_shared_from_this<Event> {
 public:
@@ -71,6 +88,33 @@ public:
 	}
 	void MarkTaskBlocked();
 	void MarkTaskUnblocked();
+	void ConfigureInternalWork(InternalEventType type, idx_t total_units, string native_unit, bool scalable);
+	void ReportInternalWork(idx_t completed_units);
+	void ReportInternalWorkerTime(uint64_t duration_ns);
+	InternalEventType GetInternalEventType() const {
+		return internal_event_type;
+	}
+	idx_t GetInternalEventPosition() const {
+		return internal_event_position;
+	}
+	idx_t GetInternalTotalWork() const {
+		return internal_total_work;
+	}
+	idx_t GetInternalCompletedWork() const {
+		return internal_completed_work.load();
+	}
+	uint64_t GetInternalWorkerTimeNs() const {
+		return internal_worker_time_ns.load();
+	}
+	const string &GetInternalNativeUnit() const {
+		return internal_native_unit;
+	}
+	bool InternalWorkScalable() const {
+		return internal_work_scalable;
+	}
+	bool InternalWorkTrackingEnabled() const {
+		return internal_work_tracking_enabled;
+	}
 
 	void SetQueryActivationInfo(idx_t group_id, QueryActivationEventKind kind, idx_t pipeline_id = 0);
 	bool HasQueryActivationInfo() const {
@@ -98,6 +142,9 @@ public:
 	}
 
 	virtual void PrintPipeline() {
+	}
+	virtual optional_ptr<Pipeline> GetOwningPipeline() {
+		return nullptr;
 	}
 	virtual bool GetPipelineWorkSnapshot(PipelineWorkSnapshot &) const {
 		return false;
@@ -149,6 +196,19 @@ protected:
 	bool energy_lifecycle_registered;
 	idx_t energy_lifecycle_group_id;
 	vector<uint64_t> energy_lifecycle_member_pipeline_ids;
+
+	//! Native work state for dynamically inserted executor events. Task counters are kept separately as demand.
+	InternalEventType internal_event_type;
+	idx_t internal_event_position;
+	idx_t internal_total_work;
+	atomic<idx_t> internal_completed_work;
+	atomic<uint64_t> internal_worker_time_ns;
+	string internal_native_unit;
+	bool internal_work_scalable;
+	bool internal_work_tracking_enabled;
+	PipelineThroughputEstimate internal_historical_throughput;
+	PipelineContinuationEstimate internal_continuation_estimate;
+	PipelineLifecycleTailEstimate internal_tail_estimate;
 };
 
 } // namespace duckdb

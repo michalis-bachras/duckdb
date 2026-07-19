@@ -509,6 +509,8 @@ private:
 
 void HashAggregateFinalizeEvent::Schedule() {
 	vector<shared_ptr<Task>> tasks;
+	ConfigureInternalWork(InternalEventType::HASH_AGGREGATE_FINALIZE, MaxValue<idx_t>(op.groupings.size(), 1),
+	                      "aggregate_grouping", false);
 	tasks.push_back(make_uniq<HashAggregateFinalizeTask>(context, *pipeline, shared_from_this(), op, gstate));
 	D_ASSERT(!tasks.empty());
 	SetTasks(std::move(tasks));
@@ -518,6 +520,7 @@ TaskExecutionResult HashAggregateFinalizeTask::ExecuteTask(TaskExecutionMode mod
 	op.FinalizeInternal(pipeline, *event, context, gstate, false);
 	D_ASSERT(!gstate.finished);
 	gstate.finished = true;
+	event->ReportInternalWork(MaxValue<idx_t>(op.groupings.size(), 1));
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }
@@ -578,10 +581,27 @@ private:
 	idx_t aggregation_idx = 0;
 	idx_t payload_idx = 0;
 	idx_t next_payload_idx = 0;
+	SourceThroughputCounters internal_work;
+	idx_t reported_work_units = 0;
 };
 
 void HashAggregateDistinctFinalizeEvent::Schedule() {
 	auto n_tasks = CreateGlobalSources();
+	idx_t total_work = 0;
+	for (idx_t grouping_idx = 0; grouping_idx < op.groupings.size(); grouping_idx++) {
+		auto &grouping = op.groupings[grouping_idx];
+		auto &distinct_state = *gstate.grouping_states[grouping_idx].distinct_state;
+		for (idx_t table_idx = 0; table_idx < grouping.distinct_data->radix_tables.size(); table_idx++) {
+			if (!grouping.distinct_data->radix_tables[table_idx]) {
+				continue;
+			}
+			total_work += grouping.distinct_data->radix_tables[table_idx]->GetSourceInputVolume(
+			                  *distinct_state.radix_states[table_idx])
+			                  .native_units;
+		}
+	}
+	ConfigureInternalWork(InternalEventType::HASH_AGGREGATE_DISTINCT_FINALIZE, total_work,
+	                      "aggregate_partition_phase", true);
 	n_tasks = MinValue<idx_t>(n_tasks, NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
 	vector<shared_ptr<Task>> tasks;
 	for (idx_t i = 0; i < n_tasks; i++) {
@@ -633,6 +653,9 @@ TaskExecutionResult HashAggregateDistinctFinalizeTask::ExecuteTask(TaskExecution
 	for (; grouping_idx < op.groupings.size(); grouping_idx++) {
 		auto res = AggregateDistinctGrouping(grouping_idx);
 		if (res == TaskExecutionResult::TASK_BLOCKED) {
+			auto completed = internal_work.work_units_touched - reported_work_units;
+			event->ReportInternalWork(completed);
+			reported_work_units += completed;
 			return res;
 		}
 		D_ASSERT(res == TaskExecutionResult::TASK_FINISHED);
@@ -641,6 +664,9 @@ TaskExecutionResult HashAggregateDistinctFinalizeTask::ExecuteTask(TaskExecution
 		next_payload_idx = 0;
 		local_sink_state = nullptr;
 	}
+	auto completed = internal_work.work_units_touched - reported_work_units;
+	event->ReportInternalWork(completed);
+	reported_work_units += completed;
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }
@@ -709,7 +735,7 @@ TaskExecutionResult HashAggregateDistinctFinalizeTask::AggregateDistinctGrouping
 		}
 		auto &local_source = *radix_table_lstate;
 		OperatorSourceInput source_input {*finalize_event.global_source_states[grouping_idx][agg_idx], local_source,
-		                                  interrupt_state};
+		                                  interrupt_state, &internal_work};
 
 		// Create a duplicate of the output_chunk, because of multi-threading we cant alter the original
 		DataChunk output_chunk;

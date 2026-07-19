@@ -148,8 +148,10 @@ public:
 		auto &sort_global = *table.global_source;
 		auto sort_local = sort.GetLocalSourceState(execution, sort_global);
 		InterruptState interrupt((weak_ptr<Task>(shared_from_this())));
-		OperatorSourceInput input {sort_global, *sort_local, interrupt};
+		SourceThroughputCounters internal_work;
+		OperatorSourceInput input {sort_global, *sort_local, interrupt, &internal_work};
 		sort.MaterializeSortedRun(execution, input);
+		event->ReportInternalWork(internal_work.work_units_touched);
 		if (++table.tasks_completed == tasks_scheduled) {
 			table.sorted = sort.GetSortedRun(sort_global);
 			if (!table.sorted) {
@@ -196,6 +198,9 @@ public:
 		vector<shared_ptr<Task>> tasks;
 
 		const auto tasks_scheduled = MinValue<idx_t>(num_threads, table.global_source->MaxThreads());
+		auto volume = table.global_source->GetSourceInputVolume();
+		ConfigureInternalWork(InternalEventType::RANGE_JOIN_MATERIALIZE, volume.native_units,
+		                      volume.native_unit.empty() ? "sort_partition" : volume.native_unit, true);
 		for (idx_t tnum = 0; tnum < tasks_scheduled; ++tnum) {
 			tasks.push_back(
 			    make_uniq<RangeJoinMaterializeTask>(*pipeline, shared_from_this(), client, table, tasks_scheduled));

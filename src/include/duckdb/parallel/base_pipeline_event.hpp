@@ -22,6 +22,9 @@ public:
 	void PrintPipeline() override {
 		pipeline->Print();
 	}
+	optional_ptr<Pipeline> GetOwningPipeline() override {
+		return pipeline.get();
+	}
 	bool GetPipelineWorkSnapshot(PipelineWorkSnapshot &snapshot) const override {
 		if (!pipeline) {
 			return false;
@@ -41,15 +44,48 @@ public:
 			snapshot.parallelism_valid = scheduled_tasks > 0;
 		};
 		if (GetQueryActivationKind() != QueryActivationEventKind::PIPELINE) {
-			if (!pipeline->GetWorkSnapshot(snapshot)) {
-				snapshot = PipelineWorkSnapshot();
-			}
+			PipelineWorkSnapshot pipeline_snapshot;
+			pipeline->GetWorkSnapshot(pipeline_snapshot);
+			snapshot = PipelineWorkSnapshot();
 			snapshot.pipeline_id = pipeline->GetProfilerPipelineId();
-			snapshot.source_input_kind = "lifecycle";
+			snapshot.profile_identity = pipeline_snapshot.profile_identity;
+			snapshot.lifecycle_tail_estimate = pipeline_snapshot.lifecycle_tail_estimate;
+			snapshot.internal_event_position = GetInternalEventPosition();
+			snapshot.internal_event_type = InternalEventTypeToString(GetInternalEventType());
+			snapshot.source_input_kind = GetQueryActivationKind() == QueryActivationEventKind::INTERNAL
+			                                 ? snapshot.internal_event_type
+			                                 : "lifecycle";
 			snapshot.source_input_confidence = "exact";
+			snapshot.native_unit = GetInternalNativeUnit();
+			snapshot.total_native_units = GetInternalTotalWork();
+			snapshot.total_chunks_equiv = GetInternalTotalWork();
+			snapshot.completed_native_units = MinValue(GetInternalCompletedWork(), GetInternalTotalWork());
+			snapshot.completed_chunks_equiv = snapshot.completed_native_units;
+			snapshot.remaining_chunks_equiv = snapshot.total_chunks_equiv - snapshot.completed_chunks_equiv;
+			snapshot.throughput_completed_chunks_equiv = snapshot.completed_chunks_equiv;
+			snapshot.throughput_worker_time_ns = GetInternalWorkerTimeNs();
+			snapshot.historical_throughput_estimate = internal_historical_throughput;
+			snapshot.continuation_estimate = internal_continuation_estimate;
+			snapshot.lifecycle_tail_estimate = internal_tail_estimate.valid ? internal_tail_estimate
+			                                                               : pipeline_snapshot.lifecycle_tail_estimate;
+			if (snapshot.throughput_completed_chunks_equiv > 0 && snapshot.throughput_worker_time_ns > 0) {
+				snapshot.single_worker_chunks_per_s =
+				    static_cast<double>(snapshot.throughput_completed_chunks_equiv) * 1000000000.0 /
+				    static_cast<double>(snapshot.throughput_worker_time_ns);
+				snapshot.throughput_valid = true;
+				snapshot.selected_throughput_valid = true;
+				snapshot.selected_throughput_is_live = true;
+				snapshot.selected_single_worker_chunks_per_s = snapshot.single_worker_chunks_per_s;
+			} else if (internal_historical_throughput.valid) {
+				snapshot.selected_throughput_valid = true;
+				snapshot.selected_single_worker_chunks_per_s = internal_historical_throughput.ewma_work_units_per_s > 0
+				                                                     ? internal_historical_throughput.ewma_work_units_per_s
+				                                                     : internal_historical_throughput.mean_work_units_per_s;
+			}
 			snapshot.valid = true;
-			snapshot.scalable = false;
 			populate_parallelism(snapshot);
+			snapshot.scalable = GetQueryActivationKind() == QueryActivationEventKind::INTERNAL &&
+			                    InternalWorkScalable() && snapshot.preferred_parallelism > 1;
 			return true;
 		}
 		auto has_work_snapshot = pipeline->GetWorkSnapshot(snapshot);

@@ -30,7 +30,7 @@ class ArrowBatchTask : public ExecutorTask {
 public:
 	ArrowBatchTask(ArrowQueryResult &result, vector<idx_t> record_batch_indices, Executor &executor,
 	               shared_ptr<Event> event_p, BatchCollectionChunkScanState scan_state, vector<string> names,
-	               idx_t batch_size);
+	               idx_t batch_size, idx_t tuple_count);
 	void ProduceRecordBatches();
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override;
 
@@ -45,6 +45,7 @@ private:
 	idx_t batch_size;
 	vector<string> names;
 	BatchCollectionChunkScanState scan_state;
+	idx_t tuple_count;
 };
 
 class ArrowMergeEvent : public BasePipelineEvent {

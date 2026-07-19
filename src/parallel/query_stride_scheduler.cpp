@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/parallel/query_stride_scheduler.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -671,6 +672,7 @@ void QueryStrideScheduler::MaybeAdvanceOptimizer() {
 		                                                    std::memory_order_acq_rel)) {
 			return;
 		}
+		EnergySystemSegmentScope energy_scope(db, EnergySystemCategory::STRIDE_SCHEDULER);
 		{
 			lock_guard<mutex> guard(state->registration_lock);
 			StartTrackingLocked(*state, now_ms);
@@ -689,6 +691,7 @@ void QueryStrideScheduler::MaybeAdvanceOptimizer() {
 	                                                    std::memory_order_acq_rel)) {
 		return;
 	}
+	EnergySystemSegmentScope energy_scope(db, EnergySystemCategory::STRIDE_SCHEDULER);
 	vector<QueryStrideTraceEntry> workload;
 	{
 		lock_guard<mutex> guard(state->registration_lock);

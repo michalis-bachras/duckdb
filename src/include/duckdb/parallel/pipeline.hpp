@@ -30,6 +30,8 @@ class Pipeline;
 
 struct PipelineWorkSnapshot {
 	idx_t pipeline_id = 0;
+	idx_t internal_event_position = 0;
+	string internal_event_type;
 	string source_input_kind;
 	string source_input_confidence;
 	idx_t total_rows = 0;
@@ -121,6 +123,7 @@ class Pipeline : public enable_shared_from_this<Pipeline> {
 	friend class PipelineFinishEvent;
 	friend class PipelineBuildState;
 	friend class MetaPipeline;
+	friend class Event;
 
 public:
 	explicit Pipeline(Executor &execution_context);

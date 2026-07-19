@@ -187,6 +187,8 @@ const char *PipelineThroughputEstimateLevelToString(PipelineThroughputEstimateLe
 		return "source";
 	case PipelineThroughputEstimateLevel::GLOBAL_COMPATIBLE:
 		return "global_compatible";
+	case PipelineThroughputEstimateLevel::SCALE_FACTOR:
+		return "scale_factor";
 	default:
 		return "none";
 	}
@@ -198,6 +200,8 @@ const char *PipelineLifecycleTailEstimateLevelToString(PipelineLifecycleTailEsti
 		return "exact";
 	case PipelineLifecycleTailEstimateLevel::GLOBAL:
 		return "global";
+	case PipelineLifecycleTailEstimateLevel::SCALE_FACTOR:
+		return "scale_factor";
 	default:
 		return "none";
 	}
@@ -213,6 +217,8 @@ const char *ContinuationEstimateLevelToString(ContinuationEstimateLevel level) {
 		return "source";
 	case ContinuationEstimateLevel::GLOBAL_RAW:
 		return "global_raw";
+	case ContinuationEstimateLevel::SCALE_FACTOR:
+		return "scale_factor";
 	default:
 		return "none";
 	}

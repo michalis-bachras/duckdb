@@ -476,6 +476,7 @@ public:
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		sink.hash_table->InitializePointerTable(entry_idx_from, entry_idx_to);
+		event->ReportInternalWork(entry_idx_to - entry_idx_from);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -504,6 +505,7 @@ public:
 		vector<shared_ptr<Task>> finalize_tasks;
 		auto &ht = *sink.hash_table;
 		const auto entry_count = ht.capacity;
+		ConfigureInternalWork(InternalEventType::HASH_JOIN_TABLE_INIT, entry_count, "hash_table_entry", true);
 		auto num_threads = NumericCast<idx_t>(sink.num_threads);
 
 		// we don't have to check whether it is too skewed here, as we only initialize the pointer table
@@ -536,6 +538,7 @@ public:
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		sink.hash_table->Finalize(chunk_idx_from, chunk_idx_to, parallel);
+		event->ReportInternalWork(chunk_idx_to - chunk_idx_from);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -565,6 +568,7 @@ public:
 		vector<shared_ptr<Task>> finalize_tasks;
 		auto &ht = *sink.hash_table;
 		const auto chunk_count = ht.GetDataCollection().ChunkCount();
+		ConfigureInternalWork(InternalEventType::HASH_JOIN_FINALIZE, chunk_count, "hash_table_chunk", true);
 
 		// if the keys are too skewed, we finalize single-threaded
 		if (FinalizeSingleThreaded(sink, true)) {
@@ -615,12 +619,14 @@ void HashJoinGlobalSinkState::InitializeProbeSpill() {
 class HashJoinRepartitionTask : public ExecutorTask {
 public:
 	HashJoinRepartitionTask(shared_ptr<Event> event_p, ClientContext &context, JoinHashTable &global_ht,
-	                        JoinHashTable &local_ht, const PhysicalOperator &op_p)
-	    : ExecutorTask(context, std::move(event_p), op_p), global_ht(global_ht), local_ht(local_ht) {
+	                        JoinHashTable &local_ht, idx_t work_bytes_p, const PhysicalOperator &op_p)
+	    : ExecutorTask(context, std::move(event_p), op_p), global_ht(global_ht), local_ht(local_ht),
+	      work_bytes(work_bytes_p) {
 	}
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		local_ht.Repartition(global_ht);
+		event->ReportInternalWork(work_bytes);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -632,6 +638,7 @@ public:
 private:
 	JoinHashTable &global_ht;
 	JoinHashTable &local_ht;
+	idx_t work_bytes;
 };
 
 class HashJoinRepartitionEvent : public BasePipelineEvent {
@@ -679,10 +686,14 @@ public:
 
 		vector<shared_ptr<Task>> partition_tasks;
 		partition_tasks.reserve(local_hts.size());
+		idx_t scheduled_bytes = 0;
 		for (auto &local_ht : local_hts) {
-			partition_tasks.push_back(
-			    make_uniq<HashJoinRepartitionTask>(shared_from_this(), context, *sink.hash_table, *local_ht, op));
+			auto work_bytes = local_ht->GetSinkCollection().SizeInBytes();
+			scheduled_bytes += work_bytes;
+			partition_tasks.push_back(make_uniq<HashJoinRepartitionTask>(shared_from_this(), context, *sink.hash_table,
+			                                                               *local_ht, work_bytes, op));
 		}
+		ConfigureInternalWork(InternalEventType::HASH_JOIN_REPARTITION, scheduled_bytes, "byte", true);
 		SetTasks(std::move(partition_tasks));
 	}
 

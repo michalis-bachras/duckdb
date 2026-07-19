@@ -487,6 +487,8 @@ private:
 	idx_t aggregation_idx = 0;
 	unique_ptr<LocalSourceState> radix_table_lstate;
 	bool blocked = false;
+	SourceThroughputCounters internal_work;
+	idx_t reported_work_units = 0;
 };
 
 void UngroupedDistinctAggregateFinalizeEvent::Schedule() {
@@ -497,6 +499,7 @@ void UngroupedDistinctAggregateFinalizeEvent::Schedule() {
 	idx_t n_tasks = 0;
 	idx_t payload_idx = 0;
 	idx_t next_payload_idx = 0;
+	idx_t total_work = 0;
 	for (idx_t agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto &aggregate = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 
@@ -514,11 +517,14 @@ void UngroupedDistinctAggregateFinalizeEvent::Schedule() {
 		// Create global state for scanning
 		auto table_idx = distinct_data.info.table_map.at(agg_idx);
 		auto &radix_table_p = *distinct_data.radix_tables[table_idx];
+		total_work += radix_table_p.GetSourceInputVolume(*gstate.distinct_state->radix_states[table_idx]).native_units;
 		n_tasks += radix_table_p.MaxThreads(*gstate.distinct_state->radix_states[table_idx]);
 		global_source_states.push_back(radix_table_p.GetGlobalSourceState(context));
 	}
 	n_tasks = MaxValue<idx_t>(n_tasks, 1);
 	n_tasks = MinValue<idx_t>(n_tasks, NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+	ConfigureInternalWork(InternalEventType::UNGROUPED_AGGREGATE_DISTINCT_FINALIZE, total_work,
+	                      "aggregate_partition_phase", true);
 
 	vector<shared_ptr<Task>> tasks;
 	for (idx_t i = 0; i < n_tasks; i++) {
@@ -532,8 +538,14 @@ void UngroupedDistinctAggregateFinalizeEvent::Schedule() {
 TaskExecutionResult UngroupedDistinctAggregateFinalizeTask::ExecuteTask(TaskExecutionMode mode) {
 	auto res = AggregateDistinct();
 	if (res == TaskExecutionResult::TASK_BLOCKED) {
+		auto completed = internal_work.work_units_touched - reported_work_units;
+		event->ReportInternalWork(completed);
+		reported_work_units += completed;
 		return res;
 	}
+	auto completed = internal_work.work_units_touched - reported_work_units;
+	event->ReportInternalWork(completed);
+	reported_work_units += completed;
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }
@@ -575,7 +587,8 @@ TaskExecutionResult UngroupedDistinctAggregateFinalizeTask::AggregateDistinct() 
 
 		auto &sink = *distinct_state.radix_states[table_idx];
 		InterruptState interrupt_state(shared_from_this());
-		OperatorSourceInput source_input {*finalize_event.global_source_states[agg_idx], lstate, interrupt_state};
+		OperatorSourceInput source_input {*finalize_event.global_source_states[agg_idx], lstate, interrupt_state,
+		                                  &internal_work};
 
 		DataChunk output_chunk;
 		output_chunk.Initialize(executor.context, distinct_state.distinct_output_chunks[table_idx]->GetTypes());

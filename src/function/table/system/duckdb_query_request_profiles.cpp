@@ -36,6 +36,16 @@ struct DuckDBQueryRequestPipelineInstancesData : public GlobalTableFunctionState
 	idx_t offset = 0;
 };
 
+struct DuckDBQueryRequestInternalEventProfilesData : public GlobalTableFunctionState {
+	vector<QueryRequestInternalEventProfileSnapshot> profiles;
+	idx_t offset = 0;
+};
+
+struct DuckDBQueryRequestInternalEventInstancesData : public GlobalTableFunctionState {
+	vector<QueryRequestInternalEventInstanceSnapshot> instances;
+	idx_t offset = 0;
+};
+
 struct DuckDBQueryRequestContinuationProfilesData : public GlobalTableFunctionState {
 	vector<QueryRequestContinuationProfileSnapshot> profiles;
 	idx_t offset = 0;
@@ -465,6 +475,121 @@ static void DuckDBQueryRequestPipelineInstancesFunction(ClientContext &context, 
 		output.SetValue(col++, count, Value::DOUBLE(instance.normalized_downstream_suffix_ns));
 		output.SetValue(col++, count, Value::DOUBLE(instance.effective_ns_per_work_unit));
 		output.SetValue(col++, count, Value::BOOLEAN(instance.continuation_valid));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryRequestInternalEventProfilesBind(
+    ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names) {
+	const char *columns[] = {"template_id", "scale_factor", "pipeline_id", "pipeline_signature_hash",
+	                         "event_position", "event_type", "native_unit", "sample_count"};
+	for (idx_t i = 0; i < 8; i++) {
+		names.emplace_back(columns[i]);
+		return_types.emplace_back(i == 5 || i == 6 ? LogicalType::VARCHAR : LogicalType::UBIGINT);
+	}
+	const char *metrics[] = {"mean_work_units_per_s", "ewma_work_units_per_s", "mean_ns_per_work_unit",
+	                         "p50_ns_per_work_unit", "p90_ns_per_work_unit", "mean_tail_ns", "p90_tail_ns"};
+	for (idx_t i = 0; i < 7; i++) {
+		names.emplace_back(metrics[i]);
+		return_types.emplace_back(LogicalType::DOUBLE);
+	}
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState>
+DuckDBQueryRequestInternalEventProfilesInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryRequestInternalEventProfilesData>();
+	result->profiles =
+	    DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetInternalEventProfilesSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryRequestInternalEventProfilesFunction(ClientContext &context, TableFunctionInput &data_p,
+	                                                          DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryRequestInternalEventProfilesData>();
+	idx_t count = 0;
+	while (data.offset < data.profiles.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &profile = data.profiles[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value::UBIGINT(profile.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(profile.scale_factor));
+		output.SetValue(col++, count, Value::UBIGINT(profile.pipeline_id));
+		output.SetValue(col++, count, Value::UBIGINT(profile.pipeline_signature_hash));
+		output.SetValue(col++, count, Value::UBIGINT(profile.event_position));
+		output.SetValue(col++, count, Value(profile.event_type));
+		output.SetValue(col++, count, Value(profile.native_unit));
+		output.SetValue(col++, count, Value::UBIGINT(profile.sample_count));
+		output.SetValue(col++, count, Value::DOUBLE(profile.mean_work_units_per_s));
+		output.SetValue(col++, count, Value::DOUBLE(profile.ewma_work_units_per_s));
+		output.SetValue(col++, count, Value::DOUBLE(profile.mean_ns_per_work_unit));
+		output.SetValue(col++, count, Value::DOUBLE(profile.p50_ns_per_work_unit));
+		output.SetValue(col++, count, Value::DOUBLE(profile.p90_ns_per_work_unit));
+		output.SetValue(col++, count, Value::DOUBLE(profile.mean_tail_ns));
+		output.SetValue(col++, count, Value::DOUBLE(profile.p90_tail_ns));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryRequestInternalEventInstancesBind(
+    ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names) {
+	const char *integer_columns[] = {"db_query_id", "request_id", "template_id", "scale_factor", "pipeline_id",
+	                                 "pipeline_signature_hash", "event_position"};
+	for (idx_t i = 0; i < 7; i++) {
+		names.emplace_back(integer_columns[i]);
+		return_types.emplace_back(LogicalType::UBIGINT);
+	}
+	names.emplace_back("event_type");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("native_unit");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	const char *work_columns[] = {"total_work_units", "completed_work_units", "worker_time_ns", "start_ns", "finish_ns"};
+	for (idx_t i = 0; i < 5; i++) {
+		names.emplace_back(work_columns[i]);
+		return_types.emplace_back(LogicalType::UBIGINT);
+	}
+	names.emplace_back("work_units_per_s");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("ns_per_work_unit");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("tail_to_pipeline_end_ns");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState>
+DuckDBQueryRequestInternalEventInstancesInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryRequestInternalEventInstancesData>();
+	result->instances =
+	    DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().GetInternalEventInstancesSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryRequestInternalEventInstancesFunction(ClientContext &context, TableFunctionInput &data_p,
+	                                                           DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryRequestInternalEventInstancesData>();
+	idx_t count = 0;
+	while (data.offset < data.instances.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &instance = data.instances[data.offset++];
+		idx_t col = 0;
+		output.SetValue(col++, count, Value::UBIGINT(instance.db_query_id));
+		output.SetValue(col++, count, Value::UBIGINT(instance.request_id));
+		output.SetValue(col++, count, Value::UBIGINT(instance.template_id));
+		output.SetValue(col++, count, Value::UBIGINT(instance.scale_factor));
+		output.SetValue(col++, count, Value::UBIGINT(instance.pipeline_id));
+		output.SetValue(col++, count, Value::UBIGINT(instance.pipeline_signature_hash));
+		output.SetValue(col++, count, Value::UBIGINT(instance.event_position));
+		output.SetValue(col++, count, Value(instance.event_type));
+		output.SetValue(col++, count, Value(instance.native_unit));
+		output.SetValue(col++, count, Value::UBIGINT(instance.total_work_units));
+		output.SetValue(col++, count, Value::UBIGINT(instance.completed_work_units));
+		output.SetValue(col++, count, Value::UBIGINT(instance.worker_time_ns));
+		output.SetValue(col++, count, Value::UBIGINT(instance.start_ns));
+		output.SetValue(col++, count, Value::UBIGINT(instance.finish_ns));
+		output.SetValue(col++, count, Value::DOUBLE(instance.work_units_per_s));
+		output.SetValue(col++, count, Value::DOUBLE(instance.ns_per_work_unit));
+		output.SetValue(col++, count, Value::UBIGINT(instance.tail_to_pipeline_end_ns));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -1393,6 +1518,14 @@ void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	                              DuckDBQueryRequestPipelineInstancesFunction,
 	                              DuckDBQueryRequestPipelineInstancesBind,
 	                              DuckDBQueryRequestPipelineInstancesInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_request_internal_event_profiles", {},
+	                              DuckDBQueryRequestInternalEventProfilesFunction,
+	                              DuckDBQueryRequestInternalEventProfilesBind,
+	                              DuckDBQueryRequestInternalEventProfilesInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_request_internal_event_instances", {},
+	                              DuckDBQueryRequestInternalEventInstancesFunction,
+	                              DuckDBQueryRequestInternalEventInstancesBind,
+	                              DuckDBQueryRequestInternalEventInstancesInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_request_continuation_profiles", {},
 	                              DuckDBQueryRequestContinuationProfilesFunction,
 	                              DuckDBQueryRequestContinuationProfilesBind,

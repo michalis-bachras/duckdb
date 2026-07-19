@@ -206,6 +206,20 @@ struct PipelineProfilingInfo {
 	vector<PipelinePerfCPUCounters> per_cpu_perf;
 };
 
+//! Query-scoped measurements for a dynamically inserted event owned by a physical pipeline.
+struct InternalEventProfilingInfo {
+	idx_t pipeline_id = 0;
+	uint64_t pipeline_signature_hash = 0;
+	idx_t event_position = 0;
+	string event_type;
+	string native_unit;
+	idx_t total_work_units = 0;
+	idx_t completed_work_units = 0;
+	uint64_t worker_time_ns = 0;
+	uint64_t start_ns = 0;
+	uint64_t finish_ns = 0;
+};
+
 //! The OperatorProfiler measures timings of individual operators
 //! This class exists once for all operators and collects `OperatorInfo` for each operator
 class OperatorProfiler {
@@ -299,6 +313,15 @@ public:
 	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks);
 	DUCKDB_API vector<PipelineProfilingInfo> GetPipelineProfilesSnapshot() const;
+	DUCKDB_API void RecordInternalEventStart(idx_t pipeline_id, uint64_t pipeline_signature_hash,
+	                                        idx_t event_position, const string &event_type,
+	                                        const string &native_unit, idx_t total_work_units);
+	DUCKDB_API void RecordInternalEventWork(idx_t pipeline_id, idx_t event_position, const string &event_type,
+	                                       idx_t completed_work_units);
+	DUCKDB_API void RecordInternalEventWorkerTime(idx_t pipeline_id, idx_t event_position, const string &event_type,
+	                                             uint64_t duration_ns);
+	DUCKDB_API void RecordInternalEventFinish(idx_t pipeline_id, idx_t event_position, const string &event_type);
+	DUCKDB_API vector<InternalEventProfilingInfo> GetInternalEventProfilesSnapshot() const;
 
 	DUCKDB_API string QueryTreeToString() const;
 	DUCKDB_API void QueryTreeToStream(std::ostream &str) const;
@@ -366,10 +389,12 @@ private:
 	vector<PipelineProfilingInfo> pipeline_profiles;
 	//! Pipeline task execution intervals emitted alongside the operator tree.
 	vector<PipelineTaskProfilingInfo> pipeline_task_profiles;
+	vector<InternalEventProfilingInfo> internal_event_profiles;
 	//! Fast lookup for pipeline records by stable id.
 	unordered_map<idx_t, idx_t> pipeline_profile_index;
 	//! Fast lookup for task records by stable id.
 	unordered_map<idx_t, idx_t> pipeline_task_profile_index;
+	unordered_map<string, idx_t> internal_event_profile_index;
 	//! Next stable per-query pipeline profile id.
 	idx_t next_pipeline_profile_id;
 	//! Next stable per-query pipeline task profile id.

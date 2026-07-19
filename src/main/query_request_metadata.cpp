@@ -188,8 +188,9 @@ void QueryRequestMetadataManager::EndQuery(ClientContext &context, bool success)
 	}
 	auto query_end_ns = TimestampNs();
 	auto pipeline_profiles = QueryProfiler::Get(context).GetPipelineProfilesSnapshot();
+	auto internal_event_profiles = QueryProfiler::Get(context).GetInternalEventProfilesSnapshot();
 	DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().RecordQueryCompletion(
-	    metadata, query_end_ns, pipeline_profiles);
+	    metadata, query_end_ns, pipeline_profiles, internal_event_profiles);
 }
 
 bool QueryRequestMetadataManager::HasActiveMetadata(ClientContext &context) {

@@ -264,9 +264,12 @@ public:
 	}
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		idx_t completed_batches = 0;
 		while (op.ExecuteTask(context, gstate)) {
+			completed_batches++;
 			op.FlushBatchData(context, gstate);
 		}
+		event->ReportInternalWork(completed_batches);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -294,6 +297,8 @@ public:
 public:
 	void Schedule() override {
 		vector<shared_ptr<Task>> tasks;
+		auto total_batches = gstate.task_manager.TaskCount();
+		ConfigureInternalWork(InternalEventType::COPY_REMAINING_BATCHES, total_batches, "copy_batch", true);
 		for (idx_t i = 0; i < idx_t(TaskScheduler::GetScheduler(context).NumberOfThreads()); i++) {
 			auto process_task =
 			    make_uniq<ProcessRemainingBatchesTask>(pipeline->executor, shared_from_this(), gstate, context, op);
