@@ -975,16 +975,16 @@ TEST_CASE("SLA scheduler preserves worker-only database invariants", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
-	REQUIRE_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_FAIL(con.Query("SET scheduler_policy='sla'"));
 	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
 	REQUIRE_NO_FAIL(con.Query("SET external_threads=1"));
-	REQUIRE_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_FAIL(con.Query("SET scheduler_policy='sla'"));
 	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
-	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla'"));
 	REQUIRE_FAIL(con.Query("SET external_threads=1"));
 	REQUIRE_FAIL(con.Query("SET query_worker_only_execution_enable=false"));
 	REQUIRE_FAIL(con.Query("RESET query_worker_only_execution_enable"));
-	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=false"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='default'"));
 	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=false"));
 }
 
@@ -996,7 +996,7 @@ TEST_CASE("SLA scheduler rejects an untrained tagged data pipeline", "[api]") {
 	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
 	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
 	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
-	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla'"));
 	REQUIRE_FAIL(con.Query(MetadataQuery(9101, 91, 10, "SELECT sum(i) FROM sla_untrained_t")));
 	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
 }
@@ -1020,7 +1020,7 @@ TEST_CASE("SLA scheduler executes a trained tagged query without debug mode", "[
 	}
 	REQUIRE(store.PipelineProfileCount() > 0);
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=10"));
-	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla'"));
 	auto &scheduler = db.instance->GetQuerySLAScheduler();
 	scheduler.ClearEpochTrace();
 	auto epochs_before = scheduler.EpochRunCount();
@@ -1051,7 +1051,7 @@ TEST_CASE("SLA scheduler records bounded epoch predictions only for debug querie
 		REQUIRE_NO_FAIL(con.Query(MetadataQuery(9250 + i, 95, 10, body)));
 	}
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=5"));
-	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla'"));
 	auto &scheduler = db.instance->GetQuerySLAScheduler();
 	scheduler.ClearEpochTrace();
 	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9260, 95, 10, body)));
@@ -1123,7 +1123,7 @@ TEST_CASE("SLA scheduler remains work-conserving when modeled SLA gains are zero
 		REQUIRE_NO_FAIL(con.Query(MetadataQuery(9270 + i, 96, 10, body)));
 	}
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=5"));
-	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla'"));
 	auto &scheduler = db.instance->GetQuerySLAScheduler();
 	scheduler.ClearEpochTrace();
 	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9280, 96, 10, 0.0, body)));
@@ -1159,7 +1159,7 @@ TEST_CASE("SLA scheduler coordinates concurrent trained queries within demand ca
 		REQUIRE_NO_FAIL(setup.Query(MetadataQuery(9400 + i, 94, 10, body)));
 	}
 	REQUIRE_NO_FAIL(setup.Query("SET query_sla_scheduler_epoch_ms=5"));
-	REQUIRE_NO_FAIL(setup.Query("SET query_sla_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET scheduler_policy='sla'"));
 
 	Connection first(db);
 	Connection second(db);
