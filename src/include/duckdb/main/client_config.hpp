@@ -92,6 +92,8 @@ struct ClientConfig {
 	bool query_activation_scheduler_enabled = false;
 	//! Enable debug logging for query admission/activation scheduler state.
 	bool query_activation_debug_enabled = false;
+	//! Connection-local multiplier applied to STRIDE query priorities.
+	double stride_user_priority = 1.0;
 	//! Prototype Linux RAPL/perf_event pipeline energy attribution.
 	EnergyAttributionSettings energy_attribution;
 

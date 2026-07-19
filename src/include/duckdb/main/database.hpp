@@ -38,6 +38,7 @@ class ResultSetManager;
 class QueryAdmissionController;
 class QueryRequestProfileStore;
 class QuerySLAScheduler;
+class QueryStrideScheduler;
 
 class DatabaseInstance : public enable_shared_from_this<DatabaseInstance> {
 	friend class DuckDB;
@@ -66,6 +67,9 @@ public:
 	DUCKDB_API QueryAdmissionController &GetQueryAdmissionController();
 	DUCKDB_API QueryRequestProfileStore &GetQueryRequestProfileStore();
 	DUCKDB_API QuerySLAScheduler &GetQuerySLAScheduler();
+	DUCKDB_API QueryStrideScheduler &GetQueryStrideScheduler();
+	QuerySchedulerPolicy GetQuerySchedulerPolicy() const;
+	void SetQuerySchedulerPolicy(QuerySchedulerPolicy policy);
 
 	DUCKDB_API const duckdb_ext_api_v1 GetExtensionAPIV1();
 
@@ -106,6 +110,8 @@ private:
 	unique_ptr<QueryAdmissionController> query_admission_controller;
 	unique_ptr<QueryRequestProfileStore> query_request_profile_store;
 	unique_ptr<QuerySLAScheduler> query_sla_scheduler;
+	unique_ptr<QueryStrideScheduler> query_stride_scheduler;
+	atomic<QuerySchedulerPolicy> query_scheduler_policy {QuerySchedulerPolicy::DEFAULT};
 
 	duckdb_ext_api_v1 (*create_api_v1)();
 };

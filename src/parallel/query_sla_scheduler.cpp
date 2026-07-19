@@ -494,11 +494,16 @@ QuerySLAScheduler::~QuerySLAScheduler() {
 }
 
 bool QuerySLAScheduler::Enabled() const {
-	return db.config.options.query_sla_scheduler_enabled;
+	return db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA;
 }
 
 idx_t QuerySLAScheduler::EpochMs() const {
 	return db.config.options.query_sla_scheduler_epoch_ms;
+}
+
+idx_t QuerySLAScheduler::ActiveQueryCount() const {
+	lock_guard<mutex> guard(state->lock);
+	return state->queries.size();
 }
 
 void QuerySLAScheduler::RegisterQuery(const QueryRequestMetadata &metadata, ProducerToken &producer,

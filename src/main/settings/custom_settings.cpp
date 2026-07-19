@@ -27,6 +27,8 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
+#include "duckdb/parallel/query_stride_scheduler.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/storage/external_file_cache.hpp"
@@ -40,6 +42,8 @@
 #include "duckdb/storage/block_allocator.hpp"
 
 #include "mbedtls_wrapper.hpp"
+
+#include <cmath>
 
 namespace duckdb {
 
@@ -1465,8 +1469,8 @@ bool EnableProgressBarSetting::OnLocalReset(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 void ExternalThreadsSetting::OnSet(SettingCallbackInfo &info, Value &input) {
 	auto new_external_threads = input.GetValue<uint64_t>();
-	if (new_external_threads > 0 && info.config.options.query_sla_scheduler_enabled) {
-		throw InvalidInputException("external_threads must remain zero while query_sla_scheduler_enable=true");
+	if (new_external_threads > 0 && info.config.options.query_scheduler_policy != QuerySchedulerPolicy::DEFAULT) {
+		throw InvalidInputException("external_threads must remain zero while scheduler_policy is sla or stride");
 	}
 	if (info.db) {
 		TaskScheduler::GetScheduler(*info.db).SetThreads(info.config.options.maximum_threads, new_external_threads);
@@ -1903,17 +1907,18 @@ Value QueryActivationDebugEnableSetting::GetSetting(const ClientContext &context
 void QueryWorkerOnlyExecutionEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
 	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
 	auto enabled = BooleanValue::Get(value);
-	if (!enabled && config.options.query_sla_scheduler_enabled) {
+	if (!enabled && config.options.query_scheduler_policy != QuerySchedulerPolicy::DEFAULT) {
 		throw InvalidInputException(
-		    "query_worker_only_execution_enable must remain true while query_sla_scheduler_enable=true");
+		    "query_worker_only_execution_enable must remain true while scheduler_policy is sla or stride");
 	}
 	config.options.query_worker_only_execution_enabled = enabled;
 }
 
 void QueryWorkerOnlyExecutionEnableSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
-	if (config.options.query_sla_scheduler_enabled && !DBConfigOptions().query_worker_only_execution_enabled) {
+	if (config.options.query_scheduler_policy != QuerySchedulerPolicy::DEFAULT &&
+	    !DBConfigOptions().query_worker_only_execution_enabled) {
 		throw InvalidInputException(
-		    "query_worker_only_execution_enable must remain true while query_sla_scheduler_enable=true");
+		    "query_worker_only_execution_enable must remain true while scheduler_policy is sla or stride");
 	}
 	config.options.query_worker_only_execution_enabled = DBConfigOptions().query_worker_only_execution_enabled;
 }
@@ -1922,23 +1927,71 @@ Value QueryWorkerOnlyExecutionEnableSetting::GetSetting(const ClientContext &con
 	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_worker_only_execution_enabled);
 }
 
-void QuerySLASchedulerEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
-	auto value = BooleanValue::Get(input.DefaultCastAs(LogicalType::BOOLEAN));
-	if (value && !config.options.query_worker_only_execution_enabled) {
-		throw InvalidInputException("query_sla_scheduler_enable requires query_worker_only_execution_enable=true");
+void QuerySchedulerPolicySetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto value = StringUtil::Lower(input.ToString());
+	QuerySchedulerPolicy policy;
+	if (value == "default") {
+		policy = QuerySchedulerPolicy::DEFAULT;
+	} else if (value == "sla") {
+		policy = QuerySchedulerPolicy::SLA;
+	} else if (value == "stride") {
+		policy = QuerySchedulerPolicy::STRIDE;
+	} else {
+		throw InvalidInputException("scheduler_policy must be one of: default, sla, stride");
 	}
-	if (value && db && TaskScheduler::GetScheduler(*db).ExternalThreads() != 0) {
-		throw InvalidInputException("query_sla_scheduler_enable requires external_threads=0");
+	if (db && policy != config.options.query_scheduler_policy &&
+	    (db->GetQuerySLAScheduler().ActiveQueryCount() != 0 || db->GetQueryStrideScheduler().ActiveQueryCount() != 0)) {
+		throw InvalidInputException("scheduler_policy cannot change while scheduler-managed queries are active");
 	}
-	config.options.query_sla_scheduler_enabled = value;
+	if (policy != QuerySchedulerPolicy::DEFAULT && !config.options.query_worker_only_execution_enabled) {
+		throw InvalidInputException("scheduler_policy=%s requires query_worker_only_execution_enable=true", value);
+	}
+	if (policy != QuerySchedulerPolicy::DEFAULT && db && TaskScheduler::GetScheduler(*db).ExternalThreads() != 0) {
+		throw InvalidInputException("scheduler_policy=%s requires external_threads=0", value);
+	}
+	config.options.query_scheduler_policy = policy;
+	if (db) {
+		TaskScheduler::GetScheduler(*db).SetQuerySchedulerPolicy(policy);
+	}
 }
 
-void QuerySLASchedulerEnableSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
-	config.options.query_sla_scheduler_enabled = DBConfigOptions().query_sla_scheduler_enabled;
+void QuerySchedulerPolicySetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	auto default_policy = DBConfigOptions().query_scheduler_policy;
+	if (db && default_policy != config.options.query_scheduler_policy &&
+	    (db->GetQuerySLAScheduler().ActiveQueryCount() != 0 || db->GetQueryStrideScheduler().ActiveQueryCount() != 0)) {
+		throw InvalidInputException("scheduler_policy cannot change while scheduler-managed queries are active");
+	}
+	config.options.query_scheduler_policy = default_policy;
+	if (db) {
+		TaskScheduler::GetScheduler(*db).SetQuerySchedulerPolicy(config.options.query_scheduler_policy);
+	}
 }
 
-Value QuerySLASchedulerEnableSetting::GetSetting(const ClientContext &context) {
-	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_sla_scheduler_enabled);
+Value QuerySchedulerPolicySetting::GetSetting(const ClientContext &context) {
+	switch (DBConfig::GetConfig(context).options.query_scheduler_policy) {
+	case QuerySchedulerPolicy::SLA:
+		return Value("sla");
+	case QuerySchedulerPolicy::STRIDE:
+		return Value("stride");
+	default:
+		return Value("default");
+	}
+}
+
+void StrideUserPrioritySetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.GetValue<double>();
+	if (!std::isfinite(value) || value <= 0) {
+		throw InvalidInputException("stride_user_priority must be finite and greater than zero");
+	}
+	ClientConfig::GetConfig(context).stride_user_priority = value;
+}
+
+void StrideUserPrioritySetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).stride_user_priority = ClientConfig().stride_user_priority;
+}
+
+Value StrideUserPrioritySetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(ClientConfig::GetConfig(context).stride_user_priority);
 }
 
 void QuerySLASchedulerEpochMsSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {

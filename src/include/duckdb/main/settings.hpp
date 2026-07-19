@@ -1085,14 +1085,25 @@ struct QueryWorkerOnlyExecutionEnableSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
-struct QuerySLASchedulerEnableSetting {
-	using RETURN_TYPE = bool;
-	static constexpr const char *Name = "query_sla_scheduler_enable";
+struct QuerySchedulerPolicySetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "scheduler_policy";
 	static constexpr const char *Description =
-	    "Enable database-scoped SLA-aware worker allocation for tagged analytical queries";
-	static constexpr const char *InputType = "BOOLEAN";
+	    "Select the database-scoped query worker scheduler: default, sla, or stride";
+	static constexpr const char *InputType = "VARCHAR";
 	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
 	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct StrideUserPrioritySetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "stride_user_priority";
+	static constexpr const char *Description =
+	    "Connection-local multiplier applied to adaptive and static STRIDE query priorities";
+	static constexpr const char *InputType = "DOUBLE";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
 	static Value GetSetting(const ClientContext &context);
 };
 

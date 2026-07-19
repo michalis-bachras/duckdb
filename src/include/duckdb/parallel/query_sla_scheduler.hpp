@@ -110,6 +110,7 @@ public:
 
 	bool Enabled() const;
 	idx_t EpochMs() const;
+	idx_t ActiveQueryCount() const;
 
 	void RegisterQuery(const QueryRequestMetadata &metadata, ProducerToken &producer, bool debug_trace_enabled);
 	void UnregisterQuery(uint64_t db_query_id);

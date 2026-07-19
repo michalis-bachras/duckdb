@@ -531,16 +531,20 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 
 		QueryRequestMetadata request_metadata;
 		auto has_request_metadata = QueryRequestMetadataManager::TryGetActive(context, request_metadata);
-		auto sla_enabled = DBConfig::GetConfig(context).options.query_sla_scheduler_enabled;
-		if (sla_enabled && has_request_metadata) {
+		auto scheduler_policy = scheduler.GetQuerySchedulerPolicy();
+		auto policy_enabled = scheduler_policy != QuerySchedulerPolicy::DEFAULT;
+		if (policy_enabled && has_request_metadata) {
 			if (!DBConfig::GetConfig(context).options.query_worker_only_execution_enabled) {
-				throw InvalidInputException("SLA scheduling requires query_worker_only_execution_enable=true");
+				throw InvalidInputException("The selected scheduler policy requires query_worker_only_execution_enable=true");
 			}
 			if (scheduler.ExternalThreads() != 0) {
-				throw InvalidInputException("SLA scheduling requires external_threads=0");
+				throw InvalidInputException("The selected scheduler policy requires external_threads=0");
 			}
 			if (!context.config.query_activation_scheduler_enabled) {
-				throw InvalidInputException("SLA scheduling requires query_activation_scheduler_enable=true");
+				throw InvalidInputException("The selected scheduler policy requires query_activation_scheduler_enable=true");
+			}
+			if (scheduler_policy == QuerySchedulerPolicy::STRIDE && context.config.query_admission_max_active != 128) {
+				throw InvalidInputException("scheduler_policy=stride requires query_admission_max_active=128");
 			}
 		}
 		if (context.config.query_activation_scheduler_enabled && has_request_metadata) {

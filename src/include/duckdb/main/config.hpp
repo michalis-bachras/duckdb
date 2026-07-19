@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "duckdb/common/enums/query_scheduler_policy.hpp"
+
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
 #include "duckdb/storage/storage_info.hpp"
 #include "duckdb/common/allocator.hpp"
@@ -111,8 +113,8 @@ struct DBConfigOptions {
 	idx_t maximum_threads = DConstants::INVALID_INDEX;
 	//! Enable materialized query execution where client threads wait instead of executing tasks.
 	bool query_worker_only_execution_enabled = false;
-	//! Enable the database-scoped SLA worker-allocation scheduler for tagged analytical queries.
-	bool query_sla_scheduler_enabled = false;
+	//! Database-scoped worker scheduling policy for tagged analytical queries.
+	QuerySchedulerPolicy query_scheduler_policy = QuerySchedulerPolicy::DEFAULT;
 	//! SLA scheduler epoch length in milliseconds.
 	idx_t query_sla_scheduler_epoch_ms = 200;
 	//! Whether or not to create and use a temporary directory to store intermediates that do not fit in memory

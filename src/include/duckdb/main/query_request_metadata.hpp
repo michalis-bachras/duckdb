@@ -22,6 +22,8 @@ struct QueryRequestMetadata {
 	uint64_t scale_factor = 0;
 	double sla_tag = 0;
 	double sla_penalty_per_s = 0;
+	//! Optional non-decaying STRIDE priority. Zero selects adaptive priority decay.
+	double stride_static_priority = 0;
 	uint64_t deadline_ns = 0;
 	uint64_t query_start_ns = 0;
 };

@@ -20,6 +20,7 @@
 #include "duckdb/main/query_admission_controller.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
+#include "duckdb/parallel/query_stride_scheduler.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -101,6 +102,7 @@ DatabaseInstance::~DatabaseInstance() {
 	query_admission_controller.reset();
 	query_request_profile_store.reset();
 	query_sla_scheduler.reset();
+	query_stride_scheduler.reset();
 
 	buffer_manager.reset();
 
@@ -284,6 +286,7 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	}
 
 	Configure(*config_ptr, database_path);
+	SetQuerySchedulerPolicy(config.options.query_scheduler_policy);
 
 	create_api_v1 = CreateAPIv1Wrapper;
 
@@ -304,6 +307,7 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	query_admission_controller = make_uniq<QueryAdmissionController>(*this);
 	query_request_profile_store = make_uniq<QueryRequestProfileStore>();
 	query_sla_scheduler = make_uniq<QuerySLAScheduler>(*this);
+	query_stride_scheduler = make_uniq<QueryStrideScheduler>(*this);
 
 	scheduler = make_uniq<TaskScheduler>(*this);
 	object_cache = make_uniq<ObjectCache>(*config.buffer_pool);
@@ -388,6 +392,14 @@ TaskScheduler &DatabaseInstance::GetScheduler() {
 	return *scheduler;
 }
 
+QuerySchedulerPolicy DatabaseInstance::GetQuerySchedulerPolicy() const {
+	return query_scheduler_policy.load(std::memory_order_acquire);
+}
+
+void DatabaseInstance::SetQuerySchedulerPolicy(QuerySchedulerPolicy policy) {
+	query_scheduler_policy.store(policy, std::memory_order_release);
+}
+
 ObjectCache &DatabaseInstance::GetObjectCache() {
 	return *object_cache;
 }
@@ -423,6 +435,13 @@ QuerySLAScheduler &DatabaseInstance::GetQuerySLAScheduler() {
 		throw InternalException("Query SLA scheduler is not initialized");
 	}
 	return *query_sla_scheduler;
+}
+
+QueryStrideScheduler &DatabaseInstance::GetQueryStrideScheduler() {
+	if (!query_stride_scheduler) {
+		throw InternalException("Query STRIDE scheduler is not initialized");
+	}
+	return *query_stride_scheduler;
 }
 
 ConnectionManager &DatabaseInstance::GetConnectionManager() {

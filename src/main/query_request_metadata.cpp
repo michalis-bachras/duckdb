@@ -111,6 +111,13 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 		result.parse_status = "missing_or_invalid_field";
 		return result;
 	}
+	auto static_priority = fields.find("stride_static_priority");
+	if (static_priority != fields.end() &&
+	    (!ParseDoubleStrict(static_priority->second, result.stride_static_priority) ||
+	     result.stride_static_priority <= 0)) {
+		result.parse_status = "invalid_stride_static_priority";
+		return result;
+	}
 	result.valid = true;
 	result.parse_status = "ok";
 	return result;
@@ -121,14 +128,14 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 bool QueryRequestMetadataManager::ProfilingEnabled(ClientContext &context) {
 	const auto &config = ClientConfig::GetConfig(context);
 	return config.query_request_profiling_enabled || config.query_activation_scheduler_enabled ||
-	       DBConfig::GetConfig(context).options.query_sla_scheduler_enabled;
+	       DatabaseInstance::GetDatabase(context).GetQuerySchedulerPolicy() != QuerySchedulerPolicy::DEFAULT;
 }
 
 bool QueryRequestMetadataManager::NeedsMetadata(ClientContext &context) {
 	const auto &config = ClientConfig::GetConfig(context);
 	return config.query_request_profiling_enabled || config.query_admission_max_active > 0 ||
 	       config.query_activation_scheduler_enabled || config.query_activation_debug_enabled ||
-	       DBConfig::GetConfig(context).options.query_sla_scheduler_enabled;
+	       DatabaseInstance::GetDatabase(context).GetQuerySchedulerPolicy() != QuerySchedulerPolicy::DEFAULT;
 }
 
 void QueryRequestMetadataManager::BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query) {

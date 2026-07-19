@@ -10,6 +10,7 @@
 
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/query_scheduler_policy.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parallel/task.hpp"
@@ -92,6 +93,9 @@ public:
 	//! Fallback to calling thread id if CPU number is not available.
 	//! Result do not need to be exact 'return 0' is a valid fallback strategy
 	static idx_t GetEstimatedCPUId();
+
+	QuerySchedulerPolicy GetQuerySchedulerPolicy() const;
+	void SetQuerySchedulerPolicy(QuerySchedulerPolicy policy);
 
 private:
 	void RelaunchThreadsInternal(int32_t n, bool destroy);

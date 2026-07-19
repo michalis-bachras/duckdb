@@ -10,6 +10,8 @@
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
+#include "duckdb/parallel/query_stride_scheduler.hpp"
+#include "duckdb/main/client_config.hpp"
 
 #include <chrono>
 
@@ -31,14 +33,24 @@ static QueryActivationDebugStore &GetDebugStore() {
 
 QueryActivationScheduler::QueryActivationScheduler(Executor &executor_p, QueryRequestMetadata metadata_p,
                                                    bool debug_enabled_p)
-    : executor(executor_p), metadata(std::move(metadata_p)), debug_enabled(debug_enabled_p) {
-	DatabaseInstance::GetDatabase(executor.context)
-	    .GetQuerySLAScheduler()
-	    .RegisterQuery(metadata, executor.GetToken(), debug_enabled);
+    : executor(executor_p), metadata(std::move(metadata_p)), debug_enabled(debug_enabled_p),
+      scheduler_policy(DatabaseInstance::GetDatabase(executor.context).GetQuerySchedulerPolicy()) {
+	auto &db = DatabaseInstance::GetDatabase(executor.context);
+	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+		db.GetQuerySLAScheduler().RegisterQuery(metadata, executor.GetToken(), debug_enabled);
+	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
+		db.GetQueryStrideScheduler().RegisterQuery(metadata, executor.GetToken(),
+		                                             ClientConfig::GetConfig(executor.context).stride_user_priority);
+	}
 }
 
 QueryActivationScheduler::~QueryActivationScheduler() {
-	DatabaseInstance::GetDatabase(executor.context).GetQuerySLAScheduler().UnregisterQuery(metadata.db_query_id);
+	auto &db = DatabaseInstance::GetDatabase(executor.context);
+	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+		db.GetQuerySLAScheduler().UnregisterQuery(metadata.db_query_id);
+	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
+		db.GetQueryStrideScheduler().UnregisterQuery(metadata.db_query_id);
+	}
 }
 
 uint64_t QueryActivationScheduler::TimestampNs() {
@@ -231,16 +243,24 @@ void QueryActivationScheduler::OnEventTasksScheduled(Event &event) {
 		auto pipeline_count = executor.GetPhysicalPipelineCount();
 		remaining_suffix_stages = completed_pipeline_count < pipeline_count ? pipeline_count - completed_pipeline_count : 1;
 	}
-	DatabaseInstance::GetDatabase(executor.context)
-	    .GetQuerySLAScheduler()
-	    .OnEventScheduled(metadata.db_query_id, event.shared_from_this(), remaining_suffix_stages);
+	auto &db = DatabaseInstance::GetDatabase(executor.context);
+	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+		db.GetQuerySLAScheduler().OnEventScheduled(metadata.db_query_id, event.shared_from_this(), remaining_suffix_stages);
+	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
+		db.GetQueryStrideScheduler().OnEventScheduled(metadata.db_query_id, event);
+	}
 }
 
 shared_ptr<Event> QueryActivationScheduler::OnEventFinished(Event &event) {
 	if (!event.HasQueryActivationInfo()) {
 		return nullptr;
 	}
-	DatabaseInstance::GetDatabase(executor.context).GetQuerySLAScheduler().OnEventFinished(metadata.db_query_id, event);
+	auto &db = DatabaseInstance::GetDatabase(executor.context);
+	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+		db.GetQuerySLAScheduler().OnEventFinished(metadata.db_query_id, event);
+	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
+		db.GetQueryStrideScheduler().OnEventFinished(metadata.db_query_id, event);
+	}
 	lock_guard<mutex> guard(scheduler_lock);
 	LogEventLocked(event, "finished");
 

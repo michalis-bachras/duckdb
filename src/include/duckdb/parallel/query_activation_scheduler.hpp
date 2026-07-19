@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/query_scheduler_policy.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/parallel/event.hpp"
@@ -64,6 +65,7 @@ private:
 	Executor &executor;
 	QueryRequestMetadata metadata;
 	bool debug_enabled;
+	QuerySchedulerPolicy scheduler_policy;
 	mutex scheduler_lock;
 	idx_t active_group_id = 0;
 	idx_t active_event_count = 0;

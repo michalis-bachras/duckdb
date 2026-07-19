@@ -18,6 +18,7 @@
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parallel/query_stride_scheduler.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include <functional>
@@ -196,7 +197,12 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	pipeline_executor->SetTaskForInterrupts(shared_from_this());
 
 	if (mode == TaskExecutionMode::PROCESS_PARTIAL) {
-		auto res = pipeline_executor->Execute(PARTIAL_CHUNK_COUNT);
+		auto chunk_count = PARTIAL_CHUNK_COUNT;
+		if (TaskScheduler::GetScheduler(pipeline.GetClientContext()).GetQuerySchedulerPolicy() ==
+		    QuerySchedulerPolicy::STRIDE) {
+			chunk_count = QUERY_STRIDE_QUANTUM_CHUNKS;
+		}
+		auto res = pipeline_executor->Execute(chunk_count);
 
 		switch (res) {
 		case PipelineExecuteResult::NOT_FINISHED:

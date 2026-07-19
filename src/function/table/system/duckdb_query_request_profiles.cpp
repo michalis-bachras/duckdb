@@ -12,6 +12,7 @@
 #include "duckdb/parallel/query_activation_scheduler.hpp"
 #include "duckdb/parallel/query_pipeline_debug.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
+#include "duckdb/parallel/query_stride_scheduler.hpp"
 
 namespace duckdb {
 
@@ -80,6 +81,16 @@ struct DuckDBQuerySLASchedulerEpochsData : public GlobalTableFunctionState {
 	vector<QuerySLASchedulerEpochSnapshot> snapshots;
 	uint64_t dropped_count = 0;
 	idx_t offset = 0;
+};
+
+struct DuckDBQueryStrideSchedulerData : public GlobalTableFunctionState {
+	vector<QueryStrideSchedulerSnapshot> snapshots;
+	idx_t offset = 0;
+};
+
+struct DuckDBQueryStrideTuningData : public GlobalTableFunctionState {
+	QueryStrideTuningSnapshot snapshot;
+	bool emitted = false;
 };
 
 static unique_ptr<FunctionData> DuckDBQueryRequestProfilesBind(ClientContext &context, TableFunctionBindInput &input,
@@ -966,6 +977,120 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext 
 	return nullptr;
 }
 
+static unique_ptr<FunctionData> DuckDBQueryStrideSchedulerBind(ClientContext &context, TableFunctionBindInput &input,
+	                                                            vector<LogicalType> &return_types,
+	                                                            vector<string> &names) {
+	for (auto name : {"slot", "generation", "db_query_id", "request_id", "template_id", "scale_factor"}) {
+		names.emplace_back(name);
+		return_types.emplace_back(LogicalType::UBIGINT);
+	}
+	names.emplace_back("initial_priority");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("minimum_priority");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("static_priority");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("task_set_active");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("lifecycle_serial");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	for (auto name : {"eligible_workers", "task_set_generation", "quanta", "worker_time_us"}) {
+		names.emplace_back(name);
+		return_types.emplace_back(LogicalType::UBIGINT);
+	}
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQueryStrideSchedulerInit(ClientContext &context,
+	                                                                       TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryStrideSchedulerData>();
+	result->snapshots = DatabaseInstance::GetDatabase(context).GetQueryStrideScheduler().GetSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryStrideSchedulerFunction(ClientContext &context, TableFunctionInput &data_p,
+	                                             DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryStrideSchedulerData>();
+	idx_t count = 0;
+	while (data.offset < data.snapshots.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = data.snapshots[data.offset++];
+		idx_t column = 0;
+		output.SetValue(column++, count, Value::UBIGINT(row.slot));
+		output.SetValue(column++, count, Value::UBIGINT(row.generation));
+		output.SetValue(column++, count, Value::UBIGINT(row.db_query_id));
+		output.SetValue(column++, count, Value::UBIGINT(row.request_id));
+		output.SetValue(column++, count, Value::UBIGINT(row.template_id));
+		output.SetValue(column++, count, Value::UBIGINT(row.scale_factor));
+		output.SetValue(column++, count, Value::DOUBLE(row.initial_priority));
+		output.SetValue(column++, count, Value::DOUBLE(row.minimum_priority));
+		output.SetValue(column++, count, Value::BOOLEAN(row.static_priority));
+		output.SetValue(column++, count, Value::BOOLEAN(row.task_set_active));
+		output.SetValue(column++, count, Value::BOOLEAN(row.lifecycle_serial));
+		output.SetValue(column++, count, Value::UBIGINT(row.eligible_workers));
+		output.SetValue(column++, count, Value::UBIGINT(row.task_set_generation));
+		output.SetValue(column++, count, Value::UBIGINT(row.quanta));
+		output.SetValue(column++, count, Value::UBIGINT(row.worker_time_us));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+static unique_ptr<FunctionData> DuckDBQueryStrideTuningBind(ClientContext &context, TableFunctionBindInput &input,
+	                                                         vector<LogicalType> &return_types,
+	                                                         vector<string> &names) {
+	names = {"phase",
+	         "decay_start",
+	         "decay_lambda",
+	         "last_objective",
+	         "optimization_count",
+	         "tracked_query_count",
+	         "registered_queries",
+	         "unregistered_queries",
+	         "activated_task_sets",
+	         "finished_task_sets",
+	         "change_task_sets",
+	         "return_task_sets",
+	         "finalization_task_sets",
+	         "worker_lazy_deactivations"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::DOUBLE, LogicalType::DOUBLE,
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::UBIGINT, LogicalType::UBIGINT};
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DuckDBQueryStrideTuningInit(ClientContext &context,
+	                                                                    TableFunctionInitInput &input) {
+	auto result = make_uniq<DuckDBQueryStrideTuningData>();
+	result->snapshot = DatabaseInstance::GetDatabase(context).GetQueryStrideScheduler().GetTuningSnapshot();
+	return std::move(result);
+}
+
+static void DuckDBQueryStrideTuningFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<DuckDBQueryStrideTuningData>();
+	if (data.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	auto &row = data.snapshot;
+	output.SetValue(0, 0, Value(row.phase));
+	output.SetValue(1, 0, Value::INTEGER(row.decay_start));
+	output.SetValue(2, 0, Value::DOUBLE(row.decay_lambda));
+	output.SetValue(3, 0, Value::DOUBLE(row.last_objective));
+	output.SetValue(4, 0, Value::UBIGINT(row.optimization_count));
+	output.SetValue(5, 0, Value::UBIGINT(row.tracked_query_count));
+	output.SetValue(6, 0, Value::UBIGINT(row.registered_queries));
+	output.SetValue(7, 0, Value::UBIGINT(row.unregistered_queries));
+	output.SetValue(8, 0, Value::UBIGINT(row.activated_task_sets));
+	output.SetValue(9, 0, Value::UBIGINT(row.finished_task_sets));
+	output.SetValue(10, 0, Value::UBIGINT(row.change_task_sets));
+	output.SetValue(11, 0, Value::UBIGINT(row.return_task_sets));
+	output.SetValue(12, 0, Value::UBIGINT(row.finalization_task_sets));
+	output.SetValue(13, 0, Value::UBIGINT(row.worker_lazy_deactivations));
+	output.SetCardinality(1);
+	data.emitted = true;
+}
+
 static unique_ptr<GlobalTableFunctionState> DuckDBQuerySLASchedulerEpochsInit(ClientContext &context,
 	                                                                         TableFunctionInitInput &input) {
 	auto result = make_uniq<DuckDBQuerySLASchedulerEpochsData>();
@@ -1279,6 +1404,10 @@ void DuckDBQueryRequestProfilesFun::RegisterFunction(BuiltinFunctions &set) {
 	set.AddFunction(TableFunction("duckdb_debug_query_sla_scheduler_epochs", {},
 	                              DuckDBQuerySLASchedulerEpochsFunction, DuckDBQuerySLASchedulerEpochsBind,
 	                              DuckDBQuerySLASchedulerEpochsInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_stride_scheduler", {}, DuckDBQueryStrideSchedulerFunction,
+	                              DuckDBQueryStrideSchedulerBind, DuckDBQueryStrideSchedulerInit));
+	set.AddFunction(TableFunction("duckdb_debug_query_stride_tuning", {}, DuckDBQueryStrideTuningFunction,
+	                              DuckDBQueryStrideTuningBind, DuckDBQueryStrideTuningInit));
 	set.AddFunction(TableFunction("duckdb_debug_query_pipeline_events", {}, DuckDBQueryPipelineEventsFunction,
 	                              DuckDBQueryPipelineEventsBind, DuckDBQueryPipelineEventsInit));
 }

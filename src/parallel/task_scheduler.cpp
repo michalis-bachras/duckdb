@@ -8,6 +8,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
+#include "duckdb/parallel/query_stride_scheduler.hpp"
 #include "duckdb/storage/block_allocator.hpp"
 #ifndef DUCKDB_NO_THREADS
 #include "concurrentqueue.h"
@@ -282,6 +283,12 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 
 	const auto &block_allocator = BlockAllocator::Get(db);
 	const auto &config = DBConfig::GetConfig(db);
+	QueryStrideWorkerState stride_worker;
+	bool stride_registered = false;
+	if (GetQuerySchedulerPolicy() == QuerySchedulerPolicy::STRIDE && worker_id != DConstants::INVALID_INDEX) {
+		db.GetQueryStrideScheduler().RegisterWorker(stride_worker);
+		stride_registered = true;
+	}
 
 	shared_ptr<Task> task;
 	// loop until the marker is set to false
@@ -307,19 +314,49 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 				}
 			}
 		}
-		auto sla_result = worker_id == DConstants::INVALID_INDEX
-		                      ? QuerySLADequeueResult::NOT_ACTIVE
-		                      : db.GetQuerySLAScheduler().TryDequeueTask(worker_id, task);
-		auto has_task = sla_result == QuerySLADequeueResult::TASK_FOUND;
-		if (sla_result == QuerySLADequeueResult::NOT_ACTIVE) {
+		auto policy = GetQuerySchedulerPolicy();
+		if (stride_registered && policy != QuerySchedulerPolicy::STRIDE) {
+			db.GetQueryStrideScheduler().DeregisterWorker(stride_worker);
+			stride_registered = false;
+		}
+		if (!stride_registered && policy == QuerySchedulerPolicy::STRIDE &&
+		    worker_id != DConstants::INVALID_INDEX) {
+			db.GetQueryStrideScheduler().RegisterWorker(stride_worker);
+			stride_registered = true;
+		}
+
+		auto sla_result = QuerySLADequeueResult::NOT_ACTIVE;
+		auto stride_result = QueryStrideDequeueResult::NOT_ACTIVE;
+		QueryStrideTaskSelection stride_selection;
+		if (policy == QuerySchedulerPolicy::SLA && worker_id != DConstants::INVALID_INDEX) {
+			sla_result = db.GetQuerySLAScheduler().TryDequeueTask(worker_id, task);
+		} else if (policy == QuerySchedulerPolicy::STRIDE && worker_id != DConstants::INVALID_INDEX) {
+			stride_result =
+			    db.GetQueryStrideScheduler().TryDequeueTask(worker_id, stride_worker, task, stride_selection);
+		}
+		auto has_task = sla_result == QuerySLADequeueResult::TASK_FOUND ||
+		                stride_result == QueryStrideDequeueResult::TASK_FOUND;
+		if (sla_result == QuerySLADequeueResult::NOT_ACTIVE &&
+		    stride_result == QueryStrideDequeueResult::NOT_ACTIVE) {
 			has_task = queue->Dequeue(task);
 		}
 		if (has_task) {
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
-			if (Settings::Get<SchedulerProcessPartialSetting>(config) || db.GetQuerySLAScheduler().Enabled()) {
+			if (Settings::Get<SchedulerProcessPartialSetting>(config) || policy != QuerySchedulerPolicy::DEFAULT) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 			}
+			auto stride_start = std::chrono::steady_clock::time_point();
+			if (stride_result == QueryStrideDequeueResult::TASK_FOUND) {
+				stride_start = std::chrono::steady_clock::now();
+			}
 			auto execute_result = task->Execute(process_mode);
+			if (stride_result == QueryStrideDequeueResult::TASK_FOUND) {
+				auto elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				                                                std::chrono::steady_clock::now() - stride_start)
+				                                                .count());
+				db.GetQueryStrideScheduler().OnQuantumCompleted(stride_worker, stride_selection,
+				                                                      MaxValue<uint64_t>(elapsed_us, 1));
+			}
 
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
@@ -339,11 +376,15 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 			}
 		} else if (queue->GetTasksInQueue() > 0) {
 			// failed to dequeue but there are still tasks remaining - signal again to retry
-			if (sla_result == QuerySLADequeueResult::NO_TASK) {
+			if (sla_result == QuerySLADequeueResult::NO_TASK ||
+			    stride_result == QueryStrideDequeueResult::NO_TASK) {
 				std::this_thread::sleep_for(std::chrono::microseconds(SLA_NO_TASK_RETRY_WAIT));
 			}
 			queue->semaphore.signal(1);
 		}
+	}
+	if (stride_registered) {
+		db.GetQueryStrideScheduler().DeregisterWorker(stride_worker);
 	}
 	// this thread will exit, flush all of its outstanding allocations
 	if (block_allocator.SupportsFlush()) {
@@ -353,6 +394,15 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 #else
 	throw NotImplementedException("DuckDB was compiled without threads! Background thread loop is not allowed.");
 #endif
+}
+
+QuerySchedulerPolicy TaskScheduler::GetQuerySchedulerPolicy() const {
+	return db.GetQuerySchedulerPolicy();
+}
+
+void TaskScheduler::SetQuerySchedulerPolicy(QuerySchedulerPolicy policy) {
+	db.SetQuerySchedulerPolicy(policy);
+	Signal(NumericCast<idx_t>(requested_thread_count.load()));
 }
 
 idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
