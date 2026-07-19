@@ -30,9 +30,9 @@ static QueryAdmissionDebugStore &GetAdmissionDebugStore() {
 
 QueryAdmissionHandle::QueryAdmissionHandle(QueryAdmissionController &controller_p, const QueryRequestMetadata &metadata_p,
                                            idx_t max_active_p, idx_t ticket_p, uint64_t queued_ns_p,
-                                           bool debug_enabled_p)
+                                           bool debug_enabled_p, shared_ptr<PendingQueryNotification> notification_p)
     : controller(&controller_p), metadata(metadata_p), max_active(max_active_p), ticket(ticket_p), queued_ns(queued_ns_p),
-      debug_enabled(debug_enabled_p) {
+      debug_enabled(debug_enabled_p), notification(std::move(notification_p)) {
 }
 
 QueryAdmissionHandle::~QueryAdmissionHandle() {
@@ -57,7 +57,8 @@ uint64_t QueryAdmissionController::TimestampNs() {
 	        .count());
 }
 
-void QueryAdmissionController::AdmitRequest(QueryAdmissionHandle &request) {
+void QueryAdmissionController::AdmitRequest(QueryAdmissionHandle &request,
+                                            vector<AdmissionNotification> &notifications) {
 	auto slot_id = next_slot_id++;
 	auto admitted_ns = TimestampNs();
 	active[slot_id] = ActiveEntry {request.metadata, slot_id, request.ticket, request.max_active, request.queued_ns,
@@ -68,6 +69,17 @@ void QueryAdmissionController::AdmitRequest(QueryAdmissionHandle &request) {
 	LogEventLocked(request.metadata, "admitted", request.ticket, request.slot_id, request.max_active, request.queued_ns,
 	               request.admitted_ns, 0, request.debug_enabled);
 	request.cv.notify_all();
+	if (request.notification) {
+		notifications.push_back({request.notification, PendingQueryEventType::ADMITTED});
+	}
+}
+
+void QueryAdmissionController::PublishNotifications(vector<AdmissionNotification> &notifications) {
+	for (auto &entry : notifications) {
+		if (entry.notification) {
+			entry.notification->Publish(entry.type);
+		}
+	}
 }
 
 void QueryAdmissionController::LogEventLocked(const QueryRequestMetadata &metadata, const string &event_state,
@@ -102,36 +114,46 @@ void QueryAdmissionController::LogEventLocked(const QueryRequestMetadata &metada
 
 unique_ptr<QueryAdmissionHandle> QueryAdmissionController::EnqueueOrAcquire(ClientContext &context,
                                                                             const QueryRequestMetadata &metadata,
-                                                                            idx_t max_active) {
+                                                                            idx_t max_active,
+                                                                            shared_ptr<PendingQueryNotification> notification) {
 	if (!metadata.valid || max_active == 0) {
 		return nullptr;
 	}
 
-	unique_lock<mutex> guard(admission_lock);
-	auto debug_enabled = context.config.query_activation_debug_enabled;
-	auto request = make_uniq<QueryAdmissionHandle>(*this, metadata, max_active, next_ticket++, TimestampNs(), debug_enabled);
-	if (waiters.empty() && active.size() < max_active) {
-		AdmitRequest(*request);
-		return request;
+	vector<AdmissionNotification> notifications;
+	unique_ptr<QueryAdmissionHandle> request;
+	{
+		unique_lock<mutex> guard(admission_lock);
+		auto debug_enabled = context.config.query_activation_debug_enabled;
+		request = make_uniq<QueryAdmissionHandle>(*this, metadata, max_active, next_ticket++, TimestampNs(),
+		                                           debug_enabled, std::move(notification));
+		if (waiters.empty() && active.size() < max_active) {
+			AdmitRequest(*request, notifications);
+		} else {
+			waiters.push_back(request.get());
+			LogEventLocked(request->metadata, "queued", request->ticket, 0, request->max_active, request->queued_ns, 0,
+			               0, request->debug_enabled);
+			if (request->notification) {
+				notifications.push_back({request->notification, PendingQueryEventType::ADMISSION_QUEUED});
+			}
+		}
 	}
-
-	waiters.push_back(request.get());
-	LogEventLocked(request->metadata, "queued", request->ticket, 0, request->max_active, request->queued_ns, 0, 0,
-	               request->debug_enabled);
+	PublishNotifications(notifications);
 	return request;
 }
 
 unique_ptr<QueryAdmissionHandle> QueryAdmissionController::Acquire(ClientContext &context,
                                                                    const QueryRequestMetadata &metadata,
-                                                                   idx_t max_active) {
-	auto request = EnqueueOrAcquire(context, metadata, max_active);
+                                                                   idx_t max_active,
+                                                                   shared_ptr<PendingQueryNotification> notification) {
+	auto request = EnqueueOrAcquire(context, metadata, max_active, std::move(notification));
 	if (request) {
 		request->Wait();
 	}
 	return request;
 }
 
-void QueryAdmissionController::ReleaseLocked(idx_t slot_id) {
+void QueryAdmissionController::ReleaseLocked(idx_t slot_id, vector<AdmissionNotification> &notifications) {
 	auto entry = active.find(slot_id);
 	if (entry == active.end()) {
 		return;
@@ -142,44 +164,54 @@ void QueryAdmissionController::ReleaseLocked(idx_t slot_id) {
 	LogEventLocked(active_entry.metadata, "released", active_entry.ticket, active_entry.slot_id,
 	               active_entry.max_active, active_entry.queued_ns, active_entry.admitted_ns, released_ns,
 	               active_entry.debug_enabled);
-	TryAdmitWaiters();
+	TryAdmitWaiters(notifications);
 }
 
-void QueryAdmissionController::TryAdmitWaiters() {
+void QueryAdmissionController::TryAdmitWaiters(vector<AdmissionNotification> &notifications) {
 	while (!waiters.empty()) {
 		auto *request = waiters.front();
 		if (active.size() >= request->max_active) {
 			break;
 		}
 		waiters.pop_front();
-		AdmitRequest(*request);
+		AdmitRequest(*request, notifications);
 	}
 }
 
 void QueryAdmissionController::CancelOrRelease(QueryAdmissionHandle &request) {
-	unique_lock<mutex> guard(admission_lock);
-	if (request.cancelled) {
-		return;
-	}
-	request.cancelled = true;
-	if (request.admitted) {
-		auto slot_id = request.slot_id;
-		request.controller = nullptr;
-		request.cv.notify_all();
-		ReleaseLocked(slot_id);
-		return;
-	}
-	for (auto entry = waiters.begin(); entry != waiters.end(); entry++) {
-		if (*entry == &request) {
-			waiters.erase(entry);
-			LogEventLocked(request.metadata, "cancelled", request.ticket, 0, request.max_active, request.queued_ns, 0, 0,
-			               request.debug_enabled);
-			break;
+	vector<AdmissionNotification> notifications;
+	{
+		unique_lock<mutex> guard(admission_lock);
+		if (request.cancelled) {
+			return;
+		}
+		request.cancelled = true;
+		if (request.admitted) {
+			auto slot_id = request.slot_id;
+			request.controller = nullptr;
+			request.cv.notify_all();
+			if (request.notification) {
+				notifications.push_back({request.notification, PendingQueryEventType::ADMISSION_RELEASED});
+			}
+			ReleaseLocked(slot_id, notifications);
+		} else {
+			for (auto entry = waiters.begin(); entry != waiters.end(); entry++) {
+				if (*entry == &request) {
+					waiters.erase(entry);
+					LogEventLocked(request.metadata, "cancelled", request.ticket, 0, request.max_active,
+					               request.queued_ns, 0, 0, request.debug_enabled);
+					if (request.notification) {
+						notifications.push_back({request.notification, PendingQueryEventType::CANCELLED});
+					}
+					break;
+				}
+			}
+			request.controller = nullptr;
+			request.cv.notify_all();
+			TryAdmitWaiters(notifications);
 		}
 	}
-	request.controller = nullptr;
-	request.cv.notify_all();
-	TryAdmitWaiters();
+	PublishNotifications(notifications);
 }
 
 void QueryAdmissionController::Wait(QueryAdmissionHandle &request) {

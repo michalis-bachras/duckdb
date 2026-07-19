@@ -18,6 +18,7 @@
 namespace duckdb {
 class ClientContext;
 class PreparedStatementData;
+struct PendingQueryParameters;
 
 //! A prepared statement
 class PreparedStatement {
@@ -77,6 +78,9 @@ public:
 	//! Create a pending query result of the prepared statement with the given set named arguments
 	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(case_insensitive_map_t<BoundParameterData> &named_values,
 	                                                       bool allow_stream_result = true);
+	//! Create a pending query with typed request metadata and asynchronous notification state.
+	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(case_insensitive_map_t<BoundParameterData> &named_values,
+	                                                       PendingQueryParameters parameters);
 
 	//! Execute the prepared statement with the given set of values
 	DUCKDB_API unique_ptr<QueryResult> Execute(vector<Value> &values, bool allow_stream_result = true);

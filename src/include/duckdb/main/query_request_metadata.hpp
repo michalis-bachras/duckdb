@@ -32,7 +32,8 @@ class QueryRequestMetadataManager {
 public:
 	static bool NeedsMetadata(ClientContext &context);
 	static bool ProfilingEnabled(ClientContext &context);
-	static void BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query);
+	static void BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query,
+	                       optional_ptr<const QueryRequestMetadata> typed_metadata = nullptr);
 	static void RefreshQueryStart(ClientContext &context);
 	static void EndQuery(ClientContext &context, bool success);
 	static bool HasActiveMetadata(ClientContext &context);

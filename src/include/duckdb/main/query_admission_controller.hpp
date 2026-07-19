@@ -10,6 +10,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
+#include "duckdb/main/pending_query_notification.hpp"
 
 #include <condition_variable>
 #include <deque>
@@ -57,7 +58,8 @@ class QueryAdmissionController;
 class QueryAdmissionHandle {
 public:
 	QueryAdmissionHandle(QueryAdmissionController &controller, const QueryRequestMetadata &metadata, idx_t max_active,
-	                     idx_t ticket, uint64_t queued_ns, bool debug_enabled);
+	                     idx_t ticket, uint64_t queued_ns, bool debug_enabled,
+	                     shared_ptr<PendingQueryNotification> notification);
 	~QueryAdmissionHandle();
 
 	QueryAdmissionHandle(const QueryAdmissionHandle &) = delete;
@@ -85,6 +87,7 @@ private:
 	bool admitted = false;
 	bool cancelled = false;
 	bool debug_enabled;
+	shared_ptr<PendingQueryNotification> notification;
 	std::condition_variable cv;
 
 	friend class QueryAdmissionController;
@@ -97,14 +100,21 @@ public:
 	explicit QueryAdmissionController(DatabaseInstance &db);
 
 	unique_ptr<QueryAdmissionHandle> EnqueueOrAcquire(ClientContext &context, const QueryRequestMetadata &metadata,
-	                                                  idx_t max_active);
+	                                                  idx_t max_active,
+	                                                  shared_ptr<PendingQueryNotification> notification = nullptr);
 	unique_ptr<QueryAdmissionHandle> Acquire(ClientContext &context, const QueryRequestMetadata &metadata,
-	                                        idx_t max_active);
+	                                        idx_t max_active,
+	                                        shared_ptr<PendingQueryNotification> notification = nullptr);
 
 	vector<QueryAdmissionSnapshot> GetSnapshot() const;
 	static vector<QueryAdmissionEventSnapshot> GetEventSnapshot();
 
 private:
+	struct AdmissionNotification {
+		shared_ptr<PendingQueryNotification> notification;
+		PendingQueryEventType type;
+	};
+
 	struct ActiveEntry {
 		QueryRequestMetadata metadata;
 		idx_t slot_id;
@@ -117,11 +127,12 @@ private:
 
 private:
 	static uint64_t TimestampNs();
-	void AdmitRequest(QueryAdmissionHandle &request);
+	void AdmitRequest(QueryAdmissionHandle &request, vector<AdmissionNotification> &notifications);
 	void CancelOrRelease(QueryAdmissionHandle &request);
-	void ReleaseLocked(idx_t slot_id);
-	void TryAdmitWaiters();
+	void ReleaseLocked(idx_t slot_id, vector<AdmissionNotification> &notifications);
+	void TryAdmitWaiters(vector<AdmissionNotification> &notifications);
 	void Wait(QueryAdmissionHandle &request);
+	static void PublishNotifications(vector<AdmissionNotification> &notifications);
 	void LogEventLocked(const QueryRequestMetadata &metadata, const string &event_state, idx_t ticket, idx_t slot_id,
 	                    idx_t max_active, uint64_t queued_ns, uint64_t admitted_ns, uint64_t released_ns,
 	                    bool debug_enabled) const;

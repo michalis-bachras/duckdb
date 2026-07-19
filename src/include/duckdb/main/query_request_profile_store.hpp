@@ -16,6 +16,7 @@
 namespace duckdb {
 
 struct QueryRequestProfileStoreState;
+class FileSystem;
 
 static constexpr idx_t DOWNSTREAM_SUFFIX_MAX_BUCKETS = 8;
 static constexpr idx_t DOWNSTREAM_SUFFIX_MAX_RESOLVED_BUCKETS = 16;
@@ -240,6 +241,10 @@ public:
 	vector<QueryRequestDownstreamSuffixProfileSnapshot> GetDownstreamSuffixProfilesSnapshot() const;
 	idx_t QueryProfileCount() const;
 	idx_t PipelineProfileCount() const;
+	//! Persist only bounded scheduler model state. Diagnostic instance/sample rows are intentionally excluded.
+	void ExportSnapshot(FileSystem &fs, const string &path) const;
+	//! Replace the current store atomically after fully validating and rebuilding derived state.
+	void ImportSnapshot(FileSystem &fs, const string &path);
 	void Clear();
 
 private:

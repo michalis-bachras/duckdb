@@ -28,6 +28,7 @@ set(TEST_API_OBJECTS
     test_relation_api.cpp
     test_query_profiler.cpp
     test_query_request_profile_store.cpp
+    test_scheduler_workload_support.cpp
     test_query_stride_scheduler.cpp
     test_dbdir.cpp
     test_pending_with_parameters.cpp

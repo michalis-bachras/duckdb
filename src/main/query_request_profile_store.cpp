@@ -8,6 +8,9 @@
 #include "duckdb/main/query_request_profile_store.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/serializer/buffered_file_reader.hpp"
+#include "duckdb/common/serializer/buffered_file_writer.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +29,71 @@ static const idx_t DOWNSTREAM_SUFFIX_MIN_EXACT_SAMPLES = 4;
 static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
 static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
 static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 1;
+static const char *PROFILE_SNAPSHOT_MAGIC = "DUCKDB_QUERY_REQUEST_PROFILE";
+
+class ProfileSnapshotWriter {
+public:
+	ProfileSnapshotWriter(FileSystem &fs, const string &path)
+	    : writer(fs, path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW) {
+	}
+
+	template <class T>
+	void Write(const T &value) {
+		writer.WriteData(const_data_ptr_cast(&value), sizeof(T));
+	}
+
+	void WriteString(const string &value) {
+		Write<uint64_t>(value.size());
+		if (!value.empty()) {
+			writer.WriteData(const_data_ptr_cast(value.data()), value.size());
+		}
+	}
+
+	void Flush() {
+		writer.Flush();
+	}
+
+private:
+	BufferedFileWriter writer;
+};
+
+class ProfileSnapshotReader {
+public:
+	ProfileSnapshotReader(FileSystem &fs, const string &path) : reader(fs, path.c_str()) {
+	}
+
+	template <class T>
+	T Read() {
+		T value;
+		reader.ReadData(data_ptr_cast(&value), sizeof(T));
+		return value;
+	}
+
+	uint64_t ReadCount(uint64_t maximum, const char *name) {
+		auto count = Read<uint64_t>();
+		if (count > maximum) {
+			throw SerializationException("Invalid %s count in query profile snapshot", name);
+		}
+		return count;
+	}
+
+	string ReadString() {
+		auto size = ReadCount(1ULL << 24, "string");
+		string result(size, '\0');
+		if (size > 0) {
+			reader.ReadData(data_ptr_cast(&result[0]), size);
+		}
+		return result;
+	}
+
+	bool Finished() {
+		return reader.Finished();
+	}
+
+private:
+	BufferedFileReader reader;
+};
 
 struct BoundedSamples {
 	std::deque<double> values;
@@ -514,6 +582,359 @@ struct QueryRequestProfileStoreState {
 };
 
 namespace query_request_profile_store_internal {
+
+static constexpr uint64_t PROFILE_SNAPSHOT_MAX_ENTRIES = 1ULL << 20;
+
+struct ProfileSnapshotState {
+	std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> query_profiles;
+	std::unordered_map<PipelineProfileKey, PipelineProfileAggregate, PipelineProfileKeyHash> pipeline_profiles;
+	std::unordered_map<uint64_t, SuffixHistogramAggregate> scale_downstream_suffix_profiles;
+	SuffixHistogramAggregate global_downstream_suffix_profile;
+	std::unordered_map<SourceSinkContinuationKey, ContinuationAggregate, SourceSinkContinuationKeyHash>
+	    source_sink_continuation_profiles;
+	std::unordered_map<SourceWorkClass, ContinuationAggregate, SourceWorkClassHash> source_continuation_profiles;
+	ContinuationAggregate global_raw_continuation_profile;
+	std::unordered_map<SourceSinkThroughputKey, ThroughputAggregate, SourceSinkThroughputKeyHash>
+	    source_sink_throughput_profiles;
+	std::unordered_map<SourceThroughputKey, ThroughputAggregate, SourceThroughputKeyHash> source_throughput_profiles;
+	std::unordered_map<CompatibleThroughputKey, ThroughputAggregate, CompatibleThroughputKeyHash>
+	    global_compatible_throughput_profiles;
+	ContinuationAggregate global_finish_tail_profile;
+};
+
+static void WriteBoundedSamples(ProfileSnapshotWriter &writer, const BoundedSamples &samples) {
+	writer.Write<uint64_t>(samples.values.size());
+	for (const auto value : samples.values) {
+		writer.Write<double>(value);
+	}
+}
+
+static BoundedSamples ReadBoundedSamples(ProfileSnapshotReader &reader) {
+	BoundedSamples result;
+	auto count = reader.ReadCount(PROFILE_SAMPLE_LIMIT, "sample");
+	for (idx_t i = 0; i < count; i++) {
+		auto value = reader.Read<double>();
+		if (!std::isfinite(value)) {
+			throw SerializationException("Non-finite sample in query profile snapshot");
+		}
+		result.Add(value);
+	}
+	return result;
+}
+
+static void WriteContinuation(ProfileSnapshotWriter &writer, const ContinuationAggregate &profile) {
+	writer.WriteString(profile.native_unit);
+	writer.Write<uint64_t>(profile.native_unit_mismatch_count);
+	WriteBoundedSamples(writer, profile.values);
+}
+
+static ContinuationAggregate ReadContinuation(ProfileSnapshotReader &reader) {
+	ContinuationAggregate result;
+	result.native_unit = reader.ReadString();
+	result.native_unit_mismatch_count = reader.Read<uint64_t>();
+	auto values = ReadBoundedSamples(reader);
+	for (const auto value : values.values) {
+		result.Add(value);
+	}
+	return result;
+}
+
+static void WriteThroughput(ProfileSnapshotWriter &writer, const ThroughputAggregate &profile) {
+	WriteBoundedSamples(writer, profile.values);
+	writer.Write<double>(profile.ewma);
+}
+
+static ThroughputAggregate ReadThroughput(ProfileSnapshotReader &reader) {
+	ThroughputAggregate result;
+	result.values = ReadBoundedSamples(reader);
+	result.ewma = reader.Read<double>();
+	if ((!result.values.values.empty() && (!std::isfinite(result.ewma) || result.ewma <= 0)) ||
+	    (result.values.values.empty() && result.ewma != 0)) {
+		throw SerializationException("Invalid throughput EWMA in query profile snapshot");
+	}
+	return result;
+}
+
+static void WriteSuffix(ProfileSnapshotWriter &writer, const SuffixHistogramAggregate &profile) {
+	writer.Write<uint64_t>(profile.samples.Count());
+	std::array<double, PROFILE_SAMPLE_LIMIT> values;
+	profile.samples.CopyTo(values);
+	for (idx_t i = 0; i < profile.samples.Count(); i++) {
+		writer.Write<double>(values[i]);
+	}
+}
+
+static SuffixHistogramAggregate ReadSuffix(ProfileSnapshotReader &reader) {
+	SuffixHistogramAggregate result;
+	auto count = reader.ReadCount(PROFILE_SAMPLE_LIMIT, "downstream suffix sample");
+	for (idx_t i = 0; i < count; i++) {
+		auto value = reader.Read<double>();
+		if (!std::isfinite(value) || value < 0) {
+			throw SerializationException("Invalid downstream suffix sample in query profile snapshot");
+		}
+		result.Add(value);
+	}
+	return result;
+}
+
+static void WriteSourceWorkClass(ProfileSnapshotWriter &writer, const SourceWorkClass &work_class) {
+	writer.Write<uint8_t>(static_cast<uint8_t>(work_class.source_type));
+	writer.Write<uint8_t>(static_cast<uint8_t>(work_class.work_kind));
+}
+
+static SourceWorkClass ReadSourceWorkClass(ProfileSnapshotReader &reader) {
+	SourceWorkClass result;
+	result.source_type = static_cast<PhysicalOperatorType>(reader.Read<uint8_t>());
+	result.work_kind = static_cast<SourceThroughputKind>(reader.Read<uint8_t>());
+	return result;
+}
+
+static void WriteQueryProfile(ProfileSnapshotWriter &writer, const QueryProfileAggregate &profile) {
+	writer.Write<uint64_t>(profile.template_id);
+	writer.Write<uint64_t>(profile.scale_factor);
+	WriteBoundedSamples(writer, profile.runtime_ns);
+	WriteBoundedSamples(writer, profile.lateness_ns);
+	WriteBoundedSamples(writer, profile.sla_cost);
+}
+
+static QueryProfileAggregate ReadQueryProfile(ProfileSnapshotReader &reader) {
+	QueryProfileAggregate result;
+	result.template_id = reader.Read<uint64_t>();
+	result.scale_factor = reader.Read<uint64_t>();
+	result.runtime_ns = ReadBoundedSamples(reader);
+	result.lateness_ns = ReadBoundedSamples(reader);
+	result.sla_cost = ReadBoundedSamples(reader);
+	return result;
+}
+
+static void WritePipelineProfile(ProfileSnapshotWriter &writer, const PipelineProfileAggregate &profile) {
+	writer.Write<uint64_t>(profile.template_id);
+	writer.Write<uint64_t>(profile.scale_factor);
+	writer.Write<uint64_t>(profile.pipeline_id);
+	writer.Write<uint64_t>(profile.pipeline_signature_hash);
+	writer.WriteString(profile.pipeline_signature);
+	writer.WriteString(profile.operator_type_sequence);
+	writer.WriteString(profile.source_type);
+	writer.WriteString(profile.sink_type);
+	WriteSourceWorkClass(writer, profile.source_work_class);
+	writer.WriteString(profile.source_input_kind);
+	writer.WriteString(profile.source_input_confidence);
+	writer.WriteString(profile.planned_input_native_unit);
+	WriteBoundedSamples(writer, profile.source_max_threads);
+	WriteBoundedSamples(writer, profile.planned_input_rows);
+	WriteBoundedSamples(writer, profile.planned_input_chunks_equiv);
+	WriteBoundedSamples(writer, profile.task_count);
+	WriteBoundedSamples(writer, profile.task_runtime_ns);
+	WriteContinuation(writer, profile.lifecycle_runtime_ns);
+	WriteContinuation(writer, profile.finish_tail_ns);
+	WriteSuffix(writer, profile.downstream_suffix_ns);
+	WriteBoundedSamples(writer, profile.single_worker_chunks_per_s);
+	WriteContinuation(writer, profile.continuation);
+	writer.Write<double>(profile.ewma_single_worker_chunks_per_s);
+}
+
+static PipelineProfileAggregate ReadPipelineProfile(ProfileSnapshotReader &reader) {
+	PipelineProfileAggregate result;
+	result.template_id = reader.Read<uint64_t>();
+	result.scale_factor = reader.Read<uint64_t>();
+	result.pipeline_id = reader.Read<uint64_t>();
+	result.pipeline_signature_hash = reader.Read<uint64_t>();
+	result.pipeline_signature = reader.ReadString();
+	result.operator_type_sequence = reader.ReadString();
+	result.source_type = reader.ReadString();
+	result.sink_type = reader.ReadString();
+	result.source_work_class = ReadSourceWorkClass(reader);
+	result.source_input_kind = reader.ReadString();
+	result.source_input_confidence = reader.ReadString();
+	result.planned_input_native_unit = reader.ReadString();
+	result.source_max_threads = ReadBoundedSamples(reader);
+	result.planned_input_rows = ReadBoundedSamples(reader);
+	result.planned_input_chunks_equiv = ReadBoundedSamples(reader);
+	result.task_count = ReadBoundedSamples(reader);
+	result.task_runtime_ns = ReadBoundedSamples(reader);
+	result.lifecycle_runtime_ns = ReadContinuation(reader);
+	result.finish_tail_ns = ReadContinuation(reader);
+	result.downstream_suffix_ns = ReadSuffix(reader);
+	result.single_worker_chunks_per_s = ReadBoundedSamples(reader);
+	result.continuation = ReadContinuation(reader);
+	result.ewma_single_worker_chunks_per_s = reader.Read<double>();
+	if ((!result.single_worker_chunks_per_s.values.empty() &&
+	     (!std::isfinite(result.ewma_single_worker_chunks_per_s) || result.ewma_single_worker_chunks_per_s <= 0)) ||
+	    (result.single_worker_chunks_per_s.values.empty() && result.ewma_single_worker_chunks_per_s != 0)) {
+		throw SerializationException("Invalid pipeline throughput EWMA in query profile snapshot");
+	}
+	return result;
+}
+
+static ProfileSnapshotState CaptureSnapshotState(QueryRequestProfileStoreState &state) {
+	ProfileSnapshotState result;
+	lock_guard<std::mutex> guard(state.lock);
+	result.query_profiles = state.query_profiles;
+	result.pipeline_profiles = state.pipeline_profiles;
+	result.scale_downstream_suffix_profiles = state.scale_downstream_suffix_profiles;
+	result.global_downstream_suffix_profile = state.global_downstream_suffix_profile;
+	result.source_sink_continuation_profiles = state.source_sink_continuation_profiles;
+	result.source_continuation_profiles = state.source_continuation_profiles;
+	result.global_raw_continuation_profile = state.global_raw_continuation_profile;
+	result.source_sink_throughput_profiles = state.source_sink_throughput_profiles;
+	result.source_throughput_profiles = state.source_throughput_profiles;
+	result.global_compatible_throughput_profiles = state.global_compatible_throughput_profiles;
+	result.global_finish_tail_profile = state.global_finish_tail_profile;
+	return result;
+}
+
+static void WriteSnapshotState(ProfileSnapshotWriter &writer, const ProfileSnapshotState &snapshot) {
+	writer.Write<uint64_t>(snapshot.query_profiles.size());
+	for (const auto &entry : snapshot.query_profiles) {
+		WriteQueryProfile(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.pipeline_profiles.size());
+	for (const auto &entry : snapshot.pipeline_profiles) {
+		WritePipelineProfile(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.scale_downstream_suffix_profiles.size());
+	for (const auto &entry : snapshot.scale_downstream_suffix_profiles) {
+		writer.Write<uint64_t>(entry.first);
+		WriteSuffix(writer, entry.second);
+	}
+	WriteSuffix(writer, snapshot.global_downstream_suffix_profile);
+
+	writer.Write<uint64_t>(snapshot.source_sink_continuation_profiles.size());
+	for (const auto &entry : snapshot.source_sink_continuation_profiles) {
+		WriteSourceWorkClass(writer, entry.first.source_work_class);
+		writer.Write<uint8_t>(static_cast<uint8_t>(entry.first.sink_type));
+		WriteContinuation(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.source_continuation_profiles.size());
+	for (const auto &entry : snapshot.source_continuation_profiles) {
+		WriteSourceWorkClass(writer, entry.first);
+		WriteContinuation(writer, entry.second);
+	}
+	WriteContinuation(writer, snapshot.global_raw_continuation_profile);
+
+	writer.Write<uint64_t>(snapshot.source_sink_throughput_profiles.size());
+	for (const auto &entry : snapshot.source_sink_throughput_profiles) {
+		WriteSourceWorkClass(writer, entry.first.source_work_class);
+		writer.Write<uint8_t>(static_cast<uint8_t>(entry.first.sink_type));
+		writer.WriteString(entry.first.native_unit);
+		WriteThroughput(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.source_throughput_profiles.size());
+	for (const auto &entry : snapshot.source_throughput_profiles) {
+		WriteSourceWorkClass(writer, entry.first.source_work_class);
+		writer.WriteString(entry.first.native_unit);
+		WriteThroughput(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.global_compatible_throughput_profiles.size());
+	for (const auto &entry : snapshot.global_compatible_throughput_profiles) {
+		writer.Write<uint8_t>(static_cast<uint8_t>(entry.first.work_kind));
+		writer.WriteString(entry.first.native_unit);
+		WriteThroughput(writer, entry.second);
+	}
+	WriteContinuation(writer, snapshot.global_finish_tail_profile);
+}
+
+static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader) {
+	ProfileSnapshotState result;
+	auto query_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "query profile");
+	for (idx_t i = 0; i < query_count; i++) {
+		auto profile = ReadQueryProfile(reader);
+		QueryProfileKey key;
+		key.template_id = profile.template_id;
+		key.scale_factor = profile.scale_factor;
+		if (!result.query_profiles.emplace(key, std::move(profile)).second) {
+			throw SerializationException("Duplicate query profile in query profile snapshot");
+		}
+	}
+	auto pipeline_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "pipeline profile");
+	for (idx_t i = 0; i < pipeline_count; i++) {
+		auto profile = ReadPipelineProfile(reader);
+		PipelineProfileKey key;
+		key.template_id = profile.template_id;
+		key.scale_factor = profile.scale_factor;
+		key.pipeline_id = profile.pipeline_id;
+		key.pipeline_signature_hash = profile.pipeline_signature_hash;
+		if (!result.pipeline_profiles.emplace(key, std::move(profile)).second) {
+			throw SerializationException("Duplicate pipeline profile in query profile snapshot");
+		}
+	}
+	auto scale_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "scale suffix profile");
+	for (idx_t i = 0; i < scale_count; i++) {
+		auto scale_factor = reader.Read<uint64_t>();
+		if (!result.scale_downstream_suffix_profiles.emplace(scale_factor, ReadSuffix(reader)).second) {
+			throw SerializationException("Duplicate scale suffix profile in query profile snapshot");
+		}
+	}
+	result.global_downstream_suffix_profile = ReadSuffix(reader);
+
+	auto source_sink_continuation_count =
+	    reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "source/sink continuation profile");
+	for (idx_t i = 0; i < source_sink_continuation_count; i++) {
+		SourceSinkContinuationKey key;
+		key.source_work_class = ReadSourceWorkClass(reader);
+		key.sink_type = static_cast<PhysicalOperatorType>(reader.Read<uint8_t>());
+		if (!result.source_sink_continuation_profiles.emplace(key, ReadContinuation(reader)).second) {
+			throw SerializationException("Duplicate source/sink continuation profile in query profile snapshot");
+		}
+	}
+	auto source_continuation_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "source continuation profile");
+	for (idx_t i = 0; i < source_continuation_count; i++) {
+		auto key = ReadSourceWorkClass(reader);
+		if (!result.source_continuation_profiles.emplace(key, ReadContinuation(reader)).second) {
+			throw SerializationException("Duplicate source continuation profile in query profile snapshot");
+		}
+	}
+	result.global_raw_continuation_profile = ReadContinuation(reader);
+
+	auto source_sink_throughput_count =
+	    reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "source/sink throughput profile");
+	for (idx_t i = 0; i < source_sink_throughput_count; i++) {
+		SourceSinkThroughputKey key;
+		key.source_work_class = ReadSourceWorkClass(reader);
+		key.sink_type = static_cast<PhysicalOperatorType>(reader.Read<uint8_t>());
+		key.native_unit = reader.ReadString();
+		if (!result.source_sink_throughput_profiles.emplace(key, ReadThroughput(reader)).second) {
+			throw SerializationException("Duplicate source/sink throughput profile in query profile snapshot");
+		}
+	}
+	auto source_throughput_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "source throughput profile");
+	for (idx_t i = 0; i < source_throughput_count; i++) {
+		SourceThroughputKey key;
+		key.source_work_class = ReadSourceWorkClass(reader);
+		key.native_unit = reader.ReadString();
+		if (!result.source_throughput_profiles.emplace(key, ReadThroughput(reader)).second) {
+			throw SerializationException("Duplicate source throughput profile in query profile snapshot");
+		}
+	}
+	auto global_throughput_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "global throughput profile");
+	for (idx_t i = 0; i < global_throughput_count; i++) {
+		CompatibleThroughputKey key;
+		key.work_kind = static_cast<SourceThroughputKind>(reader.Read<uint8_t>());
+		key.native_unit = reader.ReadString();
+		if (!result.global_compatible_throughput_profiles.emplace(key, ReadThroughput(reader)).second) {
+			throw SerializationException("Duplicate global throughput profile in query profile snapshot");
+		}
+	}
+	result.global_finish_tail_profile = ReadContinuation(reader);
+	return result;
+}
+
+static void InstallSnapshotState(QueryRequestProfileStoreState &state, ProfileSnapshotState snapshot) {
+	lock_guard<std::mutex> guard(state.lock);
+	state.query_profiles = std::move(snapshot.query_profiles);
+	state.pipeline_profiles = std::move(snapshot.pipeline_profiles);
+	state.scale_downstream_suffix_profiles = std::move(snapshot.scale_downstream_suffix_profiles);
+	state.global_downstream_suffix_profile = std::move(snapshot.global_downstream_suffix_profile);
+	state.source_sink_continuation_profiles = std::move(snapshot.source_sink_continuation_profiles);
+	state.source_continuation_profiles = std::move(snapshot.source_continuation_profiles);
+	state.global_raw_continuation_profile = std::move(snapshot.global_raw_continuation_profile);
+	state.source_sink_throughput_profiles = std::move(snapshot.source_sink_throughput_profiles);
+	state.source_throughput_profiles = std::move(snapshot.source_throughput_profiles);
+	state.global_compatible_throughput_profiles = std::move(snapshot.global_compatible_throughput_profiles);
+	state.global_finish_tail_profile = std::move(snapshot.global_finish_tail_profile);
+	state.query_samples.clear();
+	state.pipeline_instances.clear();
+}
 
 static uint64_t DurationNs(uint64_t end_ns, uint64_t start_ns) {
 	if (end_ns <= start_ns) {
@@ -1549,6 +1970,42 @@ idx_t QueryRequestProfileStore::QueryProfileCount() const {
 idx_t QueryRequestProfileStore::PipelineProfileCount() const {
 	lock_guard<std::mutex> guard(state->lock);
 	return state->pipeline_profiles.size();
+}
+
+void QueryRequestProfileStore::ExportSnapshot(FileSystem &fs, const string &path) const {
+	auto snapshot = CaptureSnapshotState(*state);
+	ProfileSnapshotWriter writer(fs, path);
+	writer.WriteString(PROFILE_SNAPSHOT_MAGIC);
+	writer.Write<uint32_t>(PROFILE_SNAPSHOT_VERSION);
+	writer.WriteString(DuckDB::SourceID());
+	writer.Write<uint64_t>(PROFILE_SAMPLE_LIMIT);
+	writer.Write<double>(THROUGHPUT_EWMA_ALPHA);
+	WriteSnapshotState(writer, snapshot);
+	writer.Flush();
+}
+
+void QueryRequestProfileStore::ImportSnapshot(FileSystem &fs, const string &path) {
+	ProfileSnapshotReader reader(fs, path);
+	if (reader.ReadString() != PROFILE_SNAPSHOT_MAGIC) {
+		throw SerializationException("Invalid query profile snapshot magic");
+	}
+	if (reader.Read<uint32_t>() != PROFILE_SNAPSHOT_VERSION) {
+		throw SerializationException("Unsupported query profile snapshot version");
+	}
+	if (reader.ReadString() != DuckDB::SourceID()) {
+		throw SerializationException("Query profile snapshot was created by a different DuckDB build");
+	}
+	if (reader.Read<uint64_t>() != PROFILE_SAMPLE_LIMIT) {
+		throw SerializationException("Query profile snapshot uses a different sample window size");
+	}
+	if (reader.Read<double>() != THROUGHPUT_EWMA_ALPHA) {
+		throw SerializationException("Query profile snapshot uses a different throughput EWMA alpha");
+	}
+	auto snapshot = ReadSnapshotState(reader);
+	if (!reader.Finished()) {
+		throw SerializationException("Trailing data in query profile snapshot");
+	}
+	InstallSnapshotState(*state, std::move(snapshot));
 }
 
 void QueryRequestProfileStore::Clear() {

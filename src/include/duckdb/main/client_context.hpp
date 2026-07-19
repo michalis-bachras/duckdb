@@ -19,6 +19,8 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/winapi.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/main/pending_query_notification.hpp"
+#include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/client_properties.hpp"
 #include "duckdb/main/external_dependencies.hpp"
@@ -59,6 +61,11 @@ struct PendingQueryParameters {
 	optional_ptr<case_insensitive_map_t<BoundParameterData>> parameters;
 	//! Whether a stream/buffer-managed result should be allowed
 	QueryParameters query_parameters;
+	//! Optional typed scheduler/request metadata. SQL-comment parsing remains the fallback when absent.
+	QueryRequestMetadata request_metadata;
+	bool has_request_metadata = false;
+	//! Optional asynchronous lifecycle notification state.
+	shared_ptr<PendingQueryNotification> notification;
 };
 
 //! The ClientContext holds information relevant to the current client session
@@ -227,6 +234,8 @@ public:
 
 	//! Returns true if execution of the current query is finished
 	DUCKDB_API bool ExecutionIsFinished();
+	//! Notification state for the currently active pending query, if supplied by the caller.
+	shared_ptr<PendingQueryNotification> GetPendingQueryNotification() const;
 
 	//! Process an error for display to the user
 	DUCKDB_API void ProcessError(ErrorData &error, const string &query) const;
@@ -282,7 +291,7 @@ private:
 
 	unique_ptr<ClientContextLock> LockContext();
 
-	void BeginQueryInternal(ClientContextLock &lock, const string &query);
+	void BeginQueryInternal(ClientContextLock &lock, const string &query, const PendingQueryParameters &parameters);
 	ErrorData EndQueryInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
 	                           optional_ptr<ErrorData> previous_error);
 

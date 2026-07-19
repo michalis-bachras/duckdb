@@ -11,6 +11,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
+#include "duckdb/main/pending_query_notification.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline_complete_event.hpp"
@@ -30,8 +31,8 @@
 namespace duckdb {
 
 Executor::Executor(ClientContext &context)
-    : context(context), next_activation_group_id(1), next_energy_lifecycle_group_id(1), executor_tasks(0),
-      blocked_thread_time(0) {
+    : context(context), query_notification(context.GetPendingQueryNotification()), next_activation_group_id(1),
+      next_energy_lifecycle_group_id(1), executor_tasks(0), blocked_thread_time(0) {
 }
 
 Executor::~Executor() {
@@ -54,8 +55,11 @@ void Executor::UnregisterTask() {
 }
 
 void Executor::CompletePipeline() {
-	completed_pipelines++;
+	auto completed = ++completed_pipelines;
 	NotifyExecutionProgress();
+	if (query_notification && completed >= total_pipelines) {
+		query_notification->Publish(PendingQueryEventType::EXECUTION_READY);
+	}
 }
 
 void Executor::NotifyExecutionProgress() {
@@ -551,6 +555,9 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 			activation_scheduler =
 			    make_uniq<QueryActivationScheduler>(*this, request_metadata, context.config.query_activation_debug_enabled);
 		}
+		if (query_notification) {
+			query_notification->Publish(PendingQueryEventType::EXECUTION_STARTED);
+		}
 
 		// finally, verify and schedule
 		VerifyPipelines();
@@ -870,6 +877,9 @@ vector<LogicalType> Executor::GetTypes() {
 }
 
 void Executor::PushError(ErrorData exception) {
+	if (query_notification) {
+		query_notification->Publish(PendingQueryEventType::EXECUTION_ERROR, exception.RawMessage());
+	}
 	// push the exception onto the stack
 	error_manager.PushError(std::move(exception));
 	// interrupt execution of any other pipelines that belong to this executor

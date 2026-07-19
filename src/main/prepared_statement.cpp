@@ -111,24 +111,36 @@ unique_ptr<PendingQueryResult> PreparedStatement::PendingQuery(vector<Value> &va
 
 unique_ptr<PendingQueryResult> PreparedStatement::PendingQuery(case_insensitive_map_t<BoundParameterData> &named_values,
                                                                bool allow_stream_result) {
+	PendingQueryParameters parameters;
+	parameters.query_parameters.output_type = allow_stream_result ? QueryResultOutputType::ALLOW_STREAMING
+	                                                            : QueryResultOutputType::FORCE_MATERIALIZED;
+	return PendingQuery(named_values, std::move(parameters));
+}
+
+unique_ptr<PendingQueryResult> PreparedStatement::PendingQuery(case_insensitive_map_t<BoundParameterData> &named_values,
+                                                               PendingQueryParameters parameters) {
 	if (!success) {
 		auto exception = InvalidInputException("Attempting to execute an unsuccessfully prepared statement!");
+		if (parameters.notification) {
+			parameters.notification->Publish(PendingQueryEventType::ERROR, exception.what());
+		}
 		return make_uniq<PendingQueryResult>(ErrorData(exception));
 	}
-	PendingQueryParameters parameters;
 	parameters.parameters = &named_values;
 
 	try {
 		VerifyParameters(named_values, named_param_map);
 	} catch (const std::exception &ex) {
+		if (parameters.notification) {
+			parameters.notification->Publish(PendingQueryEventType::ERROR, ex.what());
+		}
 		return make_uniq<PendingQueryResult>(ErrorData(ex));
 	}
 
 	D_ASSERT(data);
-	parameters.query_parameters.output_type =
-	    allow_stream_result && data->properties.output_type == QueryResultOutputType::ALLOW_STREAMING
-	        ? QueryResultOutputType::ALLOW_STREAMING
-	        : QueryResultOutputType::FORCE_MATERIALIZED;
+	if (data->properties.output_type != QueryResultOutputType::ALLOW_STREAMING) {
+		parameters.query_parameters.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+	}
 	auto result = context->PendingQuery(query, data, parameters);
 	// The result should not contain any reference to the 'vector<Value> parameters.parameters'
 	return result;

@@ -87,6 +87,8 @@ public:
 	unique_ptr<ProgressBar> progress_bar;
 	//! Optional SLA workload admission slot. Releasing this admits another waiting query.
 	unique_ptr<QueryAdmissionHandle> admission_handle;
+	//! Optional asynchronous query lifecycle notification state.
+	shared_ptr<PendingQueryNotification> notification;
 
 public:
 	void SetOpenResult(BaseQueryResult &result) {
@@ -226,7 +228,8 @@ unique_ptr<T> ClientContext::ErrorResult(ErrorData error, const string &query) {
 	return make_uniq<T>(std::move(error));
 }
 
-void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &query) {
+void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &query,
+                                       const PendingQueryParameters &parameters) {
 	// check if we are on AutoCommit. In this case we should start a transaction
 	D_ASSERT(!active_query);
 	auto &db_inst = DatabaseInstance::GetDatabase(*this);
@@ -234,6 +237,7 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 		throw ErrorManager::InvalidatedDatabase(*this, ValidChecker::InvalidatedMessage(db_inst));
 	}
 	active_query = make_uniq<ActiveQueryContext>();
+	active_query->notification = parameters.notification;
 	if (transaction.IsAutoCommit()) {
 		transaction.BeginTransaction();
 	}
@@ -241,13 +245,17 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 	transaction.SetActiveQuery(db->GetDatabaseManager().GetNewQueryNumber());
 	LogQueryInternal(lock, query);
 	active_query->query = query;
-	if (QueryRequestMetadataManager::NeedsMetadata(*this)) {
-		QueryRequestMetadataManager::BeginQuery(*this, transaction.GetActiveQuery(), query);
+	if (parameters.has_request_metadata || QueryRequestMetadataManager::NeedsMetadata(*this)) {
+		QueryRequestMetadataManager::BeginQuery(
+		    *this, transaction.GetActiveQuery(), query,
+		    parameters.has_request_metadata ? optional_ptr<const QueryRequestMetadata>(&parameters.request_metadata)
+		                                    : nullptr);
 		QueryRequestMetadata metadata;
 		if (!config.query_admission_nonblocking_enabled && QueryRequestMetadataManager::TryGetActive(*this, metadata) &&
 		    config.query_admission_max_active > 0) {
 			active_query->admission_handle =
-			    db_inst.GetQueryAdmissionController().Acquire(*this, metadata, config.query_admission_max_active);
+			    db_inst.GetQueryAdmissionController().Acquire(*this, metadata, config.query_admission_max_active,
+			                                                     active_query->notification);
 			QueryRequestMetadataManager::RefreshQueryStart(*this);
 		}
 		if (QueryRequestMetadataManager::ProfilingEnabled(*this)) {
@@ -276,11 +284,12 @@ void ClientContext::BeginQueryInternal(ClientContextLock &lock, const string &qu
 
 ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success, bool invalidate_transaction,
                                           optional_ptr<ErrorData> previous_error) {
+	D_ASSERT(active_query.get());
+	auto notification = active_query->notification;
 	if (active_query->executor) {
 		active_query->executor->CancelTasks();
 	}
 	active_query->progress_bar.reset();
-	D_ASSERT(active_query.get());
 	active_query.reset();
 	query_progress.Initialize();
 	ErrorData error;
@@ -309,7 +318,7 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	} // LCOV_EXCL_STOP
 
 	client_data->profiler->EndQuery();
-	if (QueryRequestMetadataManager::NeedsMetadata(*this)) {
+	if (QueryRequestMetadataManager::HasActiveMetadata(*this)) {
 		QueryRequestMetadataManager::EndQuery(*this, success && !error.HasError());
 	}
 	EnergyAttributionManager::EndQuery(*this);
@@ -326,6 +335,19 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 			s->QueryEnd(*this, &error);
 		} else {
 			s->QueryEnd(*this, previous_error);
+		}
+	}
+	if (notification) {
+		if (success && !error.HasError()) {
+			notification->Publish(PendingQueryEventType::RESULT_READY);
+		} else if (previous_error && previous_error->Type() == ExceptionType::INTERRUPT) {
+			notification->Publish(PendingQueryEventType::CANCELLED, previous_error->RawMessage());
+		} else {
+			const auto message = error.HasError() ? error.RawMessage()
+			                                      : previous_error ? previous_error->RawMessage() : string("Query cancelled");
+			auto type = error.HasError() || previous_error ? PendingQueryEventType::ERROR
+			                                                : PendingQueryEventType::CANCELLED;
+			notification->Publish(type, message);
 		}
 	}
 	return error;
@@ -370,6 +392,10 @@ Logger &ClientContext::GetLogger() const {
 const string &ClientContext::GetCurrentQuery() {
 	D_ASSERT(active_query);
 	return active_query->query;
+}
+
+shared_ptr<PendingQueryNotification> ClientContext::GetPendingQueryNotification() const {
+	return active_query ? active_query->notification : nullptr;
 }
 
 connection_t ClientContext::GetConnectionId() const {
@@ -588,7 +614,9 @@ ClientContext::PendingPreparedStatementInternal(ClientContextLock &lock,
 	    QueryRequestMetadataManager::TryGetActive(*this, request_metadata)) {
 		auto &db_inst = DatabaseInstance::GetDatabase(*this);
 		active_query->admission_handle =
-		    db_inst.GetQueryAdmissionController().EnqueueOrAcquire(*this, request_metadata, config.query_admission_max_active);
+		    db_inst.GetQueryAdmissionController().EnqueueOrAcquire(*this, request_metadata,
+		                                                       config.query_admission_max_active,
+		                                                       active_query->notification);
 		if (active_query->admission_handle && active_query->admission_handle->IsAdmitted()) {
 			QueryRequestMetadataManager::RefreshQueryStart(*this);
 		}
@@ -1054,13 +1082,16 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementOrPreparedStatemen
 	profiler.StartQuery(query, IsExplainAnalyze(statement ? statement.get() : prepared->unbound_statement.get()));
 
 	try {
-		BeginQueryInternal(lock, query);
+		BeginQueryInternal(lock, query, parameters);
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		if (Exception::InvalidatesDatabase(error.Type())) {
 			// fatal exceptions invalidate the entire database
 			auto &db_instance = DatabaseInstance::GetDatabase(*this);
 			ValidChecker::Invalidate(db_instance, error.RawMessage());
+		}
+		if (parameters.notification) {
+			parameters.notification->Publish(PendingQueryEventType::ERROR, error.RawMessage());
 		}
 		return ErrorResult<PendingQueryResult>(std::move(error), query);
 	}

@@ -39,6 +39,7 @@ add_library_unity(
   extension_install_info.cpp
   extension_manager.cpp
   materialized_query_result.cpp
+  pending_query_notification.cpp
   pending_query_result.cpp
   prepared_statement.cpp
   prepared_statement_data.cpp

@@ -28,6 +28,7 @@ class PipelineExecutor;
 class OperatorState;
 class QueryProfiler;
 class QueryActivationScheduler;
+class PendingQueryNotification;
 class ThreadContext;
 class Task;
 enum class QueryActivationEventKind : uint8_t;
@@ -177,6 +178,8 @@ private:
 	shared_ptr<QueryProfiler> profiler;
 	//! Optional prototype per-query pipeline activation gate.
 	unique_ptr<QueryActivationScheduler> activation_scheduler;
+	//! Optional query-level asynchronous completion notification.
+	shared_ptr<PendingQueryNotification> query_notification;
 	//! Task error manager
 	TaskErrorManager error_manager;
 

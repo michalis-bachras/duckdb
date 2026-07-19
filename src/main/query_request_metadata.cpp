@@ -123,6 +123,18 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 	return result;
 }
 
+static QueryRequestMetadata ValidateTypedMetadata(const QueryRequestMetadata &input) {
+	auto result = input;
+	if (!result.valid || result.template_id == 0 || result.scale_factor == 0 || result.deadline_ns == 0 ||
+	    !std::isfinite(result.sla_tag) || result.sla_tag < 0 || !std::isfinite(result.sla_penalty_per_s) ||
+	    result.sla_penalty_per_s < 0 || !std::isfinite(result.stride_static_priority) ||
+	    result.stride_static_priority < 0) {
+		throw InvalidInputException("Invalid typed query request metadata");
+	}
+	result.parse_status = "typed";
+	return result;
+}
+
 } // namespace
 
 bool QueryRequestMetadataManager::ProfilingEnabled(ClientContext &context) {
@@ -138,8 +150,9 @@ bool QueryRequestMetadataManager::NeedsMetadata(ClientContext &context) {
 	       DatabaseInstance::GetDatabase(context).GetQuerySchedulerPolicy() != QuerySchedulerPolicy::DEFAULT;
 }
 
-void QueryRequestMetadataManager::BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query) {
-	auto metadata = ParseQueryRequestMetadata(query);
+void QueryRequestMetadataManager::BeginQuery(ClientContext &context, uint64_t db_query_id, const string &query,
+                                             optional_ptr<const QueryRequestMetadata> typed_metadata) {
+	auto metadata = typed_metadata ? ValidateTypedMetadata(*typed_metadata) : ParseQueryRequestMetadata(query);
 	lock_guard<std::mutex> guard(g_request_metadata_lock);
 	if (!metadata.valid) {
 		g_active_request_metadata.erase(&context);
