@@ -1085,6 +1085,9 @@ TEST_CASE("SLA scheduler records bounded epoch predictions only for debug querie
 		saw_valid_pipeline = true;
 		REQUIRE(row.pipeline_signature_hash != 0);
 		REQUIRE(row.selected_throughput > 0);
+		REQUIRE(row.first_mandatory_gain >= -1e-9);
+		REQUIRE(row.last_mandatory_gain >= -1e-9);
+		REQUIRE(row.next_mandatory_gain >= -1e-9);
 		REQUIRE(row.historical_throughput_sample_count >= 4);
 		REQUIRE(row.continuation_sample_count >= 4);
 		REQUIRE(row.suffix_bucket_count > 0);

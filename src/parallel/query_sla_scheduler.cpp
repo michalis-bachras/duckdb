@@ -218,7 +218,7 @@ static double CurrentPipelineFinishNs(const PipelineWorkSnapshot &work, QueryAct
 	auto continuation_ns = work.continuation_estimate.kind == ContinuationEstimateKind::NS_PER_WORK_UNIT
 	                           ? remaining_after_epoch * work.continuation_estimate.p90
 	                           : work.continuation_estimate.p90;
-	return static_cast<double>(now_ns) + static_cast<double>(epoch_ns) + continuation_ns;
+	return static_cast<double>(now_ns) + static_cast<double>(epoch_ns) + continuation_ns + lifecycle_tail_ns;
 }
 
 static double ExpectedTardiness(const DownstreamSuffixEstimate &suffix, double downstream_budget_ns) {
@@ -393,6 +393,12 @@ struct EpochTraceInput {
 	double selected_throughput = 0;
 	bool throughput_is_live = false;
 	double predicted_sla_cost = 0;
+	double first_mandatory_gain = 0;
+	double first_optional_gain = 0;
+	double last_mandatory_gain = 0;
+	double last_optional_gain = 0;
+	double next_mandatory_gain = 0;
+	double next_optional_gain = 0;
 };
 
 } // namespace
@@ -772,10 +778,9 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		}
 	}
 
-	// SLA-only scheduling is work-conserving. Estimates can be flat or slightly non-monotonic at the boundary
-	// between the current-epoch throughput model and the historical continuation model. Such an estimate must not
-	// strand runnable work. After all positive mandatory and fragility gains are assigned, use the best remaining
-	// modeled gain as a deterministic residual ordering and fill capacity up to each pipeline's useful demand cap.
+	// SLA-only scheduling is work-conserving. After all positive mandatory and fragility gains are assigned, use the
+	// best remaining modeled gain as a deterministic residual ordering and fill capacity up to each pipeline's useful
+	// demand cap.
 	std::priority_queue<ResidualEpochHeapEntry> residual_heap;
 	for (idx_t i = 0; i < models.size(); i++) {
 		auto workers = mandatory[i] + optional[i];
@@ -821,6 +826,26 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			auto planned_workers = mandatory[i] + optional[i];
 			if (models[i].valid && planned_workers < models[i].mandatory_cost.size()) {
 				input.predicted_sla_cost = models[i].mandatory_cost[planned_workers];
+			}
+			if (models[i].valid) {
+				if (!models[i].mandatory_gain.empty()) {
+					input.first_mandatory_gain = models[i].mandatory_gain[0];
+				}
+				if (!models[i].optional_gain.empty()) {
+					input.first_optional_gain = models[i].optional_gain[0];
+				}
+				if (mandatory[i] > 0 && mandatory[i] <= models[i].mandatory_gain.size()) {
+					input.last_mandatory_gain = models[i].mandatory_gain[mandatory[i] - 1];
+				}
+				if (optional[i] > 0 && planned_workers > 0 && planned_workers <= models[i].optional_gain.size()) {
+					input.last_optional_gain = models[i].optional_gain[planned_workers - 1];
+				}
+				if (planned_workers < models[i].mandatory_gain.size()) {
+					input.next_mandatory_gain = models[i].mandatory_gain[planned_workers];
+				}
+				if (planned_workers < models[i].optional_gain.size()) {
+					input.next_optional_gain = models[i].optional_gain[planned_workers];
+				}
 			}
 			trace_inputs.push_back(std::move(input));
 		}
@@ -916,6 +941,12 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		trace.optional_workers = optional[i];
 		trace.planned_workers = mandatory[i] + optional[i];
 		trace.assigned_workers = input.assigned_workers;
+		trace.first_mandatory_gain = input.first_mandatory_gain;
+		trace.first_optional_gain = input.first_optional_gain;
+		trace.last_mandatory_gain = input.last_mandatory_gain;
+		trace.last_optional_gain = input.last_optional_gain;
+		trace.next_mandatory_gain = input.next_mandatory_gain;
+		trace.next_optional_gain = input.next_optional_gain;
 		if (input.model_valid && trace.planned_workers <= input.demand_cap) {
 			trace.predicted_pipeline_finish_ns = CurrentPipelineFinishNs(
 			    work[i], input.event_kind, trace.planned_workers, now_ns, EpochMs() * 1000000ULL);

@@ -92,6 +92,12 @@ struct QuerySLASchedulerEpochSnapshot {
 	idx_t optional_workers = 0;
 	idx_t planned_workers = 0;
 	idx_t assigned_workers = 0;
+	double first_mandatory_gain = 0;
+	double first_optional_gain = 0;
+	double last_mandatory_gain = 0;
+	double last_optional_gain = 0;
+	double next_mandatory_gain = 0;
+	double next_optional_gain = 0;
 	double predicted_pipeline_finish_ns = 0;
 	double predicted_query_finish_mean_ns = 0;
 	double predicted_query_finish_p90_ns = 0;

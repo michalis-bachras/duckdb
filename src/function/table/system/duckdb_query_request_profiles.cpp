@@ -968,6 +968,12 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext 
 	SLA_EPOCH_COLUMN("optional_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("planned_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("assigned_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("first_mandatory_gain", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("first_optional_gain", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("last_mandatory_gain", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("last_optional_gain", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("next_mandatory_gain", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("next_optional_gain", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("predicted_pipeline_finish_ns", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("predicted_query_finish_mean_ns", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("predicted_query_finish_p90_ns", LogicalType::DOUBLE);
@@ -1158,6 +1164,12 @@ static void DuckDBQuerySLASchedulerEpochsFunction(ClientContext &context, TableF
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.optional_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.planned_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.assigned_workers));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.first_mandatory_gain));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.first_optional_gain));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.last_mandatory_gain));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.last_optional_gain));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.next_mandatory_gain));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.next_optional_gain));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_pipeline_finish_ns));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_query_finish_mean_ns));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_query_finish_p90_ns));
