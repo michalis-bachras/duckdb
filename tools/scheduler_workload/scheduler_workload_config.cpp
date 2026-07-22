@@ -45,6 +45,17 @@ static double ParseDouble(const string &value, const string &name) {
 	return parsed;
 }
 
+static bool ParseBool(const string &value, const string &name) {
+	auto lower = StringUtil::Lower(value);
+	if (lower == "on" || lower == "true" || lower == "1") {
+		return true;
+	}
+	if (lower == "off" || lower == "false" || lower == "0") {
+		return false;
+	}
+	throw InvalidInputException("--%s must be on or off", name);
+}
+
 static QuerySchedulerPolicy ParseScheduler(const string &value) {
 	auto lower = StringUtil::Lower(value);
 	if (lower == "default") {
@@ -56,7 +67,10 @@ static QuerySchedulerPolicy ParseScheduler(const string &value) {
 	if (lower == "sla") {
 		return QuerySchedulerPolicy::SLA;
 	}
-	throw InvalidInputException("--scheduler must be default, stride, or sla");
+	if (lower == "sla_energy") {
+		return QuerySchedulerPolicy::SLA_ENERGY;
+	}
+	throw InvalidInputException("--scheduler must be default, stride, sla, or sla_energy");
 }
 
 static WorkloadCommand ParseCommand(const string &value) {
@@ -96,8 +110,8 @@ static void ValidateConfig(WorkloadConfig &config) {
 		}
 	}
 	if (!config.scheduler_trace_templates.empty() &&
-	    (config.command != WorkloadCommand::RUN || config.scheduler_policy != QuerySchedulerPolicy::SLA)) {
-		throw InvalidInputException("--scheduler-trace-queries is only valid for an SLA run");
+	    (config.command != WorkloadCommand::RUN || !IsQuerySLAPolicy(config.scheduler_policy))) {
+		throw InvalidInputException("--scheduler-trace-queries is only valid for an SLA-policy run");
 	}
 	std::set<uint64_t> scale_factors;
 	for (const auto &database : config.databases) {
@@ -151,6 +165,26 @@ static void ValidateConfig(WorkloadConfig &config) {
 	if (config.scheduler_policy == QuerySchedulerPolicy::STRIDE && config.admission_cap != 128) {
 		throw InvalidInputException("STRIDE requires --admission-cap 128");
 	}
+	if (config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		if (config.energy_power_model_path.empty()) {
+			throw InvalidInputException("SLA-energy runs require --energy-power-model");
+		}
+		if (!std::isfinite(config.sla_energy_lambda) || config.sla_energy_lambda < 0) {
+			throw InvalidInputException("--energy-lambda must be finite and non-negative");
+		}
+		if (config.energy_attribution_enabled && !config.sla_energy_hardware_control) {
+			throw InvalidInputException(
+			    "SLA-energy attribution requires real hardware control; disable attribution for dry-run targets");
+		}
+	}
+	if (config.energy_attribution_enabled) {
+		if (config.energy_power_model_path.empty()) {
+			throw InvalidInputException("Energy attribution requires --energy-power-model");
+		}
+		if (config.energy_attribution_period_ms == 0) {
+			throw InvalidInputException("--energy-attribution-period-ms must be positive");
+		}
+	}
 }
 
 } // namespace
@@ -159,6 +193,8 @@ string SchedulerName(QuerySchedulerPolicy policy) {
 	switch (policy) {
 	case QuerySchedulerPolicy::SLA:
 		return "sla";
+	case QuerySchedulerPolicy::SLA_ENERGY:
+		return "sla_energy";
 	case QuerySchedulerPolicy::STRIDE:
 		return "stride";
 	default:
@@ -173,7 +209,7 @@ Commands:
   calibrate       Measure isolated template runtimes under the common execution environment.
   train-profiles  Execute every selected template under DEFAULT and export a scheduler profile snapshot.
   generate        Generate a deterministic paper-style Poisson schedule using lambda = alpha / mean_duration.
-  run             Execute one saved schedule with DEFAULT, STRIDE, or SLA.
+	  run             Execute one saved schedule with DEFAULT, STRIDE, SLA, or SLA-energy.
 
 Core options:
   --database SF=PATH          Repeat for each scale factor (for example 10=db/sf10.duckdb).
@@ -195,15 +231,31 @@ Schedule options:
 
 Run options:
   --schedule PATH             Saved schedule CSV.
-  --scheduler default|stride|sla
+	  --scheduler default|stride|sla|sla_energy
   --profile-input PATH        Optional scheduler profile snapshot.
   --profile-output PATH       Export updated profile state after training/run.
   --output-dir PATH           Run timeline and summary directory.
   --submitter-threads N       Fixed native submission pool size (default: 2).
   --completion-threads N      Fixed event/completion pool size (default: 2).
   --max-driver-lag-ms X       p99 arrival, DB submission, and admission-resume gate (default: 10).
-  --scheduler-trace-queries Q2,Q9,...
-                              Enable debug epoch tracing only for these templates.
+	  --scheduler-trace-queries Q2,Q9,...
+	                              Enable debug epoch tracing only for these templates.
+	  --energy-power-model PATH  Calibrated socket/core power table for SLA-energy and attribution.
+	  --energy-lambda X          Energy weight for optional-worker utility (default: 1).
+	  --energy-exploration on|off
+	                              Enable epoch-scoped warmup exploration (default: off).
+	  --energy-exploration-seed N
+	                              Deterministic warmup exploration seed (default: 1).
+	  --energy-hardware-control on|off
+	                              Direct MSR control or dry-run publication (default: on).
+	  --energy-attribution on|off
+	                              Enable periodic RAPL attribution independently of policy (default: off).
+	  --energy-attribution-period-ms N
+	                              Periodic RAPL attribution interval (default: 100).
+	  --energy-attribution-export on|off
+	                              Export aggregate attribution diagnostics (default: on).
+	  --energy-attribution-debug-export on|off
+	                              Export per-window attribution diagnostics (default: off).
   --allow-invalid             Write diagnostics but return success for invalid runs.
 )USAGE";
 }
@@ -318,6 +370,24 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.sla_penalty_per_s = ParseDouble(value, name);
 		} else if (name == "max-driver-lag-ms") {
 			config.max_driver_lag_ms = ParseDouble(value, name);
+		} else if (name == "energy-power-model") {
+			config.energy_power_model_path = value;
+		} else if (name == "energy-lambda") {
+			config.sla_energy_lambda = ParseDouble(value, name);
+		} else if (name == "energy-exploration") {
+			config.sla_energy_exploration = ParseBool(value, name);
+		} else if (name == "energy-exploration-seed") {
+			config.sla_energy_exploration_seed = ParseUint(value, name);
+		} else if (name == "energy-hardware-control") {
+			config.sla_energy_hardware_control = ParseBool(value, name);
+		} else if (name == "energy-attribution") {
+			config.energy_attribution_enabled = ParseBool(value, name);
+		} else if (name == "energy-attribution-period-ms") {
+			config.energy_attribution_period_ms = ParseUint(value, name);
+		} else if (name == "energy-attribution-export") {
+			config.energy_attribution_export = ParseBool(value, name);
+		} else if (name == "energy-attribution-debug-export") {
+			config.energy_attribution_debug_export = ParseBool(value, name);
 		} else if (name == "allow-invalid") {
 			config.fail_on_invalid = false;
 		} else {

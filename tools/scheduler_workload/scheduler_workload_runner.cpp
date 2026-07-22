@@ -1,10 +1,14 @@
 #include "scheduler_workload.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/pending_query_notification.hpp"
+#include "duckdb/parallel/query_hardware_manager.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 
 #include <algorithm>
@@ -61,10 +65,67 @@ static void ExecuteSetting(Connection &connection, const string &query) {
 	CheckResult(connection.Query(query), query);
 }
 
+static void ConfigureEnergyAttribution(Connection &root, const WorkloadConfig &config) {
+	if (!config.energy_attribution_enabled) {
+		return;
+	}
+	auto output_dir = config.output_dir + "/energy_attribution";
+	ExecuteSetting(root, "SET energy_attribution_output_dir=" + QuoteSQLString(output_dir));
+	ExecuteSetting(root, "SET energy_attribution_base_power_path=" +
+	                         QuoteSQLString(config.energy_power_model_path));
+	ExecuteSetting(root, "SET energy_attribution_rapl_enable=true");
+	ExecuteSetting(root, "SET energy_attribution_perf_counters_enable=true");
+	ExecuteSetting(root, string("SET energy_attribution_export_enable=") +
+	                         (config.energy_attribution_export ? "true" : "false"));
+	ExecuteSetting(root, string("SET energy_attribution_debug_export_enable=") +
+	                         (config.energy_attribution_debug_export ? "true" : "false"));
+	ExecuteSetting(root, "SET energy_attribution_closed_segments_export_enable=false");
+	ExecuteSetting(root, "SET energy_attribution_overhead_detail_enable=false");
+	ExecuteSetting(root, "SET energy_attribution_pipeline_signatures_enable=false");
+	ExecuteSetting(root, "SET energy_attribution_metadata_cache_enable=true");
+	ExecuteSetting(root, "SET energy_attribution_lifecycle_phases_enable=true");
+	ExecuteSetting(root, "SET energy_attribution_migration_check_enable=true");
+	ExecuteSetting(root, "SET energy_attribution_profile_update_enable=true");
+	ExecuteSetting(root, "SET energy_attribution_period_ms=" +
+	                         std::to_string(config.energy_attribution_period_ms));
+	ExecuteSetting(root, "SET energy_attribution_periodic_enable=true");
+	// Enable last so the runtime starts once with its complete immutable configuration.
+	ExecuteSetting(root, "SET energy_attribution_enable=true");
+}
+
+static void FinalizeEnergyAttribution(DuckDB &db, Connection &root, const WorkloadConfig &config) {
+	if (!config.energy_attribution_enabled) {
+		return;
+	}
+	EnergyAttributionManager::ShutdownDatabaseRuntime(*db.instance);
+	// Prevent diagnostic COPY queries below from starting a second periodic runtime.
+	ClientConfig::GetConfig(*root.context).energy_attribution.enabled = false;
+}
+
+static void ExportRelation(Connection &root, const string &query, const string &path, const string &operation) {
+	CheckResult(root.Query("COPY (" + query + ") TO " + QuoteSQLString(path) + " (HEADER, DELIMITER ',')"),
+	            operation);
+}
+
 static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, QuerySchedulerPolicy policy) {
 	ExecuteSetting(root, "SET threads=" + std::to_string(config.threads));
 	ExecuteSetting(root, "SET external_threads=0");
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
+	if (policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled) {
+		ExecuteSetting(root, "SET pin_threads='on'");
+	}
+	if (policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		ExecuteSetting(root, string("SET query_sla_energy_hardware_control_enable=") +
+		                         (config.sla_energy_hardware_control ? "true" : "false"));
+		ExecuteSetting(root, "SET query_sla_energy_lambda=" + std::to_string(config.sla_energy_lambda));
+		ExecuteSetting(root, string("SET query_sla_energy_exploration_enable=") +
+		                         (config.sla_energy_exploration ? "true" : "false"));
+		ExecuteSetting(root, "SET query_sla_energy_exploration_seed=" +
+		                         std::to_string(config.sla_energy_exploration_seed));
+		ExecuteSetting(root, "SET query_sla_energy_power_model_path=" +
+		                         QuoteSQLString(config.energy_power_model_path));
+	}
+	ConfigureEnergyAttribution(root, config);
 	ExecuteSetting(root, "SET scheduler_policy='" + SchedulerName(policy) + "'");
 	for (const auto &database : config.databases) {
 		ExecuteSetting(root, "ATTACH " + QuoteSQLString(database.path) + " AS sf" +
@@ -532,14 +593,38 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	}
 	auto summary = Summarize(config, schedule, results, run_start_ns, notification_queue->HighWaterMark(),
 	                         max_waiters.load());
+	FinalizeEnergyAttribution(db, root, config);
+	db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
 	if (!config.scheduler_trace_templates.empty()) {
-		db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
 		auto trace_path = config.output_dir + "/query_sla_scheduler_epochs.csv";
-		CheckResult(root.Query("COPY (SELECT * FROM duckdb_debug_query_sla_scheduler_epochs()) TO " +
-		                       QuoteSQLString(trace_path) + " (HEADER, DELIMITER ',')"),
-		            "export SLA scheduler epoch trace");
+		ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_scheduler_epochs()", trace_path,
+		               "export SLA scheduler epoch trace");
+	}
+	if (config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		ExportRelation(root, "SELECT * FROM duckdb_debug_query_request_pipeline_hardware_profiles()",
+		               config.output_dir + "/query_request_pipeline_hardware_profiles.csv",
+		               "export pipeline hardware profiles");
+		ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_energy_hardware()",
+		               config.output_dir + "/query_sla_energy_hardware.csv", "export SLA-energy hardware state");
+		if (!config.scheduler_trace_templates.empty()) {
+			ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_energy_worker_epochs()",
+			               config.output_dir + "/query_sla_energy_worker_epochs.csv",
+			               "export SLA-energy worker trace");
+		}
 	}
 	ExportProfiles(db, config);
+	if (config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		auto &scheduler = db.instance->GetQuerySLAScheduler();
+		scheduler.DeactivateEnergyPolicy();
+		auto restoration = scheduler.GetHardwareManager().GetSnapshot();
+		if (config.sla_energy_hardware_control && restoration.restoration_failure_count > 0) {
+			summary.validity_errors.push_back("hardware_restoration_verification_failed");
+			summary.valid = false;
+		}
+		ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_energy_hardware()",
+		               config.output_dir + "/query_sla_energy_hardware_restoration.csv",
+		               "export post-restoration SLA-energy hardware state");
+	}
 	return summary;
 }
 

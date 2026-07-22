@@ -1,6 +1,6 @@
 # Native Scheduler Workload
 
-`scheduler_workload` is the controlled native driver for comparing DuckDB's `default`, `stride`, and `sla` scheduling policies. It generates the mixed analytical workload described in Section 5.1 of *Self-Tuning Query Scheduling for Analytical Workloads* without Python threads, the Python GIL, pending-state polling, or a cursor-pool limit.
+`scheduler_workload` is the controlled native driver for comparing DuckDB's `default`, `stride`, `sla`, and `sla_energy` scheduling policies. It generates the mixed analytical workload described in Section 5.1 of *Self-Tuning Query Scheduling for Analytical Workloads* without Python threads, the Python GIL, pending-state polling, or a cursor-pool limit.
 
 ## Build
 
@@ -79,6 +79,68 @@ done
 
 Each summary contains the schedule SHA-256. Comparisons are valid only when those hashes match and every run reports `"valid": true`.
 
+## SLA-Energy Training And Evaluation
+
+SLA-energy evaluation has two separate stages. Exploration is enabled only during profile training. A measured run imports the resulting exact hardware-pair profiles and disables exploration, so probes do not perturb the reported policy.
+
+Start with the policy-neutral snapshot produced by `train-profiles`, then run a saved training schedule with direct hardware control and deterministic epoch-scoped exploration:
+
+```bash
+sudo scheduler_workload run \
+  --database 10=/data/tpch_sf10.duckdb \
+  --database 100=/data/tpch_sf100.duckdb \
+  --queries-dir /repo/workloads/tpch/queries/duckdb \
+  --queries all \
+  --threads 16 \
+  --admission-cap 128 \
+  --schedule training_schedule.csv \
+  --scheduler sla_energy \
+  --profile-input profiles.bin \
+  --profile-output energy_profiles.bin \
+  --energy-power-model base_power_core_uncore_sweep.csv \
+  --energy-lambda 1 \
+  --energy-exploration on \
+  --energy-exploration-seed 1 \
+  --energy-hardware-control on \
+  --energy-attribution on \
+  --energy-attribution-period-ms 100 \
+  --output-dir results/sla_energy_training
+```
+
+Training may be repeated by using `energy_profiles.bin` as both the input and output snapshot until the required pipeline/pair coverage is mature. Each exact pair requires at least eight stable throughput observations and eight stable power observations. Every warmup epoch selects at most one incomplete optional-only core pair and one incomplete optional-only socket pair. If no optional-only socket appears for four active epochs, one active socket is sampled as a training-only fallback. Core and uncore targets remain selected until the next epoch or until the domain loses its assignment. Unstable mixed-frequency or migrated segments are rejected rather than contaminating the profile.
+
+Evaluate on a different saved schedule and seed with exploration disabled:
+
+```bash
+sudo scheduler_workload run \
+  --database 10=/data/tpch_sf10.duckdb \
+  --database 100=/data/tpch_sf100.duckdb \
+  --queries-dir /repo/workloads/tpch/queries/duckdb \
+  --queries all \
+  --threads 16 \
+  --admission-cap 128 \
+  --schedule evaluation_schedule.csv \
+  --scheduler sla_energy \
+  --profile-input energy_profiles.bin \
+  --energy-power-model base_power_core_uncore_sweep.csv \
+  --energy-lambda 1 \
+  --energy-exploration off \
+  --energy-hardware-control on \
+  --energy-attribution on \
+  --energy-attribution-period-ms 100 \
+  --output-dir results/sla_energy_evaluation
+```
+
+Periodic RAPL attribution is enabled explicitly with `--energy-attribution on`, independently of the selected scheduler. Before exporting a snapshot, the driver synchronously stops attribution and flushes the final partial window. Aggregate attribution output is written below `OUTPUT_DIR/energy_attribution`; disable only the files, not profile updates, with `--energy-attribution-export off`. Use `--energy-attribution-debug-export on` only for attribution diagnosis; it additionally exports per-socket windows and attributed segments.
+
+For a fair energy baseline, run the identical schedule and profile snapshot with `--scheduler sla`, the same `--energy-power-model`, and `--energy-attribution on`. The driver pins the common worker pool whenever attribution is enabled, so DEFAULT, STRIDE, SLA, and SLA-energy measurements use stable worker-to-hardware topology. Only SLA-energy enables direct frequency control; the other policies leave frequency selection to the configured OS governor.
+
+The driver exports `query_sla_energy_hardware.csv` before shutdown and `query_sla_energy_hardware_restoration.csv` after explicitly deactivating the energy policy. The latter reports exact MSR restoration attempts, successful readback verifications, and failures. A real hardware-controlled run is invalid if any restoration write or readback fails. Both upshifts and downshifts are applied synchronously and verified. Exploration diagnostics report core-probe epochs, optional-only socket-probe epochs, forced socket-probe epochs, and the current optional-only-socket miss count.
+
+`--energy-hardware-control off` is a dry-run mode for unit and scheduler validation. It publishes and verifies logical targets without opening MSRs. Combining SLA-energy dry-run targets with `--energy-attribution on` is rejected because the logical target would not identify the physical frequency used by an attributed segment.
+
+SLA-energy runs additionally export `query_request_pipeline_hardware_profiles.csv` and `query_sla_energy_hardware.csv`. With targeted scheduler tracing enabled, they also export `query_sla_energy_worker_epochs.csv`; the epoch trace separates model/allocation time from `hardware_apply_ns`.
+
 ## Common Environment
 
 Every measured policy uses:
@@ -88,9 +150,11 @@ Every measured policy uses:
 - `query_admission_max_active=128` by default;
 - query profiling enabled so bounded profiles continue adapting online;
 - activation and admission debug tracing disabled;
-- OS-controlled core and uncore frequency.
+- pinned worker topology whenever energy attribution is enabled; DEFAULT, STRIDE, and SLA leave frequency control to the OS governor, while SLA-energy applies explicit MSR targets.
 
 Only `scheduler_policy` changes between runs.
+
+The OS-frequency statement applies to the `default`, `stride`, and pure `sla` comparison. `sla_energy` deliberately uses direct MSR control and must be reported as a separate hardware-aware experiment.
 
 ## Event-Driven Execution
 

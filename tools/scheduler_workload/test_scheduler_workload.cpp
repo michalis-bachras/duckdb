@@ -66,6 +66,48 @@ int main() {
 		auto round_trip = ReadSchedule(path);
 		std::remove(path.c_str());
 		Require(ScheduleHash(first) == ScheduleHash(round_trip), "schedule CSV round trip");
+
+		const char *arguments[] = {
+		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
+		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla_energy",
+		    "--energy-power-model", "/tmp/power.csv", "--energy-hardware-control", "off",
+		    "--energy-exploration", "on", "--energy-exploration-seed", "17",
+		    "--energy-attribution-period-ms", "50",
+		    "--energy-attribution-export", "off", "--energy-attribution-debug-export", "on"};
+		auto parsed = ParseConfig(sizeof(arguments) / sizeof(arguments[0]), const_cast<char **>(arguments));
+		Require(parsed.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY, "SLA-energy scheduler parsing");
+		Require(!parsed.sla_energy_hardware_control, "dry-run hardware mode parsing");
+		Require(parsed.sla_energy_exploration, "exploration mode parsing");
+		Require(parsed.sla_energy_exploration_seed == 17, "exploration seed parsing");
+		Require(!parsed.energy_attribution_enabled, "attribution is explicit and defaults off");
+		Require(parsed.energy_attribution_period_ms == 50, "attribution period parsing");
+		Require(!parsed.energy_attribution_export, "attribution export parsing");
+		Require(parsed.energy_attribution_debug_export, "attribution debug export parsing");
+
+		const char *sla_attribution_arguments[] = {
+		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
+		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla",
+		    "--energy-power-model", "/tmp/power.csv", "--energy-attribution", "on"};
+		auto sla_attribution = ParseConfig(sizeof(sla_attribution_arguments) / sizeof(sla_attribution_arguments[0]),
+		                                   const_cast<char **>(sla_attribution_arguments));
+		Require(sla_attribution.scheduler_policy == QuerySchedulerPolicy::SLA,
+		        "SLA baseline scheduler parsing");
+		Require(sla_attribution.energy_attribution_enabled, "policy-independent attribution parsing");
+		Require(sla_attribution.energy_power_model_path == "/tmp/power.csv", "attribution power model parsing");
+
+		const char *unsafe_dry_run_arguments[] = {
+		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
+		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla_energy",
+		    "--energy-power-model", "/tmp/power.csv", "--energy-hardware-control", "off",
+		    "--energy-attribution", "on"};
+		bool rejected_unsafe_dry_run = false;
+		try {
+			ParseConfig(sizeof(unsafe_dry_run_arguments) / sizeof(unsafe_dry_run_arguments[0]),
+			            const_cast<char **>(unsafe_dry_run_arguments));
+		} catch (InvalidInputException &) {
+			rejected_unsafe_dry_run = true;
+		}
+		Require(rejected_unsafe_dry_run, "attribution rejects logical-only SLA-energy hardware targets");
 		std::cout << "scheduler_workload tests passed\n";
 		return 0;
 	} catch (std::exception &ex) {

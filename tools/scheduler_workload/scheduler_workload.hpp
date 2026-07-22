@@ -64,6 +64,15 @@ struct WorkloadConfig {
 	double sla_tag = 30;
 	double sla_penalty_per_s = 1;
 	double max_driver_lag_ms = 10;
+	double sla_energy_lambda = 1;
+	uint64_t sla_energy_exploration_seed = 1;
+	idx_t energy_attribution_period_ms = 100;
+	string energy_power_model_path;
+	bool sla_energy_exploration = false;
+	bool sla_energy_hardware_control = true;
+	bool energy_attribution_enabled = false;
+	bool energy_attribution_export = true;
+	bool energy_attribution_debug_export = false;
 	bool fail_on_invalid = true;
 };
 
