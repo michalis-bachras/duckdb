@@ -1080,6 +1080,8 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerBind(ClientContext &conte
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("optional_workers");
 	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("residual_workers");
+	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("assigned_workers");
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("next_mandatory_gain");
@@ -1116,6 +1118,7 @@ static void DuckDBQuerySLASchedulerFunction(ClientContext &context, TableFunctio
 		output.SetValue(col++, count, Value::BOOLEAN(snapshot.throughput_is_live));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.mandatory_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.optional_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.residual_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.assigned_workers));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.next_mandatory_gain));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.next_optional_gain));
@@ -1182,6 +1185,7 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext 
 	SLA_EPOCH_COLUMN("suffix_p90_ns", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("mandatory_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("optional_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("residual_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("liveness_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("planned_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("assigned_workers", LogicalType::UBIGINT);
@@ -1401,6 +1405,7 @@ static void DuckDBQuerySLASchedulerEpochsFunction(ClientContext &context, TableF
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.suffix_p90_ns));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.mandatory_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.optional_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.residual_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.liveness_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.planned_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.assigned_workers));

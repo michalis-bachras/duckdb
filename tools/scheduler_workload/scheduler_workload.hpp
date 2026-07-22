@@ -64,6 +64,7 @@ struct WorkloadConfig {
 	double sla_tag = 30;
 	double sla_penalty_per_s = 1;
 	double max_driver_lag_ms = 10;
+	bool sla_residual_workers_enabled = true;
 	double sla_energy_lambda = 1;
 	uint64_t sla_energy_exploration_seed = 1;
 	idx_t energy_attribution_period_ms = 100;

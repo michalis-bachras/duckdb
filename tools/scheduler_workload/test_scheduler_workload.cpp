@@ -72,6 +72,7 @@ int main() {
 		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla_energy",
 		    "--energy-power-model", "/tmp/power.csv", "--energy-hardware-control", "off",
 		    "--energy-exploration", "on", "--energy-exploration-seed", "17",
+		    "--sla-residual-policy", "park",
 		    "--energy-attribution-period-ms", "50",
 		    "--energy-attribution-export", "off", "--energy-attribution-debug-export", "on"};
 		auto parsed = ParseConfig(sizeof(arguments) / sizeof(arguments[0]), const_cast<char **>(arguments));
@@ -79,6 +80,7 @@ int main() {
 		Require(!parsed.sla_energy_hardware_control, "dry-run hardware mode parsing");
 		Require(parsed.sla_energy_exploration, "exploration mode parsing");
 		Require(parsed.sla_energy_exploration_seed == 17, "exploration seed parsing");
+		Require(!parsed.sla_residual_workers_enabled, "parked residual-worker policy parsing");
 		Require(!parsed.energy_attribution_enabled, "attribution is explicit and defaults off");
 		Require(parsed.energy_attribution_period_ms == 50, "attribution period parsing");
 		Require(!parsed.energy_attribution_export, "attribution export parsing");

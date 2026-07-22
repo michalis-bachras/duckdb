@@ -1117,6 +1117,17 @@ struct QuerySLASchedulerEpochMsSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct QuerySLAResidualPolicySetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "query_sla_residual_policy";
+	static constexpr const char *Description =
+	    "Select whether the SLA-only scheduler assigns zero-gain residual workers: work_conserving or park";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct QuerySLAEnergyHardwareControlEnableSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "query_sla_energy_hardware_control_enable";

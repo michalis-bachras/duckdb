@@ -47,6 +47,7 @@ struct QuerySLASchedulerSnapshot {
 	bool throughput_is_live = false;
 	idx_t mandatory_workers = 0;
 	idx_t optional_workers = 0;
+	idx_t residual_workers = 0;
 	idx_t assigned_workers = 0;
 	double next_mandatory_gain = 0;
 	double next_optional_gain = 0;
@@ -104,6 +105,7 @@ struct QuerySLASchedulerEpochSnapshot {
 	double suffix_p90_ns = 0;
 	idx_t mandatory_workers = 0;
 	idx_t optional_workers = 0;
+	idx_t residual_workers = 0;
 	idx_t liveness_workers = 0;
 	idx_t planned_workers = 0;
 	idx_t assigned_workers = 0;

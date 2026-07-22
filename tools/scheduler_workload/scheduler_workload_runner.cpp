@@ -111,6 +111,8 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 	ExecuteSetting(root, "SET threads=" + std::to_string(config.threads));
 	ExecuteSetting(root, "SET external_threads=0");
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
+	ExecuteSetting(root, string("SET query_sla_residual_policy=") +
+	                         QuoteSQLString(config.sla_residual_workers_enabled ? "work_conserving" : "park"));
 	if (policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled) {
 		ExecuteSetting(root, "SET pin_threads='on'");
 	}

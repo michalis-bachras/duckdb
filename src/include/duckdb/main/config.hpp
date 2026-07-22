@@ -117,6 +117,8 @@ struct DBConfigOptions {
 	QuerySchedulerPolicy query_scheduler_policy = QuerySchedulerPolicy::DEFAULT;
 	//! SLA scheduler epoch length in milliseconds.
 	idx_t query_sla_scheduler_epoch_ms = 200;
+	//! Whether the SLA-only scheduler assigns zero-gain residual workers up to pipeline demand caps.
+	bool query_sla_residual_workers_enabled = true;
 	//! Whether SLA-energy applies core and uncore targets through the direct MSR backend.
 	bool query_sla_energy_hardware_control_enabled = true;
 	//! Relative weight of predicted energy in the SLA-energy optional-worker objective.

@@ -187,10 +187,12 @@ struct QuerySLASchedulerState {
 		QuerySLAModel model;
 		idx_t mandatory_workers = 0;
 		idx_t optional_workers = 0;
+		idx_t residual_workers = 0;
 		idx_t liveness_workers = 0;
 		idx_t assigned_workers = 0;
 		vector<QuerySLAEnergyWorkerAssignment> energy_workers;
 		bool energy_limited_plan = false;
+		bool residual_dispatch_enabled = true;
 		bool topology_plan_published = false;
 		uint64_t dispatch_version = 0;
 		bool continuation_pending = false;
@@ -223,7 +225,7 @@ struct QuerySLASchedulerState {
 };
 
 static idx_t PlannedWorkers(const QuerySLASchedulerState::QueryState &query) {
-	return query.mandatory_workers + query.optional_workers + query.liveness_workers;
+	return query.mandatory_workers + query.optional_workers + query.residual_workers + query.liveness_workers;
 }
 
 static QuerySLAEnergyWorkerAssignment EnergyAssignmentAt(const QuerySLASchedulerState::QueryState &query,
@@ -284,7 +286,8 @@ static void RefreshDispatchEntries(QuerySLASchedulerState &state, QuerySLASchedu
 		state.dynamic_optional.emplace(query.model.optional_gain[planned], query.metadata.db_query_id,
 		                               query.dispatch_version, planned);
 	}
-	if (planned < query.model.mandatory_gain.size() && planned < query.model.optional_gain.size()) {
+	if (query.residual_dispatch_enabled && planned < query.model.mandatory_gain.size() &&
+	    planned < query.model.optional_gain.size()) {
 		state.dynamic_residual.emplace(query.model.mandatory_gain[planned], query.model.optional_gain[planned],
 		                               query.metadata.db_query_id, query.dispatch_version, planned);
 	}
@@ -337,6 +340,8 @@ void QuerySLAScheduler::RegisterQuery(const QueryRequestMetadata &metadata, Prod
 	}
 	query.metadata = metadata;
 	query.producer = &producer;
+	query.residual_dispatch_enabled =
+	    db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA && db.config.options.query_sla_residual_workers_enabled;
 	query.debug_trace_enabled = debug_trace_enabled;
 	state->next_epoch_ns.store(0);
 }
@@ -423,9 +428,12 @@ void QuerySLAScheduler::OnEventScheduled(uint64_t db_query_id, shared_ptr<Event>
 		query.mandatory_workers++;
 	}
 	query.optional_workers = planned - query.mandatory_workers;
+	query.residual_workers = 0;
 	query.liveness_workers = 0;
 	query.energy_workers.clear();
 	query.energy_limited_plan = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
+	query.residual_dispatch_enabled =
+	    !query.energy_limited_plan && db.config.options.query_sla_residual_workers_enabled;
 	query.topology_plan_published = false;
 	if (query.energy_limited_plan && planned > 0) {
 		QuerySLAEnergyWorkerAssignment worker;
@@ -452,6 +460,7 @@ void QuerySLAScheduler::OnEventFinished(uint64_t db_query_id, Event &event) {
 	entry->second.model = QuerySLAModel();
 	entry->second.mandatory_workers = 0;
 	entry->second.optional_workers = 0;
+	entry->second.residual_workers = 0;
 	entry->second.liveness_workers = 0;
 	entry->second.assigned_workers = 0;
 	entry->second.energy_workers.clear();
@@ -608,6 +617,7 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 	const auto energy_policy = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
 	vector<idx_t> mandatory(captures.size(), 0);
 	vector<idx_t> optional(captures.size(), 0);
+	vector<idx_t> residual(captures.size(), 0);
 	vector<idx_t> liveness(captures.size(), 0);
 	vector<vector<QuerySLAEnergyWorkerAssignment>> energy_workers(captures.size());
 	QuerySLAEnergyEpochPlan energy_epoch_plan;
@@ -651,14 +661,11 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			energy_workers[i] = energy_epoch_plan.queries[i].workers;
 		}
 	} else {
-		// Preserve the SLA-only scheduler's work-conserving policy by folding residual workers into its historical
-		// optional-worker count. The shared allocator keeps the classes separate for derived policies.
-		auto allocation = AllocateQuerySLAWorkers(models, worker_budget, true);
+		auto allocation = AllocateQuerySLAWorkers(models, worker_budget,
+		                                          db.config.options.query_sla_residual_workers_enabled);
 		mandatory = std::move(allocation.mandatory);
 		optional = std::move(allocation.optional);
-		for (idx_t i = 0; i < optional.size(); i++) {
-			optional[i] += allocation.residual[i];
-		}
+		residual = std::move(allocation.residual);
 	}
 	const auto allocation_ns = collect_diagnostics ? SLADurationNs(SLATimestampNs(), allocation_start_ns) : 0;
 
@@ -681,7 +688,7 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			input.remaining_work_units = models[i].remaining_work_units;
 			input.selected_throughput = models[i].throughput;
 			input.throughput_is_live = models[i].throughput_is_live;
-			auto planned_workers = mandatory[i] + optional[i] + liveness[i];
+			auto planned_workers = mandatory[i] + optional[i] + residual[i] + liveness[i];
 			if (models[i].valid && planned_workers < models[i].mandatory_cost.size()) {
 				input.predicted_sla_cost = models[i].mandatory_cost[planned_workers];
 			}
@@ -703,7 +710,8 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 				if (mandatory[i] > 0 && mandatory[i] <= models[i].mandatory_gain.size()) {
 					input.last_mandatory_gain = models[i].mandatory_gain[mandatory[i] - 1];
 				}
-				if (optional[i] > 0 && planned_workers > 0 && planned_workers <= models[i].optional_gain.size()) {
+				if ((optional[i] > 0 || residual[i] > 0) && planned_workers > 0 &&
+				    planned_workers <= models[i].optional_gain.size()) {
 					input.last_optional_gain = models[i].optional_gain[planned_workers - 1];
 				}
 				if (planned_workers < models[i].mandatory_gain.size()) {
@@ -747,9 +755,12 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		entry->second.model = std::move(models[i]);
 		entry->second.mandatory_workers = mandatory[i];
 		entry->second.optional_workers = optional[i];
+		entry->second.residual_workers = residual[i];
 		entry->second.liveness_workers = liveness[i];
 		entry->second.energy_workers = std::move(energy_workers[i]);
 		entry->second.energy_limited_plan = energy_policy;
+		entry->second.residual_dispatch_enabled =
+		    !energy_policy && db.config.options.query_sla_residual_workers_enabled;
 		entry->second.topology_plan_published = energy_policy;
 		if (trace_input_indexes[i] != DConstants::INVALID_INDEX) {
 			auto &trace_input = trace_inputs[trace_input_indexes[i]];
@@ -938,8 +949,9 @@ void QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		trace.suffix_p90_ns = QuerySLASuffixQuantileNs(suffix, 0.90);
 		trace.mandatory_workers = mandatory[i];
 		trace.optional_workers = optional[i];
+		trace.residual_workers = residual[i];
 		trace.liveness_workers = liveness[i];
-		trace.planned_workers = mandatory[i] + optional[i] + liveness[i];
+		trace.planned_workers = mandatory[i] + optional[i] + residual[i] + liveness[i];
 		trace.assigned_workers = input.assigned_workers;
 		if (energy_policy) {
 			const auto &diagnostics = energy_epoch_plan.diagnostics;
@@ -1148,7 +1160,7 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 				unavailable.push_back(candidate);
 				continue;
 			}
-			query.optional_workers++;
+			query.residual_workers++;
 			query.assigned_workers++;
 			assign_worker(query, false);
 			RefreshDispatchEntries(*state, query);
@@ -1192,6 +1204,7 @@ vector<QuerySLASchedulerSnapshot> QuerySLAScheduler::GetSnapshot() const {
 		snapshot.throughput_is_live = query.model.throughput_is_live;
 		snapshot.mandatory_workers = query.mandatory_workers;
 		snapshot.optional_workers = query.optional_workers;
+		snapshot.residual_workers = query.residual_workers;
 		snapshot.assigned_workers = query.assigned_workers;
 		if (query.assigned_workers < query.model.mandatory_gain.size()) {
 			snapshot.next_mandatory_gain = query.model.mandatory_gain[query.assigned_workers];

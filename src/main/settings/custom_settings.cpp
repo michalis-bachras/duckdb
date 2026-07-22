@@ -2038,6 +2038,36 @@ Value QuerySLASchedulerEpochMsSetting::GetSetting(const ClientContext &context) 
 	return Value::UBIGINT(DBConfig::GetConfig(context).options.query_sla_scheduler_epoch_ms);
 }
 
+void QuerySLAResidualPolicySetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto value = StringUtil::Lower(input.ToString());
+	bool enabled;
+	if (value == "work_conserving") {
+		enabled = true;
+	} else if (value == "park") {
+		enabled = false;
+	} else {
+		throw InvalidInputException("query_sla_residual_policy must be one of: work_conserving, park");
+	}
+	if (db && enabled != config.options.query_sla_residual_workers_enabled &&
+	    db->GetQuerySLAScheduler().ActiveQueryCount() != 0) {
+		throw InvalidInputException("query_sla_residual_policy cannot change while SLA-managed queries are active");
+	}
+	config.options.query_sla_residual_workers_enabled = enabled;
+}
+
+void QuerySLAResidualPolicySetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	auto enabled = DBConfigOptions().query_sla_residual_workers_enabled;
+	if (db && enabled != config.options.query_sla_residual_workers_enabled &&
+	    db->GetQuerySLAScheduler().ActiveQueryCount() != 0) {
+		throw InvalidInputException("query_sla_residual_policy cannot reset while SLA-managed queries are active");
+	}
+	config.options.query_sla_residual_workers_enabled = enabled;
+}
+
+Value QuerySLAResidualPolicySetting::GetSetting(const ClientContext &context) {
+	return Value(DBConfig::GetConfig(context).options.query_sla_residual_workers_enabled ? "work_conserving" : "park");
+}
+
 void QuerySLAEnergyHardwareControlEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config,
 	                                                       const Value &input) {
 	if (config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {

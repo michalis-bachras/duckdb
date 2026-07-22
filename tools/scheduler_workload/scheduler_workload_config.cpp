@@ -240,6 +240,8 @@ Run options:
   --max-driver-lag-ms X       p99 arrival, DB submission, and admission-resume gate (default: 10).
 	  --scheduler-trace-queries Q2,Q9,...
 	                              Enable debug epoch tracing only for these templates.
+	  --sla-residual-policy work_conserving|park
+	                              SLA-only zero-gain residual-worker policy (default: work_conserving).
 	  --energy-power-model PATH  Calibrated socket/core power table for SLA-energy and attribution.
 	  --energy-lambda X          Energy weight for optional-worker utility (default: 1).
 	  --energy-exploration on|off
@@ -370,6 +372,15 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.sla_penalty_per_s = ParseDouble(value, name);
 		} else if (name == "max-driver-lag-ms") {
 			config.max_driver_lag_ms = ParseDouble(value, name);
+		} else if (name == "sla-residual-policy") {
+			auto policy = StringUtil::Lower(value);
+			if (policy == "work_conserving") {
+				config.sla_residual_workers_enabled = true;
+			} else if (policy == "park") {
+				config.sla_residual_workers_enabled = false;
+			} else {
+				throw InvalidInputException("--sla-residual-policy must be one of: work_conserving, park");
+			}
 		} else if (name == "energy-power-model") {
 			config.energy_power_model_path = value;
 		} else if (name == "energy-lambda") {
