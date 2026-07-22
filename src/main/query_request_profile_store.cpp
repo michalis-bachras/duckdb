@@ -27,9 +27,10 @@ namespace query_request_profile_store_internal {
 static const idx_t PROFILE_SAMPLE_LIMIT = 100;
 static const idx_t DOWNSTREAM_SUFFIX_MIN_EXACT_SAMPLES = 4;
 static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
+static constexpr double HARDWARE_POWER_EWMA_ALPHA = 0.7;
 static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
 static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
-static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 2;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 4;
 static const char *PROFILE_SNAPSHOT_MAGIC = "DUCKDB_QUERY_REQUEST_PROFILE";
 
 class ProfileSnapshotWriter {
@@ -573,6 +574,64 @@ struct ThroughputAggregate {
 	}
 };
 
+struct PipelineHardwareProfileKey {
+	PipelineProfileKey pipeline;
+	QueryRequestHardwareConfiguration hardware;
+
+	bool operator==(const PipelineHardwareProfileKey &other) const {
+		return pipeline == other.pipeline && hardware == other.hardware;
+	}
+};
+
+struct PipelineHardwareProfileKeyHash {
+	size_t operator()(const PipelineHardwareProfileKey &key) const {
+		auto result = PipelineProfileKeyHash {}(key.pipeline);
+		result ^= std::hash<uint32_t> {}(key.hardware.core_frequency_khz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<uint32_t> {}(key.hardware.uncore_frequency_khz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		return result;
+	}
+};
+
+struct PipelineHardwareProfileAggregate {
+	PipelineHardwareProfileKey key;
+	BoundedSamples throughput;
+	BoundedSamples active_power_w;
+	BoundedSamples charged_power_w;
+	double throughput_ewma = 0;
+	double active_power_ewma = 0;
+	double charged_power_ewma = 0;
+	idx_t rejected_unstable_samples = 0;
+
+	void AddThroughput(double value) {
+		if (!std::isfinite(value) || value <= 0) {
+			return;
+		}
+		auto first = throughput.Count() == 0;
+		throughput.Add(value);
+		throughput_ewma = first ? value
+		                        : THROUGHPUT_EWMA_ALPHA * value + (1.0 - THROUGHPUT_EWMA_ALPHA) * throughput_ewma;
+	}
+
+	void AddPower(double active_value, double charged_value) {
+		if (!std::isfinite(active_value) || active_value < 0 || !std::isfinite(charged_value) ||
+		    charged_value < active_value) {
+			return;
+		}
+		auto first_active = active_power_w.Count() == 0;
+		active_power_w.Add(active_value);
+		active_power_ewma = first_active ? active_value
+		                                 : HARDWARE_POWER_EWMA_ALPHA * active_value +
+		                                       (1.0 - HARDWARE_POWER_EWMA_ALPHA) * active_power_ewma;
+		auto first = charged_power_w.Count() == 0;
+		charged_power_w.Add(charged_value);
+		charged_power_ewma = first ? charged_value
+		                           : HARDWARE_POWER_EWMA_ALPHA * charged_value +
+		                                 (1.0 - HARDWARE_POWER_EWMA_ALPHA) * charged_power_ewma;
+	}
+};
+
 struct QueryProfileAggregate {
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
@@ -639,6 +698,8 @@ struct QueryRequestProfileStoreState {
 	    scale_internal_event_profiles;
 	std::unordered_map<InternalEventFallbackKey, InternalEventProfileAggregate, InternalEventFallbackKeyHash>
 	    global_internal_event_profiles;
+	std::unordered_map<PipelineHardwareProfileKey, PipelineHardwareProfileAggregate, PipelineHardwareProfileKeyHash>
+	    pipeline_hardware_profiles;
 	ContinuationAggregate global_finish_tail_profile;
 	vector<QueryRequestSampleSnapshot> query_samples;
 	vector<QueryRequestPipelineInstanceSnapshot> pipeline_instances;
@@ -669,6 +730,8 @@ struct ProfileSnapshotState {
 	    scale_internal_event_profiles;
 	std::unordered_map<InternalEventFallbackKey, InternalEventProfileAggregate, InternalEventFallbackKeyHash>
 	    global_internal_event_profiles;
+	std::unordered_map<PipelineHardwareProfileKey, PipelineHardwareProfileAggregate, PipelineHardwareProfileKeyHash>
+	    pipeline_hardware_profiles;
 	ContinuationAggregate global_finish_tail_profile;
 };
 
@@ -850,6 +913,59 @@ static InternalEventProfileAggregate ReadInternalEventAggregate(ProfileSnapshotR
 	return result;
 }
 
+static void WritePipelineHardwareProfile(ProfileSnapshotWriter &writer,
+	                                     const PipelineHardwareProfileAggregate &profile) {
+	writer.Write<uint64_t>(profile.key.pipeline.template_id);
+	writer.Write<uint64_t>(profile.key.pipeline.scale_factor);
+	writer.Write<uint64_t>(profile.key.pipeline.pipeline_id);
+	writer.Write<uint64_t>(profile.key.pipeline.pipeline_signature_hash);
+	writer.Write<uint32_t>(profile.key.hardware.core_frequency_khz);
+	writer.Write<uint32_t>(profile.key.hardware.uncore_frequency_khz);
+	WriteBoundedSamples(writer, profile.throughput);
+	WriteBoundedSamples(writer, profile.active_power_w);
+	WriteBoundedSamples(writer, profile.charged_power_w);
+	writer.Write<double>(profile.throughput_ewma);
+	writer.Write<double>(profile.active_power_ewma);
+	writer.Write<double>(profile.charged_power_ewma);
+	writer.Write<uint64_t>(profile.rejected_unstable_samples);
+}
+
+static PipelineHardwareProfileAggregate ReadPipelineHardwareProfile(ProfileSnapshotReader &reader) {
+	PipelineHardwareProfileAggregate result;
+	result.key.pipeline.template_id = reader.Read<uint64_t>();
+	result.key.pipeline.scale_factor = reader.Read<uint64_t>();
+	result.key.pipeline.pipeline_id = reader.Read<uint64_t>();
+	result.key.pipeline.pipeline_signature_hash = reader.Read<uint64_t>();
+	result.key.hardware.core_frequency_khz = reader.Read<uint32_t>();
+	result.key.hardware.uncore_frequency_khz = reader.Read<uint32_t>();
+	if (!result.key.hardware.IsValid()) {
+		throw SerializationException("Invalid hardware pair in query profile snapshot");
+	}
+	result.throughput = ReadBoundedSamples(reader);
+	result.active_power_w = ReadBoundedSamples(reader);
+	result.charged_power_w = ReadBoundedSamples(reader);
+	result.throughput_ewma = reader.Read<double>();
+	result.active_power_ewma = reader.Read<double>();
+	result.charged_power_ewma = reader.Read<double>();
+	result.rejected_unstable_samples = reader.Read<uint64_t>();
+	if ((!result.throughput.values.empty() &&
+	     (!std::isfinite(result.throughput_ewma) || result.throughput_ewma <= 0)) ||
+	    (result.throughput.values.empty() && result.throughput_ewma != 0)) {
+		throw SerializationException("Invalid hardware throughput EWMA in query profile snapshot");
+	}
+	if ((!result.active_power_w.values.empty() &&
+	     (!std::isfinite(result.active_power_ewma) || result.active_power_ewma < 0)) ||
+	    (result.active_power_w.values.empty() && result.active_power_ewma != 0)) {
+		throw SerializationException("Invalid hardware active-power EWMA in query profile snapshot");
+	}
+	if ((!result.charged_power_w.values.empty() &&
+	     (!std::isfinite(result.charged_power_ewma) || result.charged_power_ewma < 0)) ||
+	    (result.charged_power_w.values.empty() && result.charged_power_ewma != 0)) {
+		throw SerializationException("Invalid hardware power EWMA in query profile snapshot");
+	}
+	return result;
+}
+
 static ProfileSnapshotState CaptureSnapshotState(QueryRequestProfileStoreState &state) {
 	ProfileSnapshotState result;
 	lock_guard<std::mutex> guard(state.lock);
@@ -866,6 +982,7 @@ static ProfileSnapshotState CaptureSnapshotState(QueryRequestProfileStoreState &
 	result.internal_event_profiles = state.internal_event_profiles;
 	result.scale_internal_event_profiles = state.scale_internal_event_profiles;
 	result.global_internal_event_profiles = state.global_internal_event_profiles;
+	result.pipeline_hardware_profiles = state.pipeline_hardware_profiles;
 	result.global_finish_tail_profile = state.global_finish_tail_profile;
 	return result;
 }
@@ -942,6 +1059,10 @@ static void WriteSnapshotState(ProfileSnapshotWriter &writer, const ProfileSnaps
 		writer.WriteString(entry.first.event_type);
 		writer.WriteString(entry.first.native_unit);
 		WriteInternalEventAggregate(writer, entry.second);
+	}
+	writer.Write<uint64_t>(snapshot.pipeline_hardware_profiles.size());
+	for (const auto &entry : snapshot.pipeline_hardware_profiles) {
+		WritePipelineHardwareProfile(writer, entry.second);
 	}
 	WriteContinuation(writer, snapshot.global_finish_tail_profile);
 }
@@ -1063,6 +1184,14 @@ static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader) {
 			throw SerializationException("Duplicate global internal event profile in query profile snapshot");
 		}
 	}
+	auto hardware_profile_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "pipeline hardware profile");
+	for (idx_t i = 0; i < hardware_profile_count; i++) {
+		auto profile = ReadPipelineHardwareProfile(reader);
+		auto key = profile.key;
+		if (!result.pipeline_hardware_profiles.emplace(key, std::move(profile)).second) {
+			throw SerializationException("Duplicate pipeline hardware profile in query profile snapshot");
+		}
+	}
 	result.global_finish_tail_profile = ReadContinuation(reader);
 	return result;
 }
@@ -1082,6 +1211,7 @@ static void InstallSnapshotState(QueryRequestProfileStoreState &state, ProfileSn
 	state.internal_event_profiles = std::move(snapshot.internal_event_profiles);
 	state.scale_internal_event_profiles = std::move(snapshot.scale_internal_event_profiles);
 	state.global_internal_event_profiles = std::move(snapshot.global_internal_event_profiles);
+	state.pipeline_hardware_profiles = std::move(snapshot.pipeline_hardware_profiles);
 	state.global_finish_tail_profile = std::move(snapshot.global_finish_tail_profile);
 	state.query_samples.clear();
 	state.pipeline_instances.clear();
@@ -1853,6 +1983,150 @@ InternalEventModelEstimate QueryRequestProfileStore::ResolveInternalEvent(
 	return result;
 }
 
+static PipelineHardwareProfileKey BuildPipelineHardwareProfileKey(
+    uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &pipeline_identity,
+    const QueryRequestHardwareConfiguration &hardware) {
+	PipelineHardwareProfileKey key;
+	key.pipeline.template_id = template_id;
+	key.pipeline.scale_factor = scale_factor;
+	key.pipeline.pipeline_id = pipeline_identity.pipeline_id;
+	key.pipeline.pipeline_signature_hash = pipeline_identity.pipeline_signature_hash;
+	key.hardware = hardware;
+	return key;
+}
+
+static QueryRequestPipelineHardwareProfileEstimate BuildPipelineHardwareProfileEstimate(
+    const PipelineHardwareProfileAggregate &profile) {
+	QueryRequestPipelineHardwareProfileEstimate result;
+	result.template_id = profile.key.pipeline.template_id;
+	result.scale_factor = profile.key.pipeline.scale_factor;
+	result.pipeline_id = profile.key.pipeline.pipeline_id;
+	result.pipeline_signature_hash = profile.key.pipeline.pipeline_signature_hash;
+	result.hardware = profile.key.hardware;
+	result.throughput_sample_count = profile.throughput.Count();
+	result.power_sample_count = profile.active_power_w.Count();
+	result.rejected_unstable_samples = profile.rejected_unstable_samples;
+	result.mean_work_units_per_s = profile.throughput.Mean();
+	result.ewma_work_units_per_s = profile.throughput_ewma;
+	result.p10_work_units_per_s = profile.throughput.Percentile(0.10);
+	if (result.ewma_work_units_per_s > 0 && result.p10_work_units_per_s > 0) {
+		result.safe_work_units_per_s = MinValue<double>(result.ewma_work_units_per_s, result.p10_work_units_per_s);
+	}
+	result.mean_active_power_w = profile.active_power_w.Mean();
+	result.ewma_active_power_w = profile.active_power_ewma;
+	result.mean_charged_power_w = profile.charged_power_w.Mean();
+	result.ewma_charged_power_w = profile.charged_power_ewma;
+	if (result.mean_active_power_w > 0) {
+		result.mean_throughput_per_active_watt = result.mean_work_units_per_s / result.mean_active_power_w;
+	}
+	if (result.ewma_active_power_w > 0) {
+		result.safe_throughput_per_active_watt = result.safe_work_units_per_s / result.ewma_active_power_w;
+	}
+	result.valid = result.throughput_sample_count > 0 || result.power_sample_count > 0;
+	result.mature = result.throughput_sample_count >= PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES &&
+	                result.power_sample_count >= PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES;
+	return result;
+}
+
+void QueryRequestProfileStore::RecordPipelineHardwareThroughput(
+    uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &pipeline_identity,
+    const QueryRequestHardwareConfiguration &hardware, double work_units, uint64_t worker_duration_ns,
+    bool hardware_state_stable) {
+	if (!pipeline_identity.valid || !hardware.IsValid() || !std::isfinite(work_units) || work_units <= 0 ||
+	    worker_duration_ns == 0) {
+		return;
+	}
+	auto key = BuildPipelineHardwareProfileKey(template_id, scale_factor, pipeline_identity, hardware);
+	lock_guard<std::mutex> guard(state->lock);
+	auto &profile = state->pipeline_hardware_profiles[key];
+	profile.key = key;
+	if (!hardware_state_stable) {
+		profile.rejected_unstable_samples++;
+		return;
+	}
+	auto throughput = work_units * 1000000000.0 / static_cast<double>(worker_duration_ns);
+	profile.AddThroughput(throughput);
+}
+
+void QueryRequestProfileStore::RecordPipelineHardwareEnergy(
+    uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &pipeline_identity,
+    const QueryRequestHardwareConfiguration &hardware, uint64_t duration_ns, double attributed_active_energy_j,
+    double attributed_base_energy_j, bool hardware_state_stable) {
+	if (!pipeline_identity.valid || !hardware.IsValid() || duration_ns == 0 ||
+	    !std::isfinite(attributed_active_energy_j) || !std::isfinite(attributed_base_energy_j) ||
+	    attributed_active_energy_j < 0 || attributed_base_energy_j < 0) {
+		return;
+	}
+	auto key = BuildPipelineHardwareProfileKey(template_id, scale_factor, pipeline_identity, hardware);
+	lock_guard<std::mutex> guard(state->lock);
+	auto &profile = state->pipeline_hardware_profiles[key];
+	profile.key = key;
+	if (!hardware_state_stable) {
+		profile.rejected_unstable_samples++;
+		return;
+	}
+	auto charged_energy_j = attributed_active_energy_j + attributed_base_energy_j;
+	auto active_power_w = attributed_active_energy_j * 1000000000.0 / static_cast<double>(duration_ns);
+	auto charged_power_w = charged_energy_j * 1000000000.0 / static_cast<double>(duration_ns);
+	profile.AddPower(active_power_w, charged_power_w);
+}
+
+vector<QueryRequestPipelineHardwareProfileEstimate> QueryRequestProfileStore::GetPipelineHardwareProfiles(
+    uint64_t template_id, uint64_t scale_factor, const PipelineProfileIdentity &pipeline_identity) const {
+	vector<QueryRequestPipelineHardwareProfileEstimate> result;
+	if (!pipeline_identity.valid) {
+		return result;
+	}
+	lock_guard<std::mutex> guard(state->lock);
+	for (const auto &entry : state->pipeline_hardware_profiles) {
+		const auto &key = entry.first.pipeline;
+		if (key.template_id != template_id || key.scale_factor != scale_factor ||
+		    key.pipeline_id != pipeline_identity.pipeline_id ||
+		    key.pipeline_signature_hash != pipeline_identity.pipeline_signature_hash) {
+			continue;
+		}
+		result.push_back(BuildPipelineHardwareProfileEstimate(entry.second));
+	}
+	std::sort(result.begin(), result.end(), [](const QueryRequestPipelineHardwareProfileEstimate &left,
+	                                           const QueryRequestPipelineHardwareProfileEstimate &right) {
+		if (left.hardware.core_frequency_khz != right.hardware.core_frequency_khz) {
+			return left.hardware.core_frequency_khz < right.hardware.core_frequency_khz;
+		}
+		return left.hardware.uncore_frequency_khz < right.hardware.uncore_frequency_khz;
+	});
+	return result;
+}
+
+vector<QueryRequestPipelineHardwareProfileEstimate>
+QueryRequestProfileStore::GetPipelineHardwareProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(state->lock);
+	vector<QueryRequestPipelineHardwareProfileEstimate> result;
+	result.reserve(state->pipeline_hardware_profiles.size());
+	for (const auto &entry : state->pipeline_hardware_profiles) {
+		result.push_back(BuildPipelineHardwareProfileEstimate(entry.second));
+	}
+	std::sort(result.begin(), result.end(), [](const QueryRequestPipelineHardwareProfileEstimate &left,
+	                                           const QueryRequestPipelineHardwareProfileEstimate &right) {
+		if (left.template_id != right.template_id) {
+			return left.template_id < right.template_id;
+		}
+		if (left.scale_factor != right.scale_factor) {
+			return left.scale_factor < right.scale_factor;
+		}
+		if (left.pipeline_id != right.pipeline_id) {
+			return left.pipeline_id < right.pipeline_id;
+		}
+		if (left.pipeline_signature_hash != right.pipeline_signature_hash) {
+			return left.pipeline_signature_hash < right.pipeline_signature_hash;
+		}
+		if (left.hardware.core_frequency_khz != right.hardware.core_frequency_khz) {
+			return left.hardware.core_frequency_khz < right.hardware.core_frequency_khz;
+		}
+		return left.hardware.uncore_frequency_khz < right.hardware.uncore_frequency_khz;
+	});
+	return result;
+}
+
 vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuffixEpoch(
     const vector<DownstreamSuffixEpochRequest> &requests) const {
 	vector<DownstreamSuffixEstimate> results(requests.size());
@@ -2313,6 +2587,7 @@ void QueryRequestProfileStore::ExportSnapshot(FileSystem &fs, const string &path
 	writer.WriteString(DuckDB::SourceID());
 	writer.Write<uint64_t>(PROFILE_SAMPLE_LIMIT);
 	writer.Write<double>(THROUGHPUT_EWMA_ALPHA);
+	writer.Write<double>(HARDWARE_POWER_EWMA_ALPHA);
 	WriteSnapshotState(writer, snapshot);
 	writer.Flush();
 }
@@ -2333,6 +2608,9 @@ void QueryRequestProfileStore::ImportSnapshot(FileSystem &fs, const string &path
 	}
 	if (reader.Read<double>() != THROUGHPUT_EWMA_ALPHA) {
 		throw SerializationException("Query profile snapshot uses a different throughput EWMA alpha");
+	}
+	if (reader.Read<double>() != HARDWARE_POWER_EWMA_ALPHA) {
+		throw SerializationException("Query profile snapshot uses a different hardware power EWMA alpha");
 	}
 	auto snapshot = ReadSnapshotState(reader);
 	if (!reader.Finished()) {
@@ -2356,6 +2634,7 @@ void QueryRequestProfileStore::Clear() {
 	state->internal_event_profiles.clear();
 	state->scale_internal_event_profiles.clear();
 	state->global_internal_event_profiles.clear();
+	state->pipeline_hardware_profiles.clear();
 	state->global_finish_tail_profile = ContinuationAggregate();
 	state->query_samples.clear();
 	state->pipeline_instances.clear();

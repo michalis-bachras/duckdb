@@ -36,7 +36,7 @@ QueryActivationScheduler::QueryActivationScheduler(Executor &executor_p, QueryRe
     : executor(executor_p), metadata(std::move(metadata_p)), debug_enabled(debug_enabled_p),
       scheduler_policy(DatabaseInstance::GetDatabase(executor.context).GetQuerySchedulerPolicy()) {
 	auto &db = DatabaseInstance::GetDatabase(executor.context);
-	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+	if (IsQuerySLAPolicy(scheduler_policy)) {
 		db.GetQuerySLAScheduler().RegisterQuery(metadata, executor.GetToken(), debug_enabled);
 	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
 		db.GetQueryStrideScheduler().RegisterQuery(metadata, executor.GetToken(),
@@ -46,7 +46,7 @@ QueryActivationScheduler::QueryActivationScheduler(Executor &executor_p, QueryRe
 
 QueryActivationScheduler::~QueryActivationScheduler() {
 	auto &db = DatabaseInstance::GetDatabase(executor.context);
-	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+	if (IsQuerySLAPolicy(scheduler_policy)) {
 		db.GetQuerySLAScheduler().UnregisterQuery(metadata.db_query_id);
 	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
 		db.GetQueryStrideScheduler().UnregisterQuery(metadata.db_query_id);
@@ -244,7 +244,7 @@ void QueryActivationScheduler::OnEventTasksScheduled(Event &event) {
 		remaining_suffix_stages = completed_pipeline_count < pipeline_count ? pipeline_count - completed_pipeline_count : 1;
 	}
 	auto &db = DatabaseInstance::GetDatabase(executor.context);
-	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+	if (IsQuerySLAPolicy(scheduler_policy)) {
 		db.GetQuerySLAScheduler().OnEventScheduled(metadata.db_query_id, event.shared_from_this(), remaining_suffix_stages);
 	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
 		db.GetQueryStrideScheduler().OnEventScheduled(metadata.db_query_id, event);
@@ -256,7 +256,7 @@ shared_ptr<Event> QueryActivationScheduler::OnEventFinished(Event &event) {
 		return nullptr;
 	}
 	auto &db = DatabaseInstance::GetDatabase(executor.context);
-	if (scheduler_policy == QuerySchedulerPolicy::SLA) {
+	if (IsQuerySLAPolicy(scheduler_policy)) {
 		db.GetQuerySLAScheduler().OnEventFinished(metadata.db_query_id, event);
 	} else if (scheduler_policy == QuerySchedulerPolicy::STRIDE) {
 		db.GetQueryStrideScheduler().OnEventFinished(metadata.db_query_id, event);

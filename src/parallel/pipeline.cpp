@@ -157,7 +157,9 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	auto finish_profiler_task = [&]() {
 		auto empty_counters = SourceThroughputCounters();
 		const auto &counters =
-		    profiler_task_id && pipeline_executor ? pipeline_executor->GetSourceThroughputCounters() : empty_counters;
+		    (energy_attribution_active || profiler_task_id || live_throughput_requested) && pipeline_executor
+		        ? pipeline_executor->GetSourceThroughputCounters()
+		        : empty_counters;
 		idx_t pipeline_input_tuples = 0;
 		idx_t pipeline_input_chunks = 0;
 		if ((energy_attribution_active || profiler_task_id) && pipeline_executor) {
@@ -166,7 +168,9 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 			pipeline_input_chunks = pipeline_input.chunks;
 		}
 		if (energy_attribution_active) {
-			energy_scope.SetWork(pipeline_input_tuples, pipeline_input_chunks);
+			auto source_work = pipeline.GetMatchingSourceWorkCounters(counters);
+			energy_scope.SetWork(pipeline_input_tuples, pipeline_input_chunks,
+			                     source_work.valid ? source_work.chunks_equiv : 0);
 		}
 		int end_cpu = -1;
 		if (energy_attribution_active || profiler_task_id) {

@@ -1089,7 +1089,7 @@ struct QuerySchedulerPolicySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "scheduler_policy";
 	static constexpr const char *Description =
-	    "Select the database-scoped query worker scheduler: default, sla, or stride";
+	    "Select the database-scoped query worker scheduler: default, sla, sla_energy, or stride";
 	static constexpr const char *InputType = "VARCHAR";
 	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
 	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
@@ -1112,6 +1112,58 @@ struct QuerySLASchedulerEpochMsSetting {
 	static constexpr const char *Name = "query_sla_scheduler_epoch_ms";
 	static constexpr const char *Description = "SLA scheduler epoch length in milliseconds";
 	static constexpr const char *InputType = "UBIGINT";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QuerySLAEnergyHardwareControlEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_sla_energy_hardware_control_enable";
+	static constexpr const char *Description =
+	    "Apply SLA-energy core and uncore targets through the direct MSR backend";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QuerySLAEnergyLambdaSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "query_sla_energy_lambda";
+	static constexpr const char *Description = "Energy weight used by the SLA-energy optional-worker objective";
+	static constexpr const char *InputType = "DOUBLE";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QuerySLAEnergyExplorationEnableSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "query_sla_energy_exploration_enable";
+	static constexpr const char *Description = "Enable epoch-scoped SLA-energy hardware-pair exploration";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QuerySLAEnergyExplorationSeedSetting {
+	using RETURN_TYPE = uint64_t;
+	static constexpr const char *Name = "query_sla_energy_exploration_seed";
+	static constexpr const char *Description = "Deterministic seed for SLA-energy hardware-pair exploration";
+	static constexpr const char *InputType = "UBIGINT";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct QuerySLAEnergyPowerModelPathSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "query_sla_energy_power_model_path";
+	static constexpr const char *Description =
+	    "Path to the calibrated socket/core power table used by SLA-energy placement";
+	static constexpr const char *InputType = "VARCHAR";
 	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
 	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
 	static Value GetSetting(const ClientContext &context);

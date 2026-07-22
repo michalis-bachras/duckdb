@@ -160,13 +160,6 @@ void LambdaSyntaxSetting::OnSet(SettingCallbackInfo &info, Value &parameter) {
 }
 
 //===----------------------------------------------------------------------===//
-// Pin Threads
-//===----------------------------------------------------------------------===//
-void PinThreadsSetting::OnSet(SettingCallbackInfo &info, Value &parameter) {
-	EnumUtil::FromString<ThreadPinMode>(StringValue::Get(parameter));
-}
-
-//===----------------------------------------------------------------------===//
 // Storage Block Prefetch
 //===----------------------------------------------------------------------===//
 void StorageBlockPrefetchSetting::OnSet(SettingCallbackInfo &info, Value &parameter) {

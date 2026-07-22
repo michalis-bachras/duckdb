@@ -1934,10 +1934,12 @@ void QuerySchedulerPolicySetting::SetGlobal(DatabaseInstance *db, DBConfig &conf
 		policy = QuerySchedulerPolicy::DEFAULT;
 	} else if (value == "sla") {
 		policy = QuerySchedulerPolicy::SLA;
+	} else if (value == "sla_energy") {
+		policy = QuerySchedulerPolicy::SLA_ENERGY;
 	} else if (value == "stride") {
 		policy = QuerySchedulerPolicy::STRIDE;
 	} else {
-		throw InvalidInputException("scheduler_policy must be one of: default, sla, stride");
+		throw InvalidInputException("scheduler_policy must be one of: default, sla, sla_energy, stride");
 	}
 	if (db && policy != config.options.query_scheduler_policy &&
 	    (db->GetQuerySLAScheduler().ActiveQueryCount() != 0 || db->GetQueryStrideScheduler().ActiveQueryCount() != 0)) {
@@ -1948,6 +1950,18 @@ void QuerySchedulerPolicySetting::SetGlobal(DatabaseInstance *db, DBConfig &conf
 	}
 	if (policy != QuerySchedulerPolicy::DEFAULT && db && TaskScheduler::GetScheduler(*db).ExternalThreads() != 0) {
 		throw InvalidInputException("scheduler_policy=%s requires external_threads=0", value);
+	}
+	if (policy == QuerySchedulerPolicy::SLA_ENERGY && db &&
+	    Settings::Get<PinThreadsSetting>(*db) != ThreadPinMode::ON) {
+		throw InvalidInputException("scheduler_policy=sla_energy requires pin_threads='on'");
+	}
+	if (db && policy == QuerySchedulerPolicy::SLA_ENERGY &&
+	    config.options.query_scheduler_policy != QuerySchedulerPolicy::SLA_ENERGY) {
+		db->GetQuerySLAScheduler().ActivateEnergyPolicy();
+	}
+	if (db && policy != QuerySchedulerPolicy::SLA_ENERGY &&
+	    config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		db->GetQuerySLAScheduler().DeactivateEnergyPolicy();
 	}
 	config.options.query_scheduler_policy = policy;
 	if (db) {
@@ -1961,6 +1975,10 @@ void QuerySchedulerPolicySetting::ResetGlobal(DatabaseInstance *db, DBConfig &co
 	    (db->GetQuerySLAScheduler().ActiveQueryCount() != 0 || db->GetQueryStrideScheduler().ActiveQueryCount() != 0)) {
 		throw InvalidInputException("scheduler_policy cannot change while scheduler-managed queries are active");
 	}
+	if (db && config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY &&
+	    default_policy != QuerySchedulerPolicy::SLA_ENERGY) {
+		db->GetQuerySLAScheduler().DeactivateEnergyPolicy();
+	}
 	config.options.query_scheduler_policy = default_policy;
 	if (db) {
 		TaskScheduler::GetScheduler(*db).SetQuerySchedulerPolicy(config.options.query_scheduler_policy);
@@ -1971,10 +1989,20 @@ Value QuerySchedulerPolicySetting::GetSetting(const ClientContext &context) {
 	switch (DBConfig::GetConfig(context).options.query_scheduler_policy) {
 	case QuerySchedulerPolicy::SLA:
 		return Value("sla");
+	case QuerySchedulerPolicy::SLA_ENERGY:
+		return Value("sla_energy");
 	case QuerySchedulerPolicy::STRIDE:
 		return Value("stride");
 	default:
 		return Value("default");
+	}
+}
+
+void PinThreadsSetting::OnSet(SettingCallbackInfo &info, Value &parameter) {
+	auto mode = EnumUtil::FromString<ThreadPinMode>(StringValue::Get(parameter));
+	if (info.config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY &&
+	    mode != ThreadPinMode::ON) {
+		throw InvalidInputException("pin_threads must remain 'on' while scheduler_policy=sla_energy");
 	}
 }
 
@@ -2008,6 +2036,86 @@ void QuerySLASchedulerEpochMsSetting::ResetGlobal(DatabaseInstance *db, DBConfig
 
 Value QuerySLASchedulerEpochMsSetting::GetSetting(const ClientContext &context) {
 	return Value::UBIGINT(DBConfig::GetConfig(context).options.query_sla_scheduler_epoch_ms);
+}
+
+void QuerySLAEnergyHardwareControlEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config,
+	                                                       const Value &input) {
+	if (config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		throw InvalidInputException(
+		    "query_sla_energy_hardware_control_enable cannot change while scheduler_policy=sla_energy");
+	}
+	config.options.query_sla_energy_hardware_control_enabled = BooleanValue::Get(input.DefaultCastAs(LogicalType::BOOLEAN));
+}
+
+void QuerySLAEnergyHardwareControlEnableSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	if (config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		throw InvalidInputException(
+		    "query_sla_energy_hardware_control_enable cannot reset while scheduler_policy=sla_energy");
+	}
+	config.options.query_sla_energy_hardware_control_enabled =
+	    DBConfigOptions().query_sla_energy_hardware_control_enabled;
+}
+
+Value QuerySLAEnergyHardwareControlEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_sla_energy_hardware_control_enabled);
+}
+
+void QuerySLAEnergyLambdaSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto value = input.GetValue<double>();
+	if (!std::isfinite(value) || value < 0) {
+		throw InvalidInputException("query_sla_energy_lambda must be finite and non-negative");
+	}
+	config.options.query_sla_energy_lambda = value;
+}
+
+void QuerySLAEnergyLambdaSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.query_sla_energy_lambda = DBConfigOptions().query_sla_energy_lambda;
+}
+
+Value QuerySLAEnergyLambdaSetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(DBConfig::GetConfig(context).options.query_sla_energy_lambda);
+}
+
+void QuerySLAEnergyExplorationEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	config.options.query_sla_energy_exploration_enabled = BooleanValue::Get(input.DefaultCastAs(LogicalType::BOOLEAN));
+}
+
+void QuerySLAEnergyExplorationEnableSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.query_sla_energy_exploration_enabled = DBConfigOptions().query_sla_energy_exploration_enabled;
+}
+
+Value QuerySLAEnergyExplorationEnableSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_sla_energy_exploration_enabled);
+}
+
+void QuerySLAEnergyExplorationSeedSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	config.options.query_sla_energy_exploration_seed = input.GetValue<uint64_t>();
+}
+
+void QuerySLAEnergyExplorationSeedSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	config.options.query_sla_energy_exploration_seed = DBConfigOptions().query_sla_energy_exploration_seed;
+}
+
+Value QuerySLAEnergyExplorationSeedSetting::GetSetting(const ClientContext &context) {
+	return Value::UBIGINT(DBConfig::GetConfig(context).options.query_sla_energy_exploration_seed);
+}
+
+void QuerySLAEnergyPowerModelPathSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	if (config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		throw InvalidInputException("query_sla_energy_power_model_path cannot change while scheduler_policy=sla_energy");
+	}
+	config.options.query_sla_energy_power_model_path = input.ToString();
+}
+
+void QuerySLAEnergyPowerModelPathSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	if (config.options.query_scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
+		throw InvalidInputException("query_sla_energy_power_model_path cannot reset while scheduler_policy=sla_energy");
+	}
+	config.options.query_sla_energy_power_model_path = DBConfigOptions().query_sla_energy_power_model_path;
+}
+
+Value QuerySLAEnergyPowerModelPathSetting::GetSetting(const ClientContext &context) {
+	return Value(DBConfig::GetConfig(context).options.query_sla_energy_power_model_path);
 }
 
 //===----------------------------------------------------------------------===//

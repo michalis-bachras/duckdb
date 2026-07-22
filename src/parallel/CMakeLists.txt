@@ -16,6 +16,10 @@ add_library_unity(
   pipeline_initialize_event.cpp
   pipeline_prepare_finish_event.cpp
   query_activation_scheduler.cpp
+  query_hardware_manager.cpp
+  query_sla_energy_model.cpp
+  query_sla_energy_planner.cpp
+  query_sla_model.cpp
   query_sla_scheduler.cpp
   query_stride_scheduler.cpp
   query_stride_optimizer.cpp

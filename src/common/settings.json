@@ -1012,7 +1012,8 @@
         "description": "Whether to pin threads to cores (Linux only, default AUTO: on when there are more than 64 cores)",
         "type": "ENUM<ThreadPinMode>",
         "scope": "global",
-        "default_value": "auto"
+        "default_value": "auto",
+        "custom_implementation": true
     },
     {
         "name": "pivot_filter_threshold",
@@ -1112,6 +1113,41 @@
         "name": "query_worker_only_execution_enable",
         "description": "Enable prototype materialized query execution where client threads wait instead of executing tasks",
         "type": "BOOLEAN",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "query_sla_energy_hardware_control_enable",
+        "description": "Apply SLA-energy core and uncore targets through the direct MSR backend",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "query_sla_energy_lambda",
+        "description": "Energy weight used by the SLA-energy optional-worker objective",
+        "type": "DOUBLE",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "query_sla_energy_exploration_enable",
+        "description": "Enable epoch-scoped SLA-energy hardware-pair exploration",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "query_sla_energy_exploration_seed",
+        "description": "Deterministic seed for SLA-energy hardware-pair exploration",
+        "type": "UBIGINT",
+        "scope": "global",
+        "custom_implementation": true
+    },
+    {
+        "name": "query_sla_energy_power_model_path",
+        "description": "Path to the calibrated socket/core power table used by SLA-energy placement",
+        "type": "VARCHAR",
         "scope": "global",
         "custom_implementation": true
     },

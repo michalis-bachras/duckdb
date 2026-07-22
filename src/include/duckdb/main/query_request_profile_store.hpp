@@ -20,6 +20,44 @@ class FileSystem;
 
 static constexpr idx_t DOWNSTREAM_SUFFIX_MAX_BUCKETS = 8;
 static constexpr idx_t DOWNSTREAM_SUFFIX_MAX_RESOLVED_BUCKETS = 16;
+static constexpr idx_t PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES = 8;
+
+struct QueryRequestHardwareConfiguration {
+	uint32_t core_frequency_khz = 0;
+	uint32_t uncore_frequency_khz = 0;
+
+	bool IsValid() const {
+		return core_frequency_khz > 0 && uncore_frequency_khz > 0;
+	}
+
+	bool operator==(const QueryRequestHardwareConfiguration &other) const {
+		return core_frequency_khz == other.core_frequency_khz &&
+		       uncore_frequency_khz == other.uncore_frequency_khz;
+	}
+};
+
+struct QueryRequestPipelineHardwareProfileEstimate {
+	bool valid = false;
+	bool mature = false;
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
+	idx_t pipeline_id = 0;
+	uint64_t pipeline_signature_hash = 0;
+	QueryRequestHardwareConfiguration hardware;
+	idx_t throughput_sample_count = 0;
+	idx_t power_sample_count = 0;
+	double mean_work_units_per_s = 0;
+	double ewma_work_units_per_s = 0;
+	double p10_work_units_per_s = 0;
+	double safe_work_units_per_s = 0;
+	double mean_active_power_w = 0;
+	double ewma_active_power_w = 0;
+	double mean_charged_power_w = 0;
+	double ewma_charged_power_w = 0;
+	double safe_throughput_per_active_watt = 0;
+	double mean_throughput_per_active_watt = 0;
+	idx_t rejected_unstable_samples = 0;
+};
 
 enum class DownstreamSuffixProfileLevel : uint8_t { NONE = 0, EXACT = 1, SCALE_FACTOR = 2, GLOBAL = 3 };
 
@@ -269,6 +307,19 @@ public:
 	                                                const PipelineProfileIdentity &pipeline_identity,
 	                                                idx_t event_position, const string &event_type,
 	                                                const string &native_unit) const;
+	void RecordPipelineHardwareThroughput(uint64_t template_id, uint64_t scale_factor,
+	                                      const PipelineProfileIdentity &pipeline_identity,
+	                                      const QueryRequestHardwareConfiguration &hardware, double work_units,
+	                                      uint64_t worker_duration_ns, bool hardware_state_stable);
+	void RecordPipelineHardwareEnergy(uint64_t template_id, uint64_t scale_factor,
+	                                  const PipelineProfileIdentity &pipeline_identity,
+	                                  const QueryRequestHardwareConfiguration &hardware, uint64_t duration_ns,
+	                                  double attributed_active_energy_j, double attributed_base_energy_j,
+	                                  bool hardware_state_stable);
+	vector<QueryRequestPipelineHardwareProfileEstimate>
+	GetPipelineHardwareProfiles(uint64_t template_id, uint64_t scale_factor,
+	                            const PipelineProfileIdentity &pipeline_identity) const;
+	vector<QueryRequestPipelineHardwareProfileEstimate> GetPipelineHardwareProfilesSnapshot() const;
 	vector<DownstreamSuffixEstimate>
 	PrepareDownstreamSuffixEpoch(const vector<DownstreamSuffixEpochRequest> &requests) const;
 	vector<QueryRequestProfileSnapshot> GetQueryProfilesSnapshot() const;

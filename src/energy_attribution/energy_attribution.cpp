@@ -11,8 +11,12 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/query_request_metadata.hpp"
+#include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/event.hpp"
 #include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/parallel/query_hardware_manager.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1169,6 +1173,8 @@ struct QueryEnergyState : public EnergyAttributionQueryHandle {
 	ClientContext *context = nullptr;
 	EnergyAttributionSettings settings;
 	uint64_t query_id = 0;
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
 	string query;
 	string output_dir;
 	uint64_t start_ns = 0;
@@ -2354,6 +2360,17 @@ struct SchedulerWorkerRegistration {
 	bool active = false;
 };
 
+struct PendingHardwareEnergyObservation {
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
+	PipelineProfileIdentity pipeline_identity;
+	QueryRequestHardwareConfiguration hardware;
+	uint64_t duration_ns = 0;
+	double attributed_active_energy_j = 0;
+	double attributed_base_energy_j = 0;
+	bool hardware_state_stable = false;
+};
+
 struct PeriodicRuntimeOverheadRecord {
 	uint64_t sample_id = 0;
 	string event;
@@ -2744,6 +2761,7 @@ private:
 		scratch_closed_segments.clear();
 		scratch_queue_segments.clear();
 		scratch_queue_closed_segments.clear();
+		scratch_hardware_energy_observations.clear();
 		scratch_rapl_snapshots.clear();
 		scratch_pipeline_profile_updates.clear();
 		scratch_query_profile_updates.clear();
@@ -2818,6 +2836,7 @@ private:
 				scratch_closed_segments.clear();
 				scratch_queue_segments.clear();
 				scratch_queue_closed_segments.clear();
+				scratch_hardware_energy_observations.clear();
 				scratch_rapl_snapshots.clear();
 				scratch_pipeline_profile_updates.clear();
 				scratch_query_profile_updates.clear();
@@ -3033,7 +3052,10 @@ private:
 		slice.physical_core_id = base.physical_core_id;
 		slice.logical_cpu_id = base.logical_cpu_id;
 		slice.query_id = base.query_id;
+		slice.template_id = base.template_id;
+		slice.scale_factor = base.scale_factor;
 		slice.pipeline_id = base.pipeline_id;
+		slice.pipeline_signature_hash = base.pipeline_signature_hash;
 		slice.pipeline_signature = base.pipeline_signature;
 		slice.role = base.role;
 		slice.phase = base.phase;
@@ -3050,6 +3072,8 @@ private:
 		slice.chunks = 0;
 		slice.core_freq_hz = base.core_freq_hz;
 		slice.uncore_freq_hz = base.uncore_freq_hz;
+		slice.target_core_frequency_khz = base.target_core_frequency_khz;
+		slice.target_uncore_frequency_khz = base.target_uncore_frequency_khz;
 		slice.smt_occupancy = base.smt_occupancy;
 		if (end_record) {
 			slice.end_logical_cpu_id = end_record->end_logical_cpu_id;
@@ -3151,6 +3175,20 @@ private:
 			AddThroughputObservationToEfficiencyAggregate(scratch_pipeline_profile_updates[pipeline_key], record, true);
 			AddThroughputObservationToEfficiencyAggregate(scratch_query_profile_updates[record.query_id], record,
 			                                              false);
+			if (active_db && record.template_id != 0 && record.scale_factor != 0 && record.pipeline_id != 0 &&
+			    record.pipeline_signature_hash != 0 && record.target_core_frequency_khz != 0 &&
+			    record.target_uncore_frequency_khz != 0 && record.work_units > 0 && record.end_ns > record.start_ns) {
+				PipelineProfileIdentity identity;
+				identity.valid = true;
+				identity.pipeline_id = record.pipeline_id;
+				identity.pipeline_signature_hash = record.pipeline_signature_hash;
+				QueryRequestHardwareConfiguration hardware;
+				hardware.core_frequency_khz = record.target_core_frequency_khz;
+				hardware.uncore_frequency_khz = record.target_uncore_frequency_khz;
+				active_db->GetQueryRequestProfileStore().RecordPipelineHardwareThroughput(
+				    record.template_id, record.scale_factor, identity, hardware, static_cast<double>(record.work_units),
+				    record.end_ns - record.start_ns, record.hardware_state_stable);
+			}
 		}
 		DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_local_aggregate_ns,
 		               phase_start_ns);
@@ -3257,6 +3295,7 @@ private:
 		overhead.slice_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
 		phase_start_ns = TimestampNs();
 		FinalizeReadyWindows(false, &overhead);
+		FlushHardwareEnergyObservations();
 		overhead.finalize_windows_ns += DurationNs(TimestampNs(), phase_start_ns);
 		FinishRuntimeOverhead(overhead, cpu_start_ns);
 	}
@@ -3293,6 +3332,7 @@ private:
 		overhead.slice_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
 		phase_start_ns = TimestampNs();
 		FinalizeReadyWindows(true, &overhead);
+		FlushHardwareEnergyObservations();
 		overhead.finalize_windows_ns += DurationNs(TimestampNs(), phase_start_ns);
 		FinishRuntimeOverhead(overhead, cpu_start_ns);
 	}
@@ -3526,6 +3566,26 @@ private:
 				profile.corrected_cycles += segment.corrected_cycles;
 				continue;
 			}
+			if (segment.record.template_id != 0 && segment.record.scale_factor != 0 &&
+			    segment.record.pipeline_id != 0 && segment.record.pipeline_signature_hash != 0 &&
+			    segment.record.target_core_frequency_khz != 0 &&
+			    segment.record.target_uncore_frequency_khz != 0 && segment.record.end_ns > segment.record.start_ns &&
+			    (segment.record.phase == EnergySegmentPhase::EXECUTE ||
+			     segment.record.phase == EnergySegmentPhase::INTERNAL)) {
+				PendingHardwareEnergyObservation observation;
+				observation.template_id = segment.record.template_id;
+				observation.scale_factor = segment.record.scale_factor;
+				observation.pipeline_identity.valid = true;
+				observation.pipeline_identity.pipeline_id = segment.record.pipeline_id;
+				observation.pipeline_identity.pipeline_signature_hash = segment.record.pipeline_signature_hash;
+				observation.hardware.core_frequency_khz = segment.record.target_core_frequency_khz;
+				observation.hardware.uncore_frequency_khz = segment.record.target_uncore_frequency_khz;
+				observation.duration_ns = segment.record.end_ns - segment.record.start_ns;
+				observation.attributed_active_energy_j = segment.attributed_active_energy_j;
+				observation.attributed_base_energy_j = segment.attributed_base_energy_j;
+				observation.hardware_state_stable = segment.record.hardware_state_stable;
+				scratch_hardware_energy_observations.push_back(std::move(observation));
+			}
 			AddSegmentToEfficiencyAggregate(query_profiles[segment.record.query_id], segment, false);
 			if (segment.record.phase == EnergySegmentPhase::EXECUTE ||
 			    segment.record.phase == EnergySegmentPhase::INTERNAL || segment.record.lifecycle_group_id == 0 ||
@@ -3547,6 +3607,19 @@ private:
 				                            allocated_energy);
 			}
 		}
+	}
+
+	void FlushHardwareEnergyObservations() {
+		if (!active_db || scratch_hardware_energy_observations.empty()) {
+			return;
+		}
+		for (const auto &observation : scratch_hardware_energy_observations) {
+			active_db->GetQueryRequestProfileStore().RecordPipelineHardwareEnergy(
+			    observation.template_id, observation.scale_factor, observation.pipeline_identity, observation.hardware,
+			    observation.duration_ns, observation.attributed_active_energy_j,
+			    observation.attributed_base_energy_j, observation.hardware_state_stable);
+		}
+		scratch_hardware_energy_observations.clear();
 	}
 
 	void OpenOutputFilesLocked() {
@@ -3871,6 +3944,7 @@ private:
 	vector<EnergySegmentRecord> scratch_closed_segments;
 	vector<EnergySegmentRecord> scratch_queue_segments;
 	vector<EnergySegmentRecord> scratch_queue_closed_segments;
+	vector<PendingHardwareEnergyObservation> scratch_hardware_energy_observations;
 	vector<RaplSnapshot> scratch_rapl_snapshots;
 	std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
 	    scratch_pipeline_profile_updates;
@@ -4040,6 +4114,11 @@ void EnergyAttributionManager::BeginQuery(ClientContext &context, uint64_t query
 	state->context = &context;
 	state->settings = settings;
 	state->query_id = query_id;
+	QueryRequestMetadata request_metadata;
+	if (QueryRequestMetadataManager::TryGetActive(context, request_metadata)) {
+		state->template_id = request_metadata.template_id;
+		state->scale_factor = request_metadata.scale_factor;
+	}
 	state->query = query;
 	state->start_ns = TimestampNs();
 	if (state->settings.metadata_cache_enabled) {
@@ -4179,8 +4258,14 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase ph
 	record = EnergySegmentRecord();
 	record.segment_id = thread_state.NextSegmentId(*query);
 	record.query_id = query->query_id;
+	record.template_id = query->template_id;
+	record.scale_factor = query->scale_factor;
 	record.pipeline_id = EnergyAttributionManager::GetPipelineAttributionId(pipeline);
 	record.pipeline_signature = LookupPipelineSignature(*query, record.pipeline_id);
+	PipelineWorkSnapshot work_snapshot;
+	if (pipeline.GetWorkSnapshot(work_snapshot) && work_snapshot.profile_identity.valid) {
+		record.pipeline_signature_hash = work_snapshot.profile_identity.pipeline_signature_hash;
+	}
 	record.role = EnergySegmentRole::UNKNOWN;
 	record.phase = phase;
 	record.owner_pipeline_id = record.pipeline_id;
@@ -4203,6 +4288,14 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase ph
 		record.core_freq_hz = topology.core_freq_hz;
 	}
 	record.uncore_freq_hz = GetQueryUncoreFrequency(*query, record.socket_id);
+	if (DatabaseInstance::GetDatabase(*query->context).GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY) {
+		auto target = DatabaseInstance::GetDatabase(*query->context)
+		                  .GetQuerySLAScheduler()
+		                  .GetHardwareManager()
+		                  .GetAppliedConfigurationForCPU(record.logical_cpu_id);
+		record.target_core_frequency_khz = target.core_frequency_khz;
+		record.target_uncore_frequency_khz = target.uncore_frequency_khz;
+	}
 	if (query->settings.periodic_enabled) {
 		active = PeriodicEnergyRuntime::Get().BeginSegment(query_ref, record);
 		return;
@@ -4270,6 +4363,16 @@ EnergySegmentScope::~EnergySegmentScope() {
 	record.migrated = record.logical_cpu_id != record.end_logical_cpu_id || record.socket_id != record.end_socket_id ||
 	                  record.physical_core_id != record.end_physical_core_id;
 	record.hardware_state_stable = !record.migrated && record.socket_id >= 0 && record.physical_core_id >= 0;
+	if (record.hardware_state_stable && query && record.target_core_frequency_khz > 0 &&
+	    record.target_uncore_frequency_khz > 0 &&
+	    DatabaseInstance::GetDatabase(*query->context).GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY) {
+		auto end_target = DatabaseInstance::GetDatabase(*query->context)
+		                      .GetQuerySLAScheduler()
+		                      .GetHardwareManager()
+		                      .GetAppliedConfigurationForCPU(record.end_logical_cpu_id);
+		record.hardware_state_stable = end_target.core_frequency_khz == record.target_core_frequency_khz &&
+		                               end_target.uncore_frequency_khz == record.target_uncore_frequency_khz;
+	}
 	if (periodic) {
 		PeriodicEnergyRuntime::Get().EndSegment(record);
 	} else {
@@ -4289,13 +4392,13 @@ void EnergySegmentScope::SetEndCPUHint(int end_cpu_hint_p) {
 	end_cpu_hint = end_cpu_hint_p;
 }
 
-void EnergySegmentScope::SetWork(uint64_t tuples, uint64_t chunks) {
+void EnergySegmentScope::SetWork(uint64_t tuples, uint64_t chunks, uint64_t work_units) {
 	if (!active) {
 		return;
 	}
 	record.tuples = tuples;
 	record.chunks = chunks;
-	record.work_units = tuples;
+	record.work_units = work_units;
 }
 
 } // namespace duckdb

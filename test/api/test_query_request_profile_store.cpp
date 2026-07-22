@@ -127,6 +127,68 @@ static string MetadataQuery(uint64_t request_id, uint64_t template_id, uint64_t 
 
 } // namespace
 
+TEST_CASE("Pipeline hardware profiles require stable exact-pair observations", "[api][sla_energy]") {
+	QueryRequestProfileStore store;
+	auto profile = PipelineProfile(1000);
+	auto identity = PipelineIdentity(profile);
+	QueryRequestHardwareConfiguration hardware;
+	hardware.core_frequency_khz = 3000000;
+	hardware.uncore_frequency_khz = 2800000;
+
+	store.RecordPipelineHardwareThroughput(18, 10, identity, hardware, 10, 1000000, false);
+	for (idx_t i = 0; i < PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES; i++) {
+		auto duration_ns = 1000000ULL + i * 10000ULL;
+		store.RecordPipelineHardwareThroughput(18, 10, identity, hardware, 10, duration_ns, true);
+		store.RecordPipelineHardwareEnergy(18, 10, identity, hardware, duration_ns, 0.001, 0.0005, true);
+	}
+
+	auto estimates = store.GetPipelineHardwareProfiles(18, 10, identity);
+	REQUIRE(estimates.size() == 1);
+	auto &estimate = estimates[0];
+	REQUIRE(estimate.valid);
+	REQUIRE(estimate.mature);
+	REQUIRE(estimate.throughput_sample_count == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
+	REQUIRE(estimate.power_sample_count == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
+	REQUIRE(estimate.rejected_unstable_samples == 1);
+	REQUIRE(estimate.safe_work_units_per_s > 0);
+	REQUIRE(estimate.safe_work_units_per_s <= estimate.ewma_work_units_per_s);
+	REQUIRE(estimate.safe_work_units_per_s <= estimate.p10_work_units_per_s);
+	REQUIRE(estimate.mean_active_power_w > 0);
+	REQUIRE(estimate.ewma_active_power_w > 0);
+	REQUIRE(estimate.mean_charged_power_w > 0);
+	REQUIRE(estimate.mean_charged_power_w > estimate.mean_active_power_w);
+	REQUIRE(estimate.safe_throughput_per_active_watt > 0);
+}
+
+TEST_CASE("Pipeline hardware profiles are exposed through the debug SQL surface", "[api][sla_energy]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	auto profile = PipelineProfile(1000);
+	auto identity = PipelineIdentity(profile);
+	QueryRequestHardwareConfiguration hardware;
+	hardware.core_frequency_khz = 2200000;
+	hardware.uncore_frequency_khz = 1800000;
+	for (idx_t i = 0; i < PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES; i++) {
+		store.RecordPipelineHardwareThroughput(19, 10, identity, hardware, 16, 2000000 + i * 10000, true);
+		store.RecordPipelineHardwareEnergy(19, 10, identity, hardware, 2000000 + i * 10000, 0.002, 0.001, true);
+	}
+	Connection con(db);
+	auto result = con.Query(
+	    "SELECT mature, throughput_sample_count, power_sample_count, safe_work_units_per_s, "
+	    "ewma_active_power_w, safe_throughput_per_active_watt FROM "
+	    "duckdb_debug_query_request_pipeline_hardware_profiles() WHERE template_id=19 AND scale_factor=10 "
+	    "AND core_frequency_khz=2200000 AND uncore_frequency_khz=1800000");
+	REQUIRE(!result->HasError());
+	REQUIRE(result->RowCount() == 1);
+	REQUIRE(result->GetValue(0, 0).GetValue<bool>());
+	REQUIRE(result->GetValue(1, 0).GetValue<uint64_t>() == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
+	REQUIRE(result->GetValue(2, 0).GetValue<uint64_t>() == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
+	REQUIRE(result->GetValue(3, 0).GetValue<double>() > 0);
+	REQUIRE(result->GetValue(4, 0).GetValue<double>() > 0);
+	REQUIRE(result->GetValue(5, 0).GetValue<double>() > 0);
+}
+
 TEST_CASE("Query request profile store aggregates direct observations", "[api]") {
 	QueryRequestProfileStore store;
 	store.Clear();
@@ -986,6 +1048,84 @@ TEST_CASE("SLA scheduler preserves worker-only database invariants", "[api]") {
 	REQUIRE_FAIL(con.Query("RESET query_worker_only_execution_enable"));
 	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='default'"));
 	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=false"));
+}
+
+TEST_CASE("SLA energy policy is independent and requires pinned workers", "[api][sla_energy]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_hardware_control_enable=false"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_FAIL(con.Query("SET scheduler_policy='sla_energy'"));
+	REQUIRE_NO_FAIL(con.Query("SET pin_threads='on'"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla_energy'"));
+	auto policy = con.Query("SELECT current_setting('scheduler_policy')");
+	REQUIRE(CHECK_COLUMN(policy, 0, {"sla_energy"}));
+	REQUIRE_FAIL(con.Query("SET pin_threads='off'"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla'"));
+	auto sla_policy = con.Query("SELECT current_setting('scheduler_policy')");
+	REQUIRE(CHECK_COLUMN(sla_policy, 0, {"sla"}));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='default'"));
+}
+
+TEST_CASE("SLA energy scheduler executes a trained tagged query in dry-run hardware mode", "[api][sla_energy]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sla_energy_t AS "
+	                          "SELECT i, i % 1009 AS g FROM range(2000000) tbl(i)"));
+	const string body = "SELECT g, count(*), sum(i) FROM sla_energy_t GROUP BY g ORDER BY g";
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE_NO_FAIL(con.Query(MetadataQuery(9150 + i, 97, 10, body)));
+	}
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=5"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_hardware_control_enable=false"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_exploration_enable=false"));
+	REQUIRE_NO_FAIL(con.Query("SET pin_threads='on'"));
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla_energy'"));
+	auto &scheduler = db.instance->GetQuerySLAScheduler();
+	scheduler.ClearEpochTrace();
+	REQUIRE_NO_FAIL(con.Query(MetadataQuery(9160, 97, 10, body)));
+
+	auto epochs = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_sla_scheduler_epochs() WHERE request_id=9160 "
+	    "AND scheduler_policy='sla_energy' AND planned_workers=assigned_workers "
+	    "AND predicted_service_rate>0 AND predicted_epoch_energy_j>=0");
+	REQUIRE(!epochs->HasError());
+	REQUIRE(epochs->GetValue(0, 0).GetValue<int64_t>() > 0);
+	auto workers = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_sla_energy_worker_epochs() WHERE request_id=9160 "
+	    "AND (mandatory OR optional OR liveness) AND applied_core_khz>0 AND applied_uncore_khz>0");
+	REQUIRE(!workers->HasError());
+	REQUIRE(workers->GetValue(0, 0).GetValue<int64_t>() > 0);
+	auto manager = con.Query(
+	    "SELECT active, hardware_control_enabled, registered_workers, verification_failure_count, status "
+	    "FROM duckdb_debug_query_sla_energy_hardware()");
+	REQUIRE(!manager->HasError());
+	REQUIRE(manager->RowCount() == 1);
+	REQUIRE(manager->GetValue(0, 0).GetValue<bool>());
+	REQUIRE_FALSE(manager->GetValue(1, 0).GetValue<bool>());
+	REQUIRE(manager->GetValue(2, 0).GetValue<uint64_t>() == 4);
+	REQUIRE(manager->GetValue(3, 0).GetValue<uint64_t>() == 0);
+	REQUIRE(manager->GetValue(4, 0).ToString() == "active_dry_run");
+	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='default'"));
+	auto restored = con.Query(
+	    "SELECT active, restoration_attempt_count, restoration_verified_count, restoration_failure_count, "
+	    "status, restoration_status FROM duckdb_debug_query_sla_energy_hardware()");
+	REQUIRE(!restored->HasError());
+	REQUIRE(restored->RowCount() == 1);
+	REQUIRE_FALSE(restored->GetValue(0, 0).GetValue<bool>());
+	REQUIRE(restored->GetValue(1, 0).GetValue<uint64_t>() == 0);
+	REQUIRE(restored->GetValue(2, 0).GetValue<uint64_t>() == 0);
+	REQUIRE(restored->GetValue(3, 0).GetValue<uint64_t>() == 0);
+	REQUIRE(restored->GetValue(4, 0).ToString() == "inactive_dry_run");
+	REQUIRE(restored->GetValue(5, 0).ToString() == "not_required");
 }
 
 TEST_CASE("SLA scheduler rejects an untrained tagged data pipeline", "[api]") {

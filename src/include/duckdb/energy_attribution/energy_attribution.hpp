@@ -77,7 +77,10 @@ struct EnergySegmentRecord {
 	int end_physical_core_id = -1;
 	int end_logical_cpu_id = -1;
 	uint64_t query_id = 0;
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
 	uint64_t pipeline_id = 0;
+	uint64_t pipeline_signature_hash = 0;
 	string pipeline_signature;
 	EnergySegmentRole role = EnergySegmentRole::UNKNOWN;
 	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
@@ -94,6 +97,8 @@ struct EnergySegmentRecord {
 	uint64_t chunks = 0;
 	double core_freq_hz = 0;
 	double uncore_freq_hz = 0;
+	uint32_t target_core_frequency_khz = 0;
+	uint32_t target_uncore_frequency_khz = 0;
 	int smt_occupancy = 1;
 	uint64_t cycles = 0;
 	uint64_t instructions = 0;
@@ -134,7 +139,7 @@ public:
 	EnergySegmentScope(const EnergySegmentScope &) = delete;
 	EnergySegmentScope &operator=(const EnergySegmentScope &) = delete;
 
-	void SetWork(uint64_t tuples, uint64_t chunks);
+	void SetWork(uint64_t tuples, uint64_t chunks, uint64_t work_units);
 	void SetEndCPUHint(int end_cpu_hint);
 
 private:

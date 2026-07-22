@@ -7,6 +7,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parallel/query_hardware_manager.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
 #include "duckdb/parallel/query_stride_scheduler.hpp"
 #include "duckdb/storage/block_allocator.hpp"
@@ -326,10 +327,11 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 		}
 
 		auto sla_result = QuerySLADequeueResult::NOT_ACTIVE;
+		QuerySLAWorkerSelection sla_selection;
 		auto stride_result = QueryStrideDequeueResult::NOT_ACTIVE;
 		QueryStrideTaskSelection stride_selection;
-		if (policy == QuerySchedulerPolicy::SLA && worker_id != DConstants::INVALID_INDEX) {
-			sla_result = db.GetQuerySLAScheduler().TryDequeueTask(worker_id, task);
+		if (IsQuerySLAPolicy(policy) && worker_id != DConstants::INVALID_INDEX) {
+			sla_result = db.GetQuerySLAScheduler().TryDequeueTask(worker_id, task, &sla_selection);
 		} else if (policy == QuerySchedulerPolicy::STRIDE && worker_id != DConstants::INVALID_INDEX) {
 			stride_result =
 			    db.GetQueryStrideScheduler().TryDequeueTask(worker_id, stride_worker, task, stride_selection);
@@ -339,6 +341,19 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 		if (sla_result == QuerySLADequeueResult::NOT_ACTIVE &&
 		    stride_result == QueryStrideDequeueResult::NOT_ACTIVE) {
 			has_task = queue->Dequeue(task);
+		}
+		if (policy == QuerySchedulerPolicy::SLA_ENERGY && worker_id != DConstants::INVALID_INDEX) {
+			auto &hardware_manager = db.GetQuerySLAScheduler().GetHardwareManager();
+			auto hardware = sla_selection.hardware;
+			if (has_task && sla_result == QuerySLADequeueResult::TASK_FOUND) {
+				if (!hardware.IsValid()) {
+					hardware = hardware_manager.ReferenceConfiguration();
+				}
+				hardware_manager.UpdateWorkerTarget(worker_id, hardware, true, sla_selection.plan_generation);
+				} else {
+					hardware_manager.UpdateWorkerTarget(worker_id, hardware_manager.MinimumConfiguration(), false,
+					                                    sla_selection.plan_generation);
+			}
 		}
 		if (has_task) {
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
@@ -495,7 +510,9 @@ static void ThreadExecuteTasks(TaskScheduler *scheduler, atomic<bool> *marker, i
 	auto &db = scheduler->GetDatabase();
 	auto linux_tid = SchedulerThreadTID();
 	EnergyAttributionManager::RegisterSchedulerWorker(db, static_cast<uint64_t>(worker_id), linux_tid, intended_cpu);
+	db.GetQuerySLAScheduler().RegisterWorker(worker_id, intended_cpu);
 	scheduler->ExecuteForever(marker, worker_id);
+	db.GetQuerySLAScheduler().UnregisterWorker(worker_id);
 	EnergyAttributionManager::UnregisterSchedulerWorker(db, static_cast<uint64_t>(worker_id), linux_tid);
 }
 #endif
@@ -662,6 +679,7 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n, bool destroy) {
 				for (idx_t thread_idx = 0; thread_idx < threads.size(); thread_idx++) {
 					auto cpu_idx = thread_idx % affinity_cpus.size();
 					SetThreadAffinity(*threads[thread_idx]->internal_thread, affinity_cpus[cpu_idx]);
+					db.GetQuerySLAScheduler().RegisterWorker(thread_idx, affinity_cpus[cpu_idx]);
 				}
 			}
 		}
