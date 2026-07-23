@@ -94,6 +94,7 @@ int main() {
 		                                   const_cast<char **>(sla_attribution_arguments));
 		Require(sla_attribution.scheduler_policy == QuerySchedulerPolicy::SLA,
 		        "SLA baseline scheduler parsing");
+		Require(!sla_attribution.sla_residual_workers_enabled, "residual workers default to parked");
 		Require(sla_attribution.energy_attribution_enabled, "policy-independent attribution parsing");
 		Require(sla_attribution.energy_power_model_path == "/tmp/power.csv", "attribution power model parsing");
 
@@ -110,6 +111,19 @@ int main() {
 			rejected_unsafe_dry_run = true;
 		}
 		Require(rejected_unsafe_dry_run, "attribution rejects logical-only SLA-energy hardware targets");
+
+		const char *removed_lambda_arguments[] = {
+		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
+		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla_energy",
+		    "--energy-power-model", "/tmp/power.csv", "--energy-lambda", "1"};
+		bool rejected_removed_lambda = false;
+		try {
+			ParseConfig(sizeof(removed_lambda_arguments) / sizeof(removed_lambda_arguments[0]),
+			            const_cast<char **>(removed_lambda_arguments));
+		} catch (InvalidInputException &) {
+			rejected_removed_lambda = true;
+		}
+		Require(rejected_removed_lambda, "removed energy-lambda option is rejected");
 		std::cout << "scheduler_workload tests passed\n";
 		return 0;
 	} catch (std::exception &ex) {

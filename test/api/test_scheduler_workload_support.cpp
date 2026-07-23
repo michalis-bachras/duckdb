@@ -238,6 +238,7 @@ TEST_CASE("Scheduler profile snapshots round trip bounded model state", "[api][s
 	auto hardware_profile = store.GetPipelineHardwareProfilesSnapshot()[0];
 	REQUIRE(hardware_profile.mean_active_power_w > 0);
 	REQUIRE(hardware_profile.mean_charged_power_w > hardware_profile.mean_active_power_w);
+	REQUIRE(hardware_profile.profile_version == 2);
 	REQUIRE(store.GetInternalEventInstancesSnapshot().size() == 1);
 	auto path = TestCreatePath("scheduler_profile_snapshot.bin");
 	store.ExportSnapshot(db.instance->GetFileSystem(), path);
@@ -252,6 +253,7 @@ TEST_CASE("Scheduler profile snapshots round trip bounded model state", "[api][s
 	REQUIRE(store.GetPipelineInstancesSnapshot().empty());
 	REQUIRE(store.GetInternalEventInstancesSnapshot().empty());
 	REQUIRE(store.GetPipelineHardwareProfilesSnapshot().size() == 1);
+	REQUIRE(store.GetPipelineHardwareProfilesSnapshot()[0].profile_version == hardware_profile.profile_version);
 	QueryRequestPipelineProfileEstimate estimate;
 	REQUIRE(store.TryGetPipelineEstimate(6, 10, 7, 99, estimate));
 	REQUIRE(estimate.throughput_sample_count == 1);

@@ -2090,22 +2090,6 @@ Value QuerySLAEnergyHardwareControlEnableSetting::GetSetting(const ClientContext
 	return Value::BOOLEAN(DBConfig::GetConfig(context).options.query_sla_energy_hardware_control_enabled);
 }
 
-void QuerySLAEnergyLambdaSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
-	auto value = input.GetValue<double>();
-	if (!std::isfinite(value) || value < 0) {
-		throw InvalidInputException("query_sla_energy_lambda must be finite and non-negative");
-	}
-	config.options.query_sla_energy_lambda = value;
-}
-
-void QuerySLAEnergyLambdaSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
-	config.options.query_sla_energy_lambda = DBConfigOptions().query_sla_energy_lambda;
-}
-
-Value QuerySLAEnergyLambdaSetting::GetSetting(const ClientContext &context) {
-	return Value::DOUBLE(DBConfig::GetConfig(context).options.query_sla_energy_lambda);
-}
-
 void QuerySLAEnergyExplorationEnableSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
 	config.options.query_sla_energy_exploration_enabled = BooleanValue::Get(input.DefaultCastAs(LogicalType::BOOLEAN));
 }

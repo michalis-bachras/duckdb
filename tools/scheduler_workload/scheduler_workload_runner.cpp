@@ -119,7 +119,6 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 	if (policy == QuerySchedulerPolicy::SLA_ENERGY) {
 		ExecuteSetting(root, string("SET query_sla_energy_hardware_control_enable=") +
 		                         (config.sla_energy_hardware_control ? "true" : "false"));
-		ExecuteSetting(root, "SET query_sla_energy_lambda=" + std::to_string(config.sla_energy_lambda));
 		ExecuteSetting(root, string("SET query_sla_energy_exploration_enable=") +
 		                         (config.sla_energy_exploration ? "true" : "false"));
 		ExecuteSetting(root, "SET query_sla_energy_exploration_seed=" +

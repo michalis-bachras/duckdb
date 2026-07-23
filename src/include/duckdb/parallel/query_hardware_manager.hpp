@@ -53,6 +53,13 @@ struct QueryHardwareWorkerTopology {
 	int physical_core_id = -1;
 };
 
+struct QueryHardwareWorkerDomainContext {
+	QueryRequestHardwareConfiguration requested_hardware;
+	uint64_t plan_generation = 0;
+	bool core_active_without_worker = false;
+	bool socket_active_without_worker = false;
+};
+
 struct QueryHardwarePowerCalibrationEntry {
 	int socket_id = -1;
 	uint32_t core_frequency_khz = 0;
@@ -90,6 +97,7 @@ public:
 	                        uint64_t generation);
 	bool IsWorkerAtConfiguration(idx_t worker_id, const QueryRequestHardwareConfiguration &hardware) const;
 	QueryRequestHardwareConfiguration GetAppliedConfigurationForCPU(int logical_cpu) const;
+	QueryHardwareWorkerDomainContext GetDomainContextExcludingWorker(idx_t worker_id) const;
 
 	QueryRequestHardwareConfiguration ReferenceConfiguration() const;
 	QueryRequestHardwareConfiguration MinimumConfiguration() const;

@@ -96,10 +96,9 @@ sudo scheduler_workload run \
   --schedule training_schedule.csv \
   --scheduler sla_energy \
   --profile-input profiles.bin \
-  --profile-output energy_profiles.bin \
-  --energy-power-model base_power_core_uncore_sweep.csv \
-  --energy-lambda 1 \
-  --energy-exploration on \
+	  --profile-output energy_profiles.bin \
+	  --energy-power-model base_power_core_uncore_sweep.csv \
+	  --energy-exploration on \
   --energy-exploration-seed 1 \
   --energy-hardware-control on \
   --energy-attribution on \
@@ -108,6 +107,8 @@ sudo scheduler_workload run \
 ```
 
 Training may be repeated by using `energy_profiles.bin` as both the input and output snapshot until the required pipeline/pair coverage is mature. Each exact pair requires at least eight stable throughput observations and eight stable power observations. Every warmup epoch selects at most one incomplete optional-only core pair and one incomplete optional-only socket pair. If no optional-only socket appears for four active epochs, one active socket is sampled as a training-only fallback. Core and uncore targets remain selected until the next epoch or until the domain loses its assignment. Unstable mixed-frequency or migrated segments are rejected rather than contaminating the profile.
+
+SLA-energy uses a lexicographic objective and has no energy-weight parameter. Every epoch first computes the same positive-gain mandatory and optional token sequence as pure SLA; the energy planner may choose hardware and placement for those fixed tokens, but may not drop, add, or redirect them. Mandatory workers may use a lower-EDP hardware pair only when it preserves the maximum-frequency mandatory cost and fragility. Optional tokens are ordered only by the fragility reduction obtained at their fastest applicable reference pair. After a token is selected, its hardware pair is the minimum normalized-EDP pair that preserves the reference mandatory cost and fragility. Lifecycle events are the exception: they have no chunk-throughput unit, so their optional worker/no-worker transition comes directly from the SLA service model and runs at the maximum-reference hardware pair without EDP optimization. O1 uses an unused SMT slot on an active core without changing its installed pair for throughput-modeled work. O2 uses an empty core on an active socket while preserving the socket's uncore frequency, and O3 densely activates an inactive socket. If no EDP-qualified O1-O3 placement exists, the fixed token is placed at the maximum-reference pair. Between epochs, dynamic query selection uses the same pure-SLA mandatory and optional gains. Reusing an active core and socket is preferred for optional work, but an inactive domain is not an eligibility barrier; the maximum-reference pair is the safe fallback.
 
 Evaluate on a different saved schedule and seed with exploration disabled:
 
@@ -121,10 +122,9 @@ sudo scheduler_workload run \
   --admission-cap 128 \
   --schedule evaluation_schedule.csv \
   --scheduler sla_energy \
-  --profile-input energy_profiles.bin \
-  --energy-power-model base_power_core_uncore_sweep.csv \
-  --energy-lambda 1 \
-  --energy-exploration off \
+	  --profile-input energy_profiles.bin \
+	  --energy-power-model base_power_core_uncore_sweep.csv \
+	  --energy-exploration off \
   --energy-hardware-control on \
   --energy-attribution on \
   --energy-attribution-period-ms 100 \
@@ -135,7 +135,7 @@ Periodic RAPL attribution is enabled explicitly with `--energy-attribution on`, 
 
 For a fair energy baseline, run the identical schedule and profile snapshot with `--scheduler sla`, the same `--energy-power-model`, and `--energy-attribution on`. The driver pins the common worker pool whenever attribution is enabled, so DEFAULT, STRIDE, SLA, and SLA-energy measurements use stable worker-to-hardware topology. Only SLA-energy enables direct frequency control; the other policies leave frequency selection to the configured OS governor.
 
-The SLA-only scheduler is work-conserving by default: after positive mandatory and optional gains are exhausted, it assigns zero-gain residual workers up to pipeline demand caps. Use `--sla-residual-policy park` for a controlled ablation that disables both epoch-level and between-epoch residual assignment. SLA-energy already parks this residual capacity and retains only its one-worker liveness fallback, so the option does not change SLA-energy behavior. Epoch traces expose `residual_workers` separately from positive-gain `optional_workers`.
+The SLA-family schedulers park capacity after positive mandatory and optional gains are exhausted. The SLA-only scheduler can opt into zero-gain residual workers up to pipeline demand caps with `--sla-residual-policy work_conserving` for controlled ablations; SLA-energy always parks residual capacity. Epoch traces expose `residual_workers` separately from positive-gain `optional_workers`.
 
 The driver exports `query_sla_energy_hardware.csv` before shutdown and `query_sla_energy_hardware_restoration.csv` after explicitly deactivating the energy policy. The latter reports exact MSR restoration attempts, successful readback verifications, and failures. A real hardware-controlled run is invalid if any restoration write or readback fails. Both upshifts and downshifts are applied synchronously and verified. Exploration diagnostics report core-probe epochs, optional-only socket-probe epochs, forced socket-probe epochs, and the current optional-only-socket miss count.
 

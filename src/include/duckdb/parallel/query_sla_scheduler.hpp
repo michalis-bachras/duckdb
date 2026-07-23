@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/query_scheduler_policy.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/task.hpp"
@@ -21,14 +22,17 @@ struct ProducerToken;
 struct QuerySLASchedulerState;
 
 enum class QuerySLADequeueResult : uint8_t { NOT_ACTIVE = 0, TASK_FOUND, NO_TASK };
+enum class QuerySLAContinuationResult : uint8_t { CONTINUE = 0, YIELD };
 
 struct QuerySLAWorkerSelection {
 	QueryRequestHardwareConfiguration hardware;
+	QuerySchedulerPolicy policy = QuerySchedulerPolicy::DEFAULT;
 	uint64_t plan_generation = 0;
+	uint64_t db_query_id = 0;
+	uint64_t pipeline_generation = 0;
 	bool assigned = false;
 	bool mandatory = false;
 	bool optional = false;
-	bool liveness = false;
 	bool exploration = false;
 };
 
@@ -106,14 +110,16 @@ struct QuerySLASchedulerEpochSnapshot {
 	idx_t mandatory_workers = 0;
 	idx_t optional_workers = 0;
 	idx_t residual_workers = 0;
-	idx_t liveness_workers = 0;
 	idx_t planned_workers = 0;
 	idx_t assigned_workers = 0;
+	idx_t reference_mandatory_workers = 0;
+	idx_t reference_optional_workers = 0;
+	bool energy_logical_plan_match = false;
 	idx_t energy_mandatory_workers = 0;
 	idx_t energy_o1_workers = 0;
 	idx_t energy_o2_workers = 0;
 	idx_t energy_o3_workers = 0;
-	idx_t energy_liveness_workers = 0;
+	idx_t energy_reference_fallback_workers = 0;
 	idx_t energy_parked_workers = 0;
 	idx_t energy_core_probes = 0;
 	idx_t energy_uncore_probes = 0;
@@ -122,9 +128,12 @@ struct QuerySLASchedulerEpochSnapshot {
 	idx_t energy_epochs_without_optional_only_socket = 0;
 	idx_t energy_profile_fallback_count = 0;
 	idx_t energy_immature_pair_rejections = 0;
-	idx_t energy_domain_pair_promotions = 0;
-	double energy_mandatory_footprint_j = 0;
-	double energy_optional_incremental_j = 0;
+	idx_t energy_domain_frequency_inflations = 0;
+	double energy_mandatory_target_sla_cost = 0;
+	double energy_mandatory_target_optional_risk = 0;
+	double energy_mandatory_reference_safe_throughput = 0;
+	double energy_mandatory_preferred_normalized_edp = 0;
+	uint64_t energy_mandatory_profile_version = 0;
 	double predicted_service_rate = 0;
 	double predicted_active_power_w = 0;
 	double predicted_epoch_energy_j = 0;
@@ -157,11 +166,20 @@ struct QuerySLAEnergyWorkerEpochSnapshot {
 	int physical_core_id = -1;
 	bool mandatory = false;
 	bool optional = false;
-	bool liveness = false;
 	bool exploration = false;
+	string optional_stage;
+	QueryRequestHardwareConfiguration preferred_hardware;
 	QueryRequestHardwareConfiguration normal_hardware;
 	QueryRequestHardwareConfiguration execution_hardware;
 	QueryRequestHardwareConfiguration applied_hardware;
+	double preferred_safe_throughput = 0;
+	double preferred_normalized_edp = 0;
+	double optional_fragility_before = 0;
+	double optional_fragility_target = 0;
+	double optional_fragility_after = 0;
+	double optional_gain = 0;
+	uint64_t profile_version = 0;
+	idx_t worker_ordinal = DConstants::INVALID_INDEX;
 };
 
 struct QuerySLAExplorationDiagnosticsSnapshot {
@@ -192,7 +210,11 @@ public:
 
 	QuerySLADequeueResult TryDequeueTask(idx_t worker_id, shared_ptr<Task> &task,
 	                                   QuerySLAWorkerSelection *selection = nullptr);
+	QuerySLAContinuationResult CheckTaskContinuation(idx_t worker_id, const QuerySLAWorkerSelection &previous,
+	                                                 QuerySLAWorkerSelection &current);
 	void RequestInitialEpoch();
+	bool TryAcquireEpochSentinel(uint64_t &deadline_ns);
+	void ReleaseEpochSentinel();
 	void RegisterWorker(idx_t worker_id, int logical_cpu);
 	void UnregisterWorker(idx_t worker_id);
 	void ActivateEnergyPolicy();
@@ -210,7 +232,7 @@ public:
 
 private:
 	void MaybeRunEpoch();
-	void RunEpoch(uint64_t now_ns);
+	idx_t RunEpoch(uint64_t now_ns);
 
 private:
 	DatabaseInstance &db;

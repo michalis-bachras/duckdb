@@ -118,11 +118,9 @@ struct DBConfigOptions {
 	//! SLA scheduler epoch length in milliseconds.
 	idx_t query_sla_scheduler_epoch_ms = 200;
 	//! Whether the SLA-only scheduler assigns zero-gain residual workers up to pipeline demand caps.
-	bool query_sla_residual_workers_enabled = true;
+	bool query_sla_residual_workers_enabled = false;
 	//! Whether SLA-energy applies core and uncore targets through the direct MSR backend.
 	bool query_sla_energy_hardware_control_enabled = true;
-	//! Relative weight of predicted energy in the SLA-energy optional-worker objective.
-	double query_sla_energy_lambda = 1.0;
 	//! Whether SLA-energy may collect epoch-scoped hardware-pair exploration samples.
 	bool query_sla_energy_exploration_enabled = false;
 	//! Deterministic seed used to select exploration domains and frequencies.

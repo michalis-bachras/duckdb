@@ -318,11 +318,13 @@ static unique_ptr<FunctionData> DuckDBQueryRequestPipelineHardwareProfilesBind(
 	for (auto name : {"mean_work_units_per_s", "ewma_work_units_per_s", "p10_work_units_per_s",
 	                  "safe_work_units_per_s", "mean_active_power_w", "ewma_active_power_w",
 	                  "mean_charged_power_w", "ewma_charged_power_w", "safe_throughput_per_active_watt",
-	                  "mean_throughput_per_active_watt"}) {
+	                  "mean_throughput_per_active_watt", "normalized_edp"}) {
 		names.emplace_back(name);
 		return_types.emplace_back(LogicalType::DOUBLE);
 	}
 	names.emplace_back("rejected_unstable_samples");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("profile_version");
 	return_types.emplace_back(LogicalType::UBIGINT);
 	return nullptr;
 }
@@ -362,7 +364,9 @@ static void DuckDBQueryRequestPipelineHardwareProfilesFunction(ClientContext &co
 		output.SetValue(col++, count, Value::DOUBLE(profile.ewma_charged_power_w));
 		output.SetValue(col++, count, Value::DOUBLE(profile.safe_throughput_per_active_watt));
 		output.SetValue(col++, count, Value::DOUBLE(profile.mean_throughput_per_active_watt));
+		output.SetValue(col++, count, Value::DOUBLE(profile.normalized_edp));
 		output.SetValue(col++, count, Value::UBIGINT(profile.rejected_unstable_samples));
+		output.SetValue(col++, count, Value::UBIGINT(profile.profile_version));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -1186,14 +1190,16 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext 
 	SLA_EPOCH_COLUMN("mandatory_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("optional_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("residual_workers", LogicalType::UBIGINT);
-	SLA_EPOCH_COLUMN("liveness_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("planned_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("assigned_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("reference_mandatory_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("reference_optional_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("energy_logical_plan_match", LogicalType::BOOLEAN);
 	SLA_EPOCH_COLUMN("energy_mandatory_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_o1_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_o2_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_o3_workers", LogicalType::UBIGINT);
-	SLA_EPOCH_COLUMN("energy_liveness_workers", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("energy_reference_fallback_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_parked_workers", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_core_probes", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_uncore_probes", LogicalType::UBIGINT);
@@ -1202,9 +1208,12 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext 
 	SLA_EPOCH_COLUMN("energy_epochs_without_optional_only_socket", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_profile_fallback_count", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("energy_immature_pair_rejections", LogicalType::UBIGINT);
-	SLA_EPOCH_COLUMN("energy_domain_pair_promotions", LogicalType::UBIGINT);
-	SLA_EPOCH_COLUMN("energy_mandatory_footprint_j", LogicalType::DOUBLE);
-	SLA_EPOCH_COLUMN("energy_optional_incremental_j", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("energy_domain_frequency_inflations", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("energy_mandatory_target_sla_cost", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("energy_mandatory_target_optional_risk", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("energy_mandatory_reference_safe_throughput", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("energy_mandatory_preferred_normalized_edp", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("energy_mandatory_profile_version", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("predicted_service_rate", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("predicted_active_power_w", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("predicted_epoch_energy_j", LogicalType::DOUBLE);
@@ -1406,14 +1415,16 @@ static void DuckDBQuerySLASchedulerEpochsFunction(ClientContext &context, TableF
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.mandatory_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.optional_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.residual_workers));
-		output.SetValue(col++, count, Value::UBIGINT(snapshot.liveness_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.planned_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.assigned_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.reference_mandatory_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.reference_optional_workers));
+		output.SetValue(col++, count, Value::BOOLEAN(snapshot.energy_logical_plan_match));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_mandatory_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_o1_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_o2_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_o3_workers));
-		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_liveness_workers));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_reference_fallback_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_parked_workers));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_core_probes));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_uncore_probes));
@@ -1422,9 +1433,12 @@ static void DuckDBQuerySLASchedulerEpochsFunction(ClientContext &context, TableF
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_epochs_without_optional_only_socket));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_profile_fallback_count));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_immature_pair_rejections));
-		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_domain_pair_promotions));
-		output.SetValue(col++, count, Value::DOUBLE(snapshot.energy_mandatory_footprint_j));
-		output.SetValue(col++, count, Value::DOUBLE(snapshot.energy_optional_incremental_j));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_domain_frequency_inflations));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.energy_mandatory_target_sla_cost));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.energy_mandatory_target_optional_risk));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.energy_mandatory_reference_safe_throughput));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.energy_mandatory_preferred_normalized_edp));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.energy_mandatory_profile_version));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_service_rate));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_active_power_w));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_epoch_energy_j));
@@ -1458,15 +1472,30 @@ static unique_ptr<FunctionData> DuckDBQuerySLAEnergyWorkerEpochsBind(ClientConte
 		names.emplace_back(name);
 		return_types.emplace_back(LogicalType::INTEGER);
 	}
-	for (auto name : {"mandatory", "optional", "liveness", "exploration"}) {
+	for (auto name : {"mandatory", "optional", "exploration"}) {
 		names.emplace_back(name);
 		return_types.emplace_back(LogicalType::BOOLEAN);
 	}
-	for (auto name : {"normal_core_khz", "normal_uncore_khz", "execution_core_khz", "execution_uncore_khz",
-	                  "applied_core_khz", "applied_uncore_khz"}) {
+	names.emplace_back("optional_stage");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	for (auto name : {"preferred_core_khz", "preferred_uncore_khz", "normal_core_khz", "normal_uncore_khz",
+	                  "execution_core_khz", "execution_uncore_khz", "applied_core_khz", "applied_uncore_khz"}) {
 		names.emplace_back(name);
 		return_types.emplace_back(LogicalType::UINTEGER);
 	}
+	names.emplace_back("preferred_safe_throughput");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("preferred_normalized_edp");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	for (auto name : {"optional_fragility_before", "optional_fragility_target", "optional_fragility_after",
+	                  "optional_gain"}) {
+		names.emplace_back(name);
+		return_types.emplace_back(LogicalType::DOUBLE);
+	}
+	names.emplace_back("profile_version");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("worker_ordinal");
+	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("trace_dropped_count");
 	return_types.emplace_back(LogicalType::UBIGINT);
 	return nullptr;
@@ -1498,14 +1527,24 @@ static void DuckDBQuerySLAEnergyWorkerEpochsFunction(ClientContext &context, Tab
 		output.SetValue(col++, count, Value::INTEGER(row.physical_core_id));
 		output.SetValue(col++, count, Value::BOOLEAN(row.mandatory));
 		output.SetValue(col++, count, Value::BOOLEAN(row.optional));
-		output.SetValue(col++, count, Value::BOOLEAN(row.liveness));
 		output.SetValue(col++, count, Value::BOOLEAN(row.exploration));
+		output.SetValue(col++, count, Value(row.optional_stage));
+		output.SetValue(col++, count, Value::UINTEGER(row.preferred_hardware.core_frequency_khz));
+		output.SetValue(col++, count, Value::UINTEGER(row.preferred_hardware.uncore_frequency_khz));
 		output.SetValue(col++, count, Value::UINTEGER(row.normal_hardware.core_frequency_khz));
 		output.SetValue(col++, count, Value::UINTEGER(row.normal_hardware.uncore_frequency_khz));
 		output.SetValue(col++, count, Value::UINTEGER(row.execution_hardware.core_frequency_khz));
 		output.SetValue(col++, count, Value::UINTEGER(row.execution_hardware.uncore_frequency_khz));
 		output.SetValue(col++, count, Value::UINTEGER(row.applied_hardware.core_frequency_khz));
 		output.SetValue(col++, count, Value::UINTEGER(row.applied_hardware.uncore_frequency_khz));
+		output.SetValue(col++, count, Value::DOUBLE(row.preferred_safe_throughput));
+		output.SetValue(col++, count, Value::DOUBLE(row.preferred_normalized_edp));
+		output.SetValue(col++, count, Value::DOUBLE(row.optional_fragility_before));
+		output.SetValue(col++, count, Value::DOUBLE(row.optional_fragility_target));
+		output.SetValue(col++, count, Value::DOUBLE(row.optional_fragility_after));
+		output.SetValue(col++, count, Value::DOUBLE(row.optional_gain));
+		output.SetValue(col++, count, Value::UBIGINT(row.profile_version));
+		output.SetValue(col++, count, Value::UBIGINT(row.worker_ordinal));
 		output.SetValue(col++, count, Value::UBIGINT(data.dropped_count));
 		count++;
 	}

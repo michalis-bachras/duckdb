@@ -9,16 +9,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 
 namespace duckdb {
 
 namespace {
-
-static constexpr idx_t O3_BEAM_WIDTH = 4;
-static constexpr idx_t O3_MAX_DEPTH = 8;
-static constexpr idx_t OPTIONAL_QUERY_SHORTLIST = 8;
 
 struct CoreKey {
 	CoreKey() {
@@ -43,16 +42,18 @@ struct PlannerHardwareCandidate {
 	QueryRequestHardwareConfiguration hardware;
 	double throughput = 0;
 	double active_power_w = 0;
+	double normalized_edp = 0;
+	uint64_t profile_version = 0;
 	idx_t sample_count = 0;
 };
 
 struct MandatoryToken {
-	MandatoryToken(idx_t query_index_p, const QueryRequestHardwareConfiguration &preferred_p)
-	    : query_index(query_index_p), preferred(preferred_p) {
+	MandatoryToken(idx_t query_index_p, const QuerySLAEnergyWorkerAssignment &assignment_p)
+	    : query_index(query_index_p), assignment(assignment_p) {
 	}
 
 	idx_t query_index = 0;
-	QueryRequestHardwareConfiguration preferred;
+	QuerySLAEnergyWorkerAssignment assignment;
 };
 
 struct CoreSlots {
@@ -60,27 +61,21 @@ struct CoreSlots {
 	vector<QueryHardwareWorkerTopology> workers;
 };
 
-struct OptionalAction {
+struct OptionalToken {
 	bool valid = false;
-	double utility = 0;
-	double risk_gain = 0;
-	double energy_j = 0;
-	CoreKey core;
+	idx_t query_index = DConstants::INVALID_INDEX;
+	idx_t worker_ordinal = DConstants::INVALID_INDEX;
 	int socket_id = -1;
-	uint32_t core_frequency_khz = 0;
-	uint32_t uncore_frequency_khz = 0;
-	idx_t query_a = DConstants::INVALID_INDEX;
-	idx_t query_b = DConstants::INVALID_INDEX;
-	double throughput_a = 0;
-	double throughput_b = 0;
-};
-
-struct BeamState {
-	vector<double> service_rates;
-	vector<double> optional_risks;
-	vector<idx_t> worker_counts;
-	vector<OptionalAction> actions;
-	double value = 0;
+	QueryRequestHardwareConfiguration hardware;
+	double throughput = 0;
+	double active_power_w = 0;
+	double normalized_edp = 0;
+	double fragility_before = 0;
+	double fragility_target = 0;
+	double fragility_after = 0;
+	double gain = 0;
+	uint64_t profile_version = 0;
+	QuerySLAEnergyOptionalStage stage = QuerySLAEnergyOptionalStage::NONE;
 };
 
 static bool PlannerSameHardware(const QueryRequestHardwareConfiguration &left,
@@ -115,6 +110,10 @@ static PlannerHardwareCandidate FindHardwareCandidate(const QuerySLAEnergyModelI
 		result.throughput = profile.safe_work_units_per_s;
 		result.active_power_w =
 		    profile.ewma_active_power_w > 0 ? profile.ewma_active_power_w : profile.mean_active_power_w;
+		result.normalized_edp = result.active_power_w > 0
+		                            ? result.active_power_w / (result.throughput * result.throughput)
+		                            : 0;
+		result.profile_version = profile.profile_version;
 		return result;
 	}
 	if (PlannerSameHardware(hardware, query.reference_hardware) && query.reference_model.valid &&
@@ -175,24 +174,12 @@ static vector<CoreSlots> BuildCoreSlots(const vector<QueryHardwareWorkerTopology
 	return result;
 }
 
-static vector<QueryHardwareWorkerTopology> FlattenSlots(const vector<CoreSlots> &cores, bool reverse_sockets) {
+static vector<QueryHardwareWorkerTopology> FlattenSlots(const vector<CoreSlots> &cores) {
 	vector<QueryHardwareWorkerTopology> result;
 	for (const auto &core : cores) {
 		for (const auto &worker : core.workers) {
 			result.push_back(worker);
 		}
-	}
-	if (reverse_sockets) {
-		std::stable_sort(result.begin(), result.end(), [](const QueryHardwareWorkerTopology &left,
-		                                                   const QueryHardwareWorkerTopology &right) {
-			if (left.socket_id != right.socket_id) {
-				return left.socket_id > right.socket_id;
-			}
-			if (left.physical_core_id != right.physical_core_id) {
-				return left.physical_core_id < right.physical_core_id;
-			}
-			return left.logical_cpu < right.logical_cpu;
-		});
 	}
 	return result;
 }
@@ -227,48 +214,18 @@ static void ResolveActualHardware(vector<QuerySLAEnergyPlacedWorker> &workers,
 	}
 }
 
-static bool IsSafeNormalHardware(const QuerySLAEnergyModelInput &query,
-	                             const QueryRequestHardwareConfiguration &hardware) {
-	if (PlannerSameHardware(hardware, query.reference_hardware)) {
-		return true;
-	}
-	for (const auto &profile : query.hardware_profiles) {
-		if (PlannerSameHardware(profile.hardware, hardware)) {
-			return profile.valid && profile.mature && profile.safe_work_units_per_s > 0;
-		}
-	}
-	return false;
+static bool HardwareAtLeast(const QueryRequestHardwareConfiguration &actual,
+	                        const QueryRequestHardwareConfiguration &preferred) {
+	return actual.core_frequency_khz >= preferred.core_frequency_khz &&
+	       actual.uncore_frequency_khz >= preferred.uncore_frequency_khz;
 }
 
-static bool ReconcileNormalHardwarePairs(vector<QuerySLAEnergyPlacedWorker> &workers,
-	                                     const QuerySLAEnergyPlannerInput &input, idx_t &promotion_count) {
-	// Core and uncore requests are domain-coupled: SMT siblings share a core target and all workers on a socket
-	// share an uncore target. Resolve those maxima first, then conservatively promote any resulting unprofiled
-	// cross-product to the query's maximum-frequency reference pair. Promotions are monotone, so at most one
-	// promotion per worker is needed before convergence.
-	for (idx_t iteration = 0; iteration <= workers.size(); iteration++) {
-		ResolveActualHardware(workers, input.topology);
-		bool changed = false;
-		for (auto &worker : workers) {
-			if (worker.query_index >= input.queries.size()) {
-				return false;
-			}
-			const auto &query = input.queries[worker.query_index];
-			if (IsSafeNormalHardware(query, worker.normal_hardware)) {
-				continue;
-			}
-			if (PlannerSameHardware(worker.preferred_hardware, query.reference_hardware)) {
-				return false;
-			}
-			worker.preferred_hardware = query.reference_hardware;
-			promotion_count++;
-			changed = true;
-		}
-		if (!changed) {
-			return true;
-		}
+static idx_t CountDomainFrequencyInflations(const vector<QuerySLAEnergyPlacedWorker> &workers) {
+	idx_t result = 0;
+	for (const auto &worker : workers) {
+		result += PlannerSameHardware(worker.normal_hardware, worker.preferred_hardware) ? 0 : 1;
 	}
-	return false;
+	return result;
 }
 
 static double PlannerPredictedEpochEnergy(const QuerySLAModelInput &input, double service_rate, double power_w) {
@@ -282,10 +239,51 @@ static double PlannerPredictedEpochEnergy(const QuerySLAModelInput &input, doubl
 	return power_w * MinValue<double>(epoch_s, work_s);
 }
 
-static bool RebuildQueryAllocationsFromActualHardware(QuerySLAEnergyEpochPlan &plan,
-	                                                   const QuerySLAEnergyPlannerInput &input) {
+static double PlannerServiceTolerance(double expected, idx_t worker_count) {
+	return 64.0 * std::numeric_limits<double>::epsilon() *
+	       MaxValue<double>(1.0, std::abs(expected)) *
+	       static_cast<double>(MaxValue<idx_t>(1, worker_count));
+}
+
+static string PlannerValidationDetail(idx_t query_index, const QuerySLAEnergyPlannerInput &input,
+	                                  const string &message) {
+	std::ostringstream result;
+	result << std::setprecision(17) << "query index " << query_index;
+	if (query_index < input.queries.size()) {
+		result << " db_query_id=" << input.queries[query_index].sla_input.metadata.db_query_id
+		       << " pipeline=" << input.queries[query_index].sla_input.work.pipeline_id;
+	}
+	result << ": " << message;
+	return result.str();
+}
+
+static bool RebuildQueryAllocationsFromPreferences(QuerySLAEnergyEpochPlan &plan,
+	                                                const QuerySLAEnergyPlannerInput &input, string &error) {
+	auto previous = plan.queries;
 	vector<QuerySLAEnergyQueryAllocation> allocations(input.queries.size());
+	vector<vector<bool>> seen(input.queries.size());
+	vector<long double> reconstructed_service(input.queries.size(), 0);
+	vector<long double> reconstructed_power(input.queries.size(), 0);
 	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+		if (query_index < previous.size()) {
+			allocations[query_index].mandatory_target_sla_cost =
+			    previous[query_index].mandatory_target_sla_cost;
+			allocations[query_index].mandatory_target_optional_risk =
+			    previous[query_index].mandatory_target_optional_risk;
+			allocations[query_index].mandatory_preferred_service_rate =
+			    previous[query_index].mandatory_preferred_service_rate;
+			allocations[query_index].mandatory_reference_safe_throughput =
+			    previous[query_index].mandatory_reference_safe_throughput;
+			allocations[query_index].mandatory_preferred_normalized_edp =
+			    previous[query_index].mandatory_preferred_normalized_edp;
+			allocations[query_index].mandatory_profile_version =
+			    previous[query_index].mandatory_profile_version;
+			allocations[query_index].aggregate_service_rate =
+			    previous[query_index].aggregate_service_rate;
+			allocations[query_index].aggregate_active_power_w =
+			    previous[query_index].aggregate_active_power_w;
+			seen[query_index].resize(previous[query_index].workers.size(), false);
+		}
 		auto evaluation = QuerySLAEvaluateServiceRate(input.queries[query_index].sla_input, 0, 0);
 		if (evaluation.valid) {
 			allocations[query_index].predicted_sla_cost = evaluation.mandatory_cost;
@@ -294,106 +292,125 @@ static bool RebuildQueryAllocationsFromActualHardware(QuerySLAEnergyEpochPlan &p
 	}
 	for (const auto &worker : plan.workers) {
 		if (worker.query_index >= input.queries.size() ||
-		    !IsSafeNormalHardware(input.queries[worker.query_index], worker.normal_hardware)) {
+		    !HardwareAtLeast(worker.normal_hardware, worker.preferred_hardware) ||
+		    worker.preferred_safe_throughput < 0) {
+			error = "placed worker has an invalid query, hardware preference, or throughput";
 			return false;
 		}
-		const auto &query = input.queries[worker.query_index];
-		auto candidate = FindHardwareCandidate(query, worker.normal_hardware);
-		if (!candidate.valid && PlannerSameHardware(worker.normal_hardware, query.reference_hardware)) {
-			// Serial lifecycle work has no source throughput. The reference pair is still the only safe cold pair.
-			candidate.valid = query.reference_model.valid;
-			candidate.throughput = query.reference_model.throughput;
-		}
-		if (!candidate.valid) {
+		auto query_index = worker.query_index;
+		if (query_index >= previous.size() || worker.worker_ordinal >= previous[query_index].workers.size()) {
+			error = PlannerValidationDetail(query_index, input, "placed worker has an invalid ordinal");
 			return false;
 		}
+		auto &expected = previous[query_index].workers[worker.worker_ordinal];
+		if (seen[query_index][worker.worker_ordinal]) {
+			error = PlannerValidationDetail(query_index, input, "placed worker ordinal appears more than once");
+			return false;
+		}
+		if (worker.mandatory != expected.mandatory || worker.optional != expected.optional ||
+		    !(worker.preferred_hardware == expected.hardware) ||
+		    worker.preferred_safe_throughput != expected.safe_throughput ||
+		    worker.profile_version != expected.profile_version ||
+		    worker.optional_stage != expected.optional_stage) {
+			error = PlannerValidationDetail(query_index, input, "placed worker no longer matches its accepted token");
+			return false;
+		}
+		seen[query_index][worker.worker_ordinal] = true;
 		auto &allocation = allocations[worker.query_index];
 		QuerySLAEnergyWorkerAssignment assignment;
-		assignment.hardware = worker.normal_hardware;
-		assignment.mandatory = worker.mandatory;
-		assignment.optional = worker.optional;
-		assignment.liveness = worker.liveness;
-		allocation.workers.push_back(assignment);
-		allocation.aggregate_service_rate += candidate.throughput;
-		allocation.aggregate_active_power_w += candidate.active_power_w;
+		assignment.valid = true;
+		assignment.hardware = worker.preferred_hardware;
+		assignment.safe_throughput = worker.preferred_safe_throughput;
+			assignment.active_power_w = worker.preferred_active_power_w;
+			assignment.normalized_edp = worker.preferred_normalized_edp;
+			assignment.optional_fragility_before = worker.optional_fragility_before;
+			assignment.optional_fragility_target = worker.optional_fragility_target;
+			assignment.optional_fragility_after = worker.optional_fragility_after;
+			assignment.optional_gain = worker.optional_gain;
+			assignment.profile_version = worker.profile_version;
+			assignment.worker_ordinal = worker.worker_ordinal;
+			assignment.optional_stage = worker.optional_stage;
+			assignment.mandatory = worker.mandatory;
+			assignment.optional = worker.optional;
+			allocation.workers.push_back(assignment);
+		reconstructed_service[query_index] += static_cast<long double>(worker.preferred_safe_throughput);
+		reconstructed_power[query_index] += static_cast<long double>(worker.preferred_active_power_w);
 		allocation.mandatory_workers += worker.mandatory ? 1 : 0;
-		allocation.optional_workers += worker.optional ? 1 : 0;
-		allocation.liveness_workers += worker.liveness ? 1 : 0;
+			allocation.optional_workers += worker.optional ? 1 : 0;
+		}
+		for (auto &allocation : allocations) {
+			std::sort(allocation.workers.begin(), allocation.workers.end(),
+			          [](const QuerySLAEnergyWorkerAssignment &left,
+			             const QuerySLAEnergyWorkerAssignment &right) {
+				          return left.worker_ordinal < right.worker_ordinal;
+		          });
 	}
 	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
 		auto &allocation = allocations[query_index];
+		if (query_index >= previous.size() ||
+		    allocation.mandatory_workers != previous[query_index].mandatory_workers ||
+		    allocation.optional_workers != previous[query_index].optional_workers ||
+		    std::find(seen[query_index].begin(), seen[query_index].end(), false) != seen[query_index].end()) {
+			error = PlannerValidationDetail(query_index, input, "placed worker set differs from the accepted allocation");
+			return false;
+		}
+		auto reconstructed_service_rate = static_cast<double>(reconstructed_service[query_index]);
+		auto service_tolerance =
+		    PlannerServiceTolerance(allocation.aggregate_service_rate, allocation.workers.size());
+		if (std::abs(reconstructed_service_rate - allocation.aggregate_service_rate) > service_tolerance) {
+			std::ostringstream message;
+			message << std::setprecision(17) << "token service sum=" << reconstructed_service_rate
+			        << " differs from canonical service=" << allocation.aggregate_service_rate
+			        << " tolerance=" << service_tolerance;
+			error = PlannerValidationDetail(query_index, input, message.str());
+			return false;
+		}
+		auto reconstructed_power_w = static_cast<double>(reconstructed_power[query_index]);
+		auto power_tolerance =
+		    PlannerServiceTolerance(allocation.aggregate_active_power_w, allocation.workers.size());
+		if (std::abs(reconstructed_power_w - allocation.aggregate_active_power_w) > power_tolerance) {
+			error = PlannerValidationDetail(query_index, input, "token power sum differs from canonical power");
+			return false;
+		}
 		auto evaluation = QuerySLAEvaluateServiceRate(input.queries[query_index].sla_input,
 		                                             allocation.aggregate_service_rate, allocation.workers.size());
 		if (!evaluation.valid) {
+			error = PlannerValidationDetail(query_index, input, "canonical service cannot be evaluated");
 			return false;
 		}
 		allocation.predicted_sla_cost = evaluation.mandatory_cost;
 		allocation.predicted_optional_risk = evaluation.optional_risk;
 		allocation.predicted_epoch_energy_j = PlannerPredictedEpochEnergy(
 		    input.queries[query_index].sla_input, allocation.aggregate_service_rate, allocation.aggregate_active_power_w);
+		if (allocation.mandatory_workers > 0) {
+			auto cost_tolerance =
+			    1e-9 * MaxValue<double>(1.0, std::abs(allocation.mandatory_target_sla_cost));
+			auto risk_tolerance =
+			    1e-9 * MaxValue<double>(1.0, std::abs(allocation.mandatory_target_optional_risk));
+			if (allocation.predicted_sla_cost >
+			        allocation.mandatory_target_sla_cost + cost_tolerance ||
+			    allocation.predicted_optional_risk >
+			        allocation.mandatory_target_optional_risk + risk_tolerance) {
+				std::ostringstream message;
+				message << std::setprecision(17)
+				        << "mandatory SLA target regression: actual_cost=" << allocation.predicted_sla_cost
+				        << " target_cost=" << allocation.mandatory_target_sla_cost
+				        << " actual_risk=" << allocation.predicted_optional_risk
+				        << " target_risk=" << allocation.mandatory_target_optional_risk
+				        << " service=" << allocation.aggregate_service_rate
+				        << " workers=" << allocation.workers.size();
+				error = PlannerValidationDetail(query_index, input, message.str());
+				return false;
+			}
+		}
 	}
 	plan.queries = std::move(allocations);
 	return true;
 }
 
-static double PlacementEnergy(const vector<QuerySLAEnergyPlacedWorker> &workers,
-	                          const vector<QueryHardwareWorkerTopology> &topology,
-	                          const QueryHardwarePowerModelSnapshot &power_model, uint64_t epoch_ns) {
-	if (workers.empty()) {
-		return 0;
-	}
-	std::unordered_map<idx_t, QueryHardwareWorkerTopology> worker_topology;
-	std::map<int, idx_t> physical_cores_per_socket;
-	std::set<CoreKey> all_cores;
-	for (const auto &worker : topology) {
-		worker_topology[worker.worker_id] = worker;
-		all_cores.insert(CoreKey(worker.socket_id, worker.physical_core_id));
-	}
-	for (const auto &core : all_cores) {
-		physical_cores_per_socket[core.socket_id]++;
-	}
-	std::map<CoreKey, QueryRequestHardwareConfiguration> cores;
-	std::map<int, uint32_t> sockets;
-	for (const auto &worker : workers) {
-		auto topology_entry = worker_topology.find(worker.worker_id);
-		if (topology_entry == worker_topology.end()) {
-			continue;
-		}
-		CoreKey core(topology_entry->second.socket_id, topology_entry->second.physical_core_id);
-		auto &hardware = cores[core];
-		hardware.core_frequency_khz =
-		    MaxValue<uint32_t>(hardware.core_frequency_khz, worker.normal_hardware.core_frequency_khz);
-		hardware.uncore_frequency_khz =
-		    MaxValue<uint32_t>(hardware.uncore_frequency_khz, worker.normal_hardware.uncore_frequency_khz);
-		sockets[core.socket_id] =
-		    MaxValue<uint32_t>(sockets[core.socket_id], worker.normal_hardware.uncore_frequency_khz);
-	}
-	double power_w = 0;
-	for (const auto &socket : sockets) {
-		auto value = power_model.SocketIncrementalPowerW(socket.first, socket.second);
-		if (value < 0) {
-			// Deterministic fallback keeps dense packing preferable when calibration is unavailable.
-			power_w += 1000.0 + static_cast<double>(socket.second) / 1000000.0;
-		} else {
-			power_w += value;
-		}
-	}
-	for (const auto &core : cores) {
-		auto value = power_model.CoreIncrementalPowerW(core.first.socket_id, core.second.core_frequency_khz,
-		                                             sockets[core.first.socket_id],
-		                                             physical_cores_per_socket[core.first.socket_id]);
-		if (value < 0) {
-			power_w += static_cast<double>(core.second.core_frequency_khz) / 1000000.0;
-		} else {
-			power_w += value;
-		}
-	}
-	return power_w * static_cast<double>(epoch_ns) / 1000000000.0;
-}
-
 static vector<QuerySLAEnergyPlacedWorker>
 BuildMandatoryCandidate(const vector<MandatoryToken> &tokens, const vector<QueryHardwareWorkerTopology> &slots,
-	                    const QuerySLAEnergyPlannerInput &input, idx_t &promotion_count) {
+	                    const QuerySLAEnergyPlannerInput &input) {
 	vector<QuerySLAEnergyPlacedWorker> result;
 	if (tokens.size() > slots.size()) {
 		return result;
@@ -403,179 +420,159 @@ BuildMandatoryCandidate(const vector<MandatoryToken> &tokens, const vector<Query
 		QuerySLAEnergyPlacedWorker worker;
 		worker.worker_id = slots[i].worker_id;
 		worker.query_index = tokens[i].query_index;
-		worker.preferred_hardware = tokens[i].preferred;
+		worker.preferred_hardware = tokens[i].assignment.hardware;
+		worker.preferred_safe_throughput = tokens[i].assignment.safe_throughput;
+		worker.preferred_active_power_w = tokens[i].assignment.active_power_w;
+		worker.preferred_normalized_edp = tokens[i].assignment.normalized_edp;
+		worker.profile_version = tokens[i].assignment.profile_version;
+		worker.worker_ordinal = tokens[i].assignment.worker_ordinal;
 		worker.mandatory = true;
 		result.push_back(worker);
 	}
-	if (!ReconcileNormalHardwarePairs(result, input, promotion_count)) {
-		result.clear();
-	}
+	ResolveActualHardware(result, input.topology);
 	return result;
 }
 
-static bool EvaluateOptionalWorker(const QuerySLAEnergyModelInput &query,
-	                               const QuerySLAEnergyQueryAllocation &allocation,
-	                               const QueryRequestHardwareConfiguration &hardware, double &throughput,
-	                               double &risk_gain, QuerySLAEnergyPlannerDiagnostics &diagnostics) {
-	if (!query.reference_model.valid || allocation.workers.size() >= query.reference_model.demand_cap) {
-		return false;
+static bool OptionalTokenPreferred(const OptionalToken &candidate, const OptionalToken &current) {
+	if (!current.valid || candidate.gain != current.gain) {
+		return !current.valid || candidate.gain > current.gain;
 	}
-	auto candidate = FindHardwareCandidate(query, hardware, &diagnostics);
-	if (!candidate.valid || candidate.throughput <= 0) {
-		return false;
+	if (candidate.query_index != current.query_index) {
+		return candidate.query_index < current.query_index;
 	}
-	auto evaluation = QuerySLAEvaluateServiceRate(query.sla_input,
-	                                             allocation.aggregate_service_rate + candidate.throughput,
-	                                             allocation.workers.size() + 1);
-	if (!evaluation.valid) {
-		return false;
+	if (candidate.socket_id != current.socket_id) {
+		return candidate.socket_id < current.socket_id;
 	}
-	throughput = candidate.throughput;
-	risk_gain = allocation.predicted_optional_risk - evaluation.optional_risk;
-	return risk_gain > 0;
+	if (candidate.hardware.uncore_frequency_khz != current.hardware.uncore_frequency_khz) {
+		return candidate.hardware.uncore_frequency_khz < current.hardware.uncore_frequency_khz;
+	}
+	return candidate.hardware.core_frequency_khz < current.hardware.core_frequency_khz;
 }
 
-static void ApplyOptionalWorker(QuerySLAEnergyEpochPlan &plan, const QuerySLAEnergyPlannerInput &input,
-	                            idx_t query_index, idx_t worker_id,
-	                            const QueryRequestHardwareConfiguration &hardware, double throughput,
-	                            bool liveness = false) {
-	auto &allocation = plan.queries[query_index];
-	auto evaluation = QuerySLAEvaluateServiceRate(input.queries[query_index].sla_input,
-	                                             allocation.aggregate_service_rate + throughput,
-	                                             allocation.workers.size() + 1);
-	QuerySLAEnergyWorkerAssignment query_worker;
-	query_worker.hardware = hardware;
-	query_worker.optional = !liveness;
-	query_worker.liveness = liveness;
-	allocation.workers.push_back(query_worker);
-	allocation.aggregate_service_rate += throughput;
+static OptionalToken BuildOptionalToken(const QuerySLAEnergyModelInput &query,
+	                                    const QuerySLAEnergyQueryAllocation &allocation, idx_t query_index,
+	                                    QuerySLAEnergyOptionalStage stage, int socket_id,
+	                                    const QueryRequestHardwareConfiguration &reference_hardware,
+	                                    const vector<QueryRequestHardwareConfiguration> &allowed_hardware) {
+	OptionalToken result;
+	auto worker_ordinal = allocation.workers.size();
+	if (worker_ordinal >= query.reference_model.service_rates.size() ||
+	    worker_ordinal >= query.reference_model.optional_risk.size()) {
+		return result;
+	}
+		auto selected = SelectQuerySLAOptionalAddition(
+		    query, allocation.aggregate_service_rate, allocation.predicted_optional_risk, worker_ordinal,
+		    reference_hardware, allowed_hardware, stage);
+	if (!selected.valid) {
+		return result;
+	}
+	result.valid = true;
+	result.query_index = query_index;
+	result.worker_ordinal = selected.worker_ordinal;
+	result.socket_id = socket_id;
+	result.hardware = selected.hardware;
+	result.throughput = selected.safe_throughput;
+	result.active_power_w = selected.active_power_w;
+	result.normalized_edp = selected.normalized_edp;
+	result.fragility_before = selected.optional_fragility_before;
+	result.fragility_target = selected.optional_fragility_target;
+	result.fragility_after = selected.optional_fragility_after;
+	result.gain = selected.optional_gain;
+	result.profile_version = selected.profile_version;
+	result.stage = stage;
+	return result;
+}
+
+static void CommitOptionalToken(QuerySLAEnergyQueryAllocation &allocation,
+	                            const QuerySLAEnergyModelInput &query, const OptionalToken &token) {
+	QuerySLAEnergyWorkerAssignment worker;
+	worker.valid = true;
+	worker.hardware = token.hardware;
+	worker.safe_throughput = token.throughput;
+	worker.active_power_w = token.active_power_w;
+	worker.normalized_edp = token.normalized_edp;
+	worker.optional_fragility_before = token.fragility_before;
+	worker.optional_fragility_target = token.fragility_target;
+	worker.optional_fragility_after = token.fragility_after;
+	worker.optional_gain = token.gain;
+	worker.profile_version = token.profile_version;
+	worker.worker_ordinal = token.worker_ordinal;
+	worker.optional_stage = token.stage;
+	worker.optional = true;
+	allocation.workers.push_back(worker);
+	allocation.aggregate_service_rate += token.throughput;
+	allocation.aggregate_active_power_w += token.active_power_w;
+	auto evaluation = QuerySLAEvaluateServiceRate(query.sla_input, allocation.aggregate_service_rate,
+	                                             allocation.workers.size());
 	if (evaluation.valid) {
 		allocation.predicted_sla_cost = evaluation.mandatory_cost;
 		allocation.predicted_optional_risk = evaluation.optional_risk;
 	}
-	allocation.optional_workers += liveness ? 0 : 1;
-	allocation.liveness_workers += liveness ? 1 : 0;
-	QuerySLAEnergyPlacedWorker worker;
-	worker.worker_id = worker_id;
-	worker.query_index = query_index;
-	worker.preferred_hardware = hardware;
-	worker.normal_hardware = hardware;
-	worker.execution_hardware = hardware;
-	worker.optional = !liveness;
-	worker.liveness = liveness;
-	plan.workers.push_back(worker);
+	allocation.optional_workers++;
 }
 
-static vector<idx_t> QueryShortlist(const QuerySLAEnergyPlannerInput &input, const QuerySLAEnergyEpochPlan &plan,
-	                                const QueryRequestHardwareConfiguration &hardware,
-	                                const vector<double> *service_rates = nullptr,
-	                                const vector<double> *optional_risks = nullptr,
-	                                const vector<idx_t> *worker_counts = nullptr) {
-	vector<std::pair<double, idx_t>> ranked;
-	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
-		auto candidate = FindHardwareCandidate(input.queries[query_index], hardware);
-		if (!candidate.valid) {
-			continue;
-		}
-		auto service = service_rates ? (*service_rates)[query_index] : plan.queries[query_index].aggregate_service_rate;
-		auto risk = optional_risks ? (*optional_risks)[query_index] : plan.queries[query_index].predicted_optional_risk;
-		auto workers = worker_counts ? (*worker_counts)[query_index] : plan.queries[query_index].workers.size();
-		if (workers >= input.queries[query_index].reference_model.demand_cap) {
-			continue;
-		}
-		auto evaluation =
-		    QuerySLAEvaluateServiceRate(input.queries[query_index].sla_input, service + candidate.throughput, workers + 1);
-		if (evaluation.valid && risk > evaluation.optional_risk) {
-			ranked.emplace_back(risk - evaluation.optional_risk, query_index);
-		}
+static void PlaceOptionalToken(QuerySLAEnergyEpochPlan &plan, const OptionalToken &token, idx_t worker_id) {
+	QuerySLAEnergyPlacedWorker worker;
+	worker.worker_id = worker_id;
+	worker.query_index = token.query_index;
+	worker.preferred_hardware = token.hardware;
+	worker.normal_hardware = token.hardware;
+	worker.execution_hardware = token.hardware;
+	worker.preferred_safe_throughput = token.throughput;
+	worker.preferred_active_power_w = token.active_power_w;
+	worker.preferred_normalized_edp = token.normalized_edp;
+	worker.optional_fragility_before = token.fragility_before;
+	worker.optional_fragility_target = token.fragility_target;
+	worker.optional_fragility_after = token.fragility_after;
+	worker.optional_gain = token.gain;
+	worker.profile_version = token.profile_version;
+	worker.worker_ordinal = token.worker_ordinal;
+	worker.optional_stage = token.stage;
+	worker.optional = true;
+	plan.workers.push_back(worker);
+	switch (token.stage) {
+	case QuerySLAEnergyOptionalStage::O1:
+		plan.diagnostics.o1_workers++;
+		break;
+	case QuerySLAEnergyOptionalStage::O2:
+		plan.diagnostics.o2_workers++;
+		break;
+	case QuerySLAEnergyOptionalStage::O3:
+		plan.diagnostics.o3_workers++;
+		break;
+	case QuerySLAEnergyOptionalStage::REFERENCE_FALLBACK:
+		plan.diagnostics.reference_fallback_workers++;
+		break;
+	default:
+		break;
 	}
-	std::sort(ranked.begin(), ranked.end(), [](const std::pair<double, idx_t> &left,
-	                                         const std::pair<double, idx_t> &right) {
-		if (left.first != right.first) {
-			return left.first > right.first;
+}
+
+static vector<QueryRequestHardwareConfiguration>
+BuildHardwarePairs(const vector<uint32_t> &core_levels, const vector<uint32_t> &uncore_levels) {
+	vector<QueryRequestHardwareConfiguration> result;
+	result.reserve(core_levels.size() * uncore_levels.size());
+	for (auto uncore_khz : uncore_levels) {
+		for (auto core_khz : core_levels) {
+			result.push_back(PlannerHardware(core_khz, uncore_khz));
 		}
-		return left.second < right.second;
-	});
-	vector<idx_t> result;
-	for (idx_t i = 0; i < MinValue<idx_t>(ranked.size(), OPTIONAL_QUERY_SHORTLIST); i++) {
-		result.push_back(ranked[i].second);
 	}
 	return result;
 }
 
-static OptionalAction BestPairAction(const QuerySLAEnergyPlannerInput &input, const QuerySLAEnergyEpochPlan &plan,
-	                                 const CoreKey &core, uint32_t core_khz, uint32_t uncore_khz,
-	                                 double activation_energy_j, const vector<double> *service_rates = nullptr,
-	                                 const vector<double> *optional_risks = nullptr,
-	                                 const vector<idx_t> *worker_counts = nullptr) {
-	auto hardware = PlannerHardware(core_khz, uncore_khz);
-	auto shortlist = QueryShortlist(input, plan, hardware, service_rates, optional_risks, worker_counts);
-	OptionalAction best;
-	for (auto query_a : shortlist) {
-		for (auto query_b : shortlist) {
-			auto service_a = service_rates ? (*service_rates)[query_a] : plan.queries[query_a].aggregate_service_rate;
-			auto risk_a = optional_risks ? (*optional_risks)[query_a] : plan.queries[query_a].predicted_optional_risk;
-			auto workers_a = worker_counts ? (*worker_counts)[query_a] : plan.queries[query_a].workers.size();
-			auto candidate_a = FindHardwareCandidate(input.queries[query_a], hardware);
-			auto candidate_b = FindHardwareCandidate(input.queries[query_b], hardware);
-			if (!candidate_a.valid || !candidate_b.valid) {
-				continue;
-			}
-			double gain = 0;
-			if (query_a == query_b) {
-				if (workers_a + 2 > input.queries[query_a].reference_model.demand_cap) {
-					continue;
-				}
-				auto evaluation = QuerySLAEvaluateServiceRate(
-				    input.queries[query_a].sla_input, service_a + candidate_a.throughput + candidate_b.throughput,
-				    workers_a + 2);
-				if (!evaluation.valid) {
-					continue;
-				}
-				gain = risk_a - evaluation.optional_risk;
-			} else {
-				auto service_b = service_rates ? (*service_rates)[query_b] : plan.queries[query_b].aggregate_service_rate;
-				auto risk_b = optional_risks ? (*optional_risks)[query_b] : plan.queries[query_b].predicted_optional_risk;
-				auto workers_b = worker_counts ? (*worker_counts)[query_b] : plan.queries[query_b].workers.size();
-				if (workers_a + 1 > input.queries[query_a].reference_model.demand_cap ||
-				    workers_b + 1 > input.queries[query_b].reference_model.demand_cap) {
-					continue;
-				}
-				auto eval_a = QuerySLAEvaluateServiceRate(input.queries[query_a].sla_input,
-				                                            service_a + candidate_a.throughput, workers_a + 1);
-				auto eval_b = QuerySLAEvaluateServiceRate(input.queries[query_b].sla_input,
-				                                            service_b + candidate_b.throughput, workers_b + 1);
-				if (!eval_a.valid || !eval_b.valid) {
-					continue;
-				}
-				gain = risk_a - eval_a.optional_risk + risk_b - eval_b.optional_risk;
-			}
-			auto utility = gain - input.energy_lambda * activation_energy_j;
-			if (utility > 0 && (!best.valid || utility > best.utility)) {
-				best.valid = true;
-				best.utility = utility;
-				best.risk_gain = gain;
-				best.energy_j = activation_energy_j;
-				best.core = core;
-				best.socket_id = core.socket_id;
-				best.core_frequency_khz = core_khz;
-				best.uncore_frequency_khz = uncore_khz;
-				best.query_a = query_a;
-				best.query_b = query_b;
-				best.throughput_a = candidate_a.throughput;
-				best.throughput_b = candidate_b.throughput;
-			}
+static void SortOptionalTokensForPacking(vector<OptionalToken> &tokens) {
+	std::stable_sort(tokens.begin(), tokens.end(), [](const OptionalToken &left, const OptionalToken &right) {
+		if (left.hardware.uncore_frequency_khz != right.hardware.uncore_frequency_khz) {
+			return left.hardware.uncore_frequency_khz > right.hardware.uncore_frequency_khz;
 		}
-	}
-	return best;
-}
-
-static void ApplyPairAction(QuerySLAEnergyEpochPlan &plan, const QuerySLAEnergyPlannerInput &input,
-	                        const OptionalAction &action, const CoreSlots &core) {
-	auto hardware = PlannerHardware(action.core_frequency_khz, action.uncore_frequency_khz);
-	ApplyOptionalWorker(plan, input, action.query_a, core.workers[0].worker_id, hardware, action.throughput_a);
-	ApplyOptionalWorker(plan, input, action.query_b, core.workers[1].worker_id, hardware, action.throughput_b);
-	plan.diagnostics.optional_incremental_energy_j += action.energy_j;
+		if (left.hardware.core_frequency_khz != right.hardware.core_frequency_khz) {
+			return left.hardware.core_frequency_khz > right.hardware.core_frequency_khz;
+		}
+		if (left.query_index != right.query_index) {
+			return left.query_index < right.query_index;
+		}
+		return left.worker_ordinal < right.worker_ordinal;
+	});
 }
 
 static void ApplyExplorationOverlay(QuerySLAEnergyEpochPlan &plan, const QuerySLAEnergyPlannerInput &input,
@@ -624,7 +621,7 @@ static void ApplyExplorationOverlay(QuerySLAEnergyEpochPlan &plan, const QuerySL
 		}
 		for (auto worker_index : worker_indexes) {
 			const auto &worker = plan.workers[worker_index];
-			if (!worker.optional || worker.mandatory || worker.liveness) {
+			if (!worker.optional || worker.mandatory) {
 				return false;
 			}
 		}
@@ -754,7 +751,8 @@ static void ApplyExplorationOverlay(QuerySLAEnergyEpochPlan &plan, const QuerySL
 
 } // namespace
 
-QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput &input) {
+QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput &input_p) {
+	auto input = input_p;
 	QuerySLAEnergyEpochPlan result;
 	if (input.queries.empty()) {
 		result.valid = true;
@@ -764,6 +762,26 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 		result.error = "SLA-energy planner requires a nonempty pinned worker topology";
 		return result;
 	}
+	if (input.logical_allocation.mandatory.size() != input.queries.size() ||
+	    input.logical_allocation.optional.size() != input.queries.size()) {
+		result.error = "SLA-energy planner requires one fixed logical allocation per query";
+		return result;
+	}
+	idx_t logical_worker_count = 0;
+	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+		auto &query = input.queries[query_index];
+		if (!query.reference_model.valid) {
+			result.error = "SLA-energy planner requires a valid maximum-frequency reference model";
+			return result;
+		}
+		auto target = input.logical_allocation.mandatory[query_index] +
+		              input.logical_allocation.optional[query_index];
+		if (target > query.reference_model.demand_cap) {
+			result.error = "SLA-energy logical allocation exceeds query demand";
+			return result;
+		}
+		logical_worker_count += target;
+	}
 	for (const auto &query : input.queries) {
 		for (const auto &profile : query.hardware_profiles) {
 			if (profile.valid && !profile.mature && !PlannerSameHardware(profile.hardware, query.reference_hardware)) {
@@ -772,49 +790,45 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 		}
 	}
 	auto budget = MinValue<idx_t>(input.worker_budget, input.topology.size());
-	auto mandatory = AllocateQuerySLAEnergyWorkers(input.queries, budget, input.energy_lambda, false);
+	if (logical_worker_count > budget) {
+		result.error = "SLA-energy logical allocation exceeds the pinned worker budget";
+		return result;
+	}
+	auto mandatory = AllocateQuerySLAMandatoryWorkers(input.queries, input.logical_allocation.mandatory);
+	if (!mandatory.valid) {
+		result.error = mandatory.error.empty() ? "SLA-energy mandatory allocation failed" : mandatory.error;
+		return result;
+	}
 	result.queries = std::move(mandatory.queries);
 	vector<MandatoryToken> tokens;
 	for (idx_t query_index = 0; query_index < result.queries.size(); query_index++) {
 		for (const auto &worker : result.queries[query_index].workers) {
 			if (worker.mandatory) {
-				tokens.push_back(MandatoryToken(query_index, worker.hardware));
+				tokens.push_back(MandatoryToken(query_index, worker));
 			}
 		}
 	}
 	std::sort(tokens.begin(), tokens.end(), [](const MandatoryToken &left, const MandatoryToken &right) {
-		if (left.preferred.uncore_frequency_khz != right.preferred.uncore_frequency_khz) {
-			return left.preferred.uncore_frequency_khz > right.preferred.uncore_frequency_khz;
+		if (left.assignment.hardware.uncore_frequency_khz != right.assignment.hardware.uncore_frequency_khz) {
+			return left.assignment.hardware.uncore_frequency_khz > right.assignment.hardware.uncore_frequency_khz;
 		}
-		if (left.preferred.core_frequency_khz != right.preferred.core_frequency_khz) {
-			return left.preferred.core_frequency_khz > right.preferred.core_frequency_khz;
+		if (left.assignment.hardware.core_frequency_khz != right.assignment.hardware.core_frequency_khz) {
+			return left.assignment.hardware.core_frequency_khz > right.assignment.hardware.core_frequency_khz;
 		}
 		return left.query_index < right.query_index;
 	});
 	auto cores = BuildCoreSlots(input.topology);
-	auto dense_slots = FlattenSlots(cores, false);
-	auto alternate_slots = FlattenSlots(cores, true);
-	idx_t dense_promotions = 0;
-	idx_t alternate_promotions = 0;
-	auto dense = BuildMandatoryCandidate(tokens, dense_slots, input, dense_promotions);
-	auto alternate = BuildMandatoryCandidate(tokens, alternate_slots, input, alternate_promotions);
-	if (!tokens.empty() && (dense.empty() || alternate.empty())) {
-		result.error = "SLA-energy planner could not reconcile mandatory hardware domains";
+	auto dense_slots = FlattenSlots(cores);
+	result.workers = BuildMandatoryCandidate(tokens, dense_slots, input);
+	if (!tokens.empty() && result.workers.empty()) {
+		result.error = "SLA-energy planner could not place mandatory workers";
 		return result;
 	}
-	auto dense_energy = PlacementEnergy(dense, input.topology, input.power_model, input.epoch_ns);
-	auto alternate_energy = PlacementEnergy(alternate, input.topology, input.power_model, input.epoch_ns);
-	if (alternate_energy < dense_energy) {
-		result.workers = std::move(alternate);
-		result.diagnostics.domain_pair_promotions += alternate_promotions;
-	} else {
-		result.workers = std::move(dense);
-		result.diagnostics.domain_pair_promotions += dense_promotions;
-	}
-	result.diagnostics.mandatory_footprint_energy_j = MinValue<double>(dense_energy, alternate_energy);
+	result.diagnostics.domain_frequency_inflations = CountDomainFrequencyInflations(result.workers);
 	result.diagnostics.mandatory_workers = result.workers.size();
-	if (!RebuildQueryAllocationsFromActualHardware(result, input)) {
-		result.error = "SLA-energy planner could not model reconciled mandatory hardware";
+	string validation_error;
+	if (!RebuildQueryAllocationsFromPreferences(result, input, validation_error)) {
+		result.error = "SLA-energy planner could not validate mandatory preferences: " + validation_error;
 		return result;
 	}
 
@@ -832,13 +846,10 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 		active_sockets.insert(topology.socket_id);
 	}
 
-	// O1: unused SMT slots on already active physical cores inherit the existing core/socket pair.
+	// O1: unused SMT slots on active physical cores use the installed core/socket pair.
 	while (used_worker_ids.size() < budget) {
-		double best_gain = 0;
-		idx_t best_query = DConstants::INVALID_INDEX;
+		OptionalToken best;
 		idx_t best_worker = DConstants::INVALID_INDEX;
-		double best_throughput = 0;
-		QueryRequestHardwareConfiguration best_hardware;
 		for (const auto &core : cores) {
 			if (active_cores.find(core.key) == active_cores.end()) {
 				continue;
@@ -857,235 +868,291 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 						break;
 					}
 				}
+				if (!hardware.IsValid()) {
+					continue;
+				}
+				vector<QueryRequestHardwareConfiguration> allowed {hardware};
 				for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
-					double throughput = 0;
-					double gain = 0;
-					if (EvaluateOptionalWorker(input.queries[query_index], result.queries[query_index], hardware,
-					                           throughput, gain, result.diagnostics) &&
-					    gain > best_gain) {
-						best_gain = gain;
-						best_query = query_index;
+					if (result.queries[query_index].optional_workers >=
+					    input.logical_allocation.optional[query_index]) {
+						continue;
+					}
+					auto token = BuildOptionalToken(
+					    input.queries[query_index], result.queries[query_index], query_index,
+					    QuerySLAEnergyOptionalStage::O1, core.key.socket_id, hardware, allowed);
+					if (token.valid &&
+					    (OptionalTokenPreferred(token, best) ||
+					     (best.valid && token.gain == best.gain && token.query_index == best.query_index &&
+					      slot.worker_id < best_worker))) {
+						best = token;
 						best_worker = slot.worker_id;
-						best_throughput = throughput;
-						best_hardware = hardware;
 					}
 				}
 			}
 		}
-		if (best_query == DConstants::INVALID_INDEX) {
+		if (!best.valid) {
 			break;
 		}
-		ApplyOptionalWorker(result, input, best_query, best_worker, best_hardware, best_throughput);
+		CommitOptionalToken(result.queries[best.query_index], input.queries[best.query_index], best);
+		PlaceOptionalToken(result, best, best_worker);
 		used_worker_ids.insert(best_worker);
-		result.diagnostics.o1_workers++;
 	}
 
-	// O2: activate complete SMT cores on sockets already used by mandatory/O1 work.
-	bool made_progress = true;
-	while (made_progress && used_worker_ids.size() + 2 <= budget && input.power_model.valid) {
-		made_progress = false;
-		OptionalAction best;
-		const CoreSlots *best_core = nullptr;
-		std::map<int, idx_t> core_count_by_socket;
-		for (const auto &core : cores) {
-			core_count_by_socket[core.key.socket_id]++;
+	// O2: select fixed optional tokens for empty cores on active sockets, then pair similar core preferences.
+	std::map<int, vector<const CoreSlots *>> o2_cores;
+	std::map<int, uint32_t> active_socket_uncore;
+	for (const auto &worker : result.workers) {
+		auto topology = worker_topology[worker.worker_id];
+		active_socket_uncore[topology.socket_id] =
+		    MaxValue<uint32_t>(active_socket_uncore[topology.socket_id], worker.normal_hardware.uncore_frequency_khz);
+	}
+	for (const auto &core : cores) {
+		if (active_sockets.find(core.key.socket_id) != active_sockets.end() &&
+		    active_cores.find(core.key) == active_cores.end()) {
+			o2_cores[core.key.socket_id].push_back(&core);
 		}
-		for (const auto &core : cores) {
-			if (active_sockets.find(core.key.socket_id) == active_sockets.end() ||
-			    active_cores.find(core.key) != active_cores.end() || core.workers.size() < 2) {
+	}
+	std::map<int, vector<OptionalToken>> o2_tokens;
+	idx_t selected_o2_workers = 0;
+	while (used_worker_ids.size() + selected_o2_workers < budget) {
+		OptionalToken best;
+		for (const auto &socket_entry : o2_cores) {
+			idx_t capacity = 0;
+			for (const auto core : socket_entry.second) {
+				capacity += core->workers.size();
+			}
+			if (o2_tokens[socket_entry.first].size() >= capacity) {
 				continue;
 			}
-			uint32_t socket_uncore = 0;
-			for (const auto &worker : result.workers) {
-				auto topology = worker_topology[worker.worker_id];
-				if (topology.socket_id == core.key.socket_id) {
-					socket_uncore = MaxValue<uint32_t>(socket_uncore, worker.normal_hardware.uncore_frequency_khz);
-				}
+			auto uncore_khz = active_socket_uncore[socket_entry.first];
+			if (uncore_khz == 0 || input.core_frequency_levels_khz.empty()) {
+				continue;
 			}
+			vector<QueryRequestHardwareConfiguration> allowed;
 			for (auto core_khz : input.core_frequency_levels_khz) {
-				auto power_w = input.power_model.CoreIncrementalPowerW(
-				    core.key.socket_id, core_khz, socket_uncore, core_count_by_socket[core.key.socket_id]);
-				if (power_w < 0) {
+				allowed.push_back(PlannerHardware(core_khz, uncore_khz));
+			}
+			auto reference = PlannerHardware(input.core_frequency_levels_khz.back(), uncore_khz);
+			for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+				if (result.queries[query_index].optional_workers >=
+				    input.logical_allocation.optional[query_index]) {
 					continue;
 				}
-				auto energy_j = power_w * static_cast<double>(input.epoch_ns) / 1000000000.0;
-				auto action = BestPairAction(input, result, core.key, core_khz, socket_uncore, energy_j);
-				if (action.valid && (!best.valid || action.utility > best.utility)) {
-					best = action;
-					best_core = &core;
+				auto token = BuildOptionalToken(
+				    input.queries[query_index], result.queries[query_index], query_index,
+				    QuerySLAEnergyOptionalStage::O2, socket_entry.first, reference, allowed);
+				if (token.valid && OptionalTokenPreferred(token, best)) {
+					best = token;
 				}
 			}
 		}
-		if (best.valid && best_core) {
-			ApplyPairAction(result, input, best, *best_core);
-			used_worker_ids.insert(best_core->workers[0].worker_id);
-			used_worker_ids.insert(best_core->workers[1].worker_id);
-			active_cores.insert(best_core->key);
-			result.diagnostics.o2_workers += 2;
-			made_progress = true;
+		if (!best.valid) {
+			break;
+		}
+		CommitOptionalToken(result.queries[best.query_index], input.queries[best.query_index], best);
+		o2_tokens[best.socket_id].push_back(best);
+		selected_o2_workers++;
+	}
+	for (auto &socket_entry : o2_tokens) {
+		auto &tokens_for_socket = socket_entry.second;
+		SortOptionalTokensForPacking(tokens_for_socket);
+		vector<QueryHardwareWorkerTopology> slots;
+		for (const auto core : o2_cores[socket_entry.first]) {
+			slots.insert(slots.end(), core->workers.begin(), core->workers.end());
+		}
+		for (idx_t i = 0; i < tokens_for_socket.size(); i++) {
+			PlaceOptionalToken(result, tokens_for_socket[i], slots[i].worker_id);
+			used_worker_ids.insert(slots[i].worker_id);
+			active_cores.insert(CoreKey(slots[i].socket_id, slots[i].physical_core_id));
 		}
 	}
+	ResolveActualHardware(result.workers, input.topology);
 
-	// O3: bounded beam search over complete SMT cores on one currently inactive socket.
+	// O3: activate one inactive socket at a time and densely pack independently selected optional tokens.
 	std::set<int> topology_sockets;
 	for (const auto &core : cores) {
 		topology_sockets.insert(core.key.socket_id);
 	}
-	while (used_worker_ids.size() + 2 <= budget && input.power_model.valid) {
-		double best_bundle_utility = 0;
-		int best_socket = -1;
-		uint32_t best_uncore = 0;
-		vector<OptionalAction> best_actions;
-		for (const auto &socket_entry : topology_sockets) {
-			if (active_sockets.find(socket_entry) != active_sockets.end()) {
+	auto all_hardware = BuildHardwarePairs(input.core_frequency_levels_khz, input.uncore_frequency_levels_khz);
+	while (used_worker_ids.size() < budget && !all_hardware.empty()) {
+		OptionalToken first;
+		int selected_socket = -1;
+		for (auto socket_id : topology_sockets) {
+			if (active_sockets.find(socket_id) != active_sockets.end()) {
 				continue;
 			}
-			vector<const CoreSlots *> socket_cores;
-			for (const auto &core : cores) {
-				if (core.key.socket_id == socket_entry && core.workers.size() >= 2) {
-					socket_cores.push_back(&core);
-				}
-			}
-			auto max_depth = MinValue<idx_t>(
-			    O3_MAX_DEPTH, MinValue<idx_t>(socket_cores.size(), (budget - used_worker_ids.size()) / 2));
-			for (auto uncore_khz : input.uncore_frequency_levels_khz) {
-				auto socket_power_w = input.power_model.SocketIncrementalPowerW(socket_entry, uncore_khz);
-				if (socket_power_w < 0) {
+			for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+				if (result.queries[query_index].optional_workers >=
+				    input.logical_allocation.optional[query_index]) {
 					continue;
 				}
-				vector<BeamState> beam(1);
-				beam[0].service_rates.resize(result.queries.size());
-				beam[0].optional_risks.resize(result.queries.size());
-				beam[0].worker_counts.resize(result.queries.size());
-				for (idx_t query_index = 0; query_index < result.queries.size(); query_index++) {
-					beam[0].service_rates[query_index] = result.queries[query_index].aggregate_service_rate;
-					beam[0].optional_risks[query_index] = result.queries[query_index].predicted_optional_risk;
-					beam[0].worker_counts[query_index] = result.queries[query_index].workers.size();
-				}
-				for (idx_t depth = 0; depth < max_depth && !beam.empty(); depth++) {
-					vector<BeamState> children;
-					for (const auto &state : beam) {
-						vector<OptionalAction> actions;
-						for (auto core_khz : input.core_frequency_levels_khz) {
-							auto core_power_w = input.power_model.CoreIncrementalPowerW(
-							    socket_entry, core_khz, uncore_khz, socket_cores.size());
-							if (core_power_w < 0) {
-								continue;
-							}
-							auto energy_j = core_power_w * static_cast<double>(input.epoch_ns) / 1000000000.0;
-							auto action = BestPairAction(input, result, socket_cores[depth]->key, core_khz,
-							                             uncore_khz, energy_j, &state.service_rates,
-							                             &state.optional_risks, &state.worker_counts);
-							if (action.valid) {
-								actions.push_back(action);
-							}
-						}
-						std::sort(actions.begin(), actions.end(), [](const OptionalAction &left,
-						                                                  const OptionalAction &right) {
-							return left.utility > right.utility;
-						});
-						for (idx_t action_index = 0;
-						     action_index < MinValue<idx_t>(actions.size(), OPTIONAL_QUERY_SHORTLIST); action_index++) {
-							auto child = state;
-							const auto &action = actions[action_index];
-							auto hardware =
-							    PlannerHardware(action.core_frequency_khz, action.uncore_frequency_khz);
-							auto candidate_a = FindHardwareCandidate(input.queries[action.query_a], hardware);
-							auto candidate_b = FindHardwareCandidate(input.queries[action.query_b], hardware);
-							if (action.query_a == action.query_b) {
-								auto q = action.query_a;
-								child.service_rates[q] += candidate_a.throughput + candidate_b.throughput;
-								child.worker_counts[q] += 2;
-								auto evaluation = QuerySLAEvaluateServiceRate(input.queries[q].sla_input,
-								                                                  child.service_rates[q], child.worker_counts[q]);
-								child.optional_risks[q] = evaluation.optional_risk;
-							} else {
-								for (auto q : {action.query_a, action.query_b}) {
-									auto candidate = FindHardwareCandidate(input.queries[q], hardware);
-									child.service_rates[q] += candidate.throughput;
-									child.worker_counts[q]++;
-									auto evaluation = QuerySLAEvaluateServiceRate(input.queries[q].sla_input,
-									                                                  child.service_rates[q], child.worker_counts[q]);
-									child.optional_risks[q] = evaluation.optional_risk;
-								}
-							}
-							child.actions.push_back(action);
-							child.value += action.utility;
-							children.push_back(std::move(child));
-						}
-					}
-					std::sort(children.begin(), children.end(), [](const BeamState &left, const BeamState &right) {
-						return left.value > right.value;
-					});
-					if (children.size() > O3_BEAM_WIDTH) {
-						children.resize(O3_BEAM_WIDTH);
-					}
-					beam = std::move(children);
-					auto socket_energy_j =
-					    socket_power_w * static_cast<double>(input.epoch_ns) / 1000000000.0;
-					for (const auto &state : beam) {
-						auto utility = state.value - input.energy_lambda * socket_energy_j;
-						if (utility > best_bundle_utility) {
-							best_bundle_utility = utility;
-							best_socket = socket_entry;
-							best_uncore = uncore_khz;
-							best_actions = state.actions;
-						}
-					}
+				auto token = BuildOptionalToken(
+				    input.queries[query_index], result.queries[query_index], query_index,
+				    QuerySLAEnergyOptionalStage::O3, socket_id, input.queries[query_index].reference_hardware,
+				    all_hardware);
+				if (token.valid && OptionalTokenPreferred(token, first)) {
+					first = token;
+					selected_socket = socket_id;
 				}
 			}
 		}
-		if (best_socket < 0 || best_actions.empty() || best_bundle_utility <= 0) {
+		if (!first.valid || selected_socket < 0) {
 			break;
 		}
-		idx_t action_index = 0;
+		vector<QueryHardwareWorkerTopology> socket_slots;
 		for (const auto &core : cores) {
-			if (core.key.socket_id != best_socket || action_index >= best_actions.size()) {
-				continue;
+			if (core.key.socket_id == selected_socket) {
+				socket_slots.insert(socket_slots.end(), core.workers.begin(), core.workers.end());
 			}
-			auto action = best_actions[action_index++];
-			action.uncore_frequency_khz = best_uncore;
-			ApplyPairAction(result, input, action, core);
-			used_worker_ids.insert(core.workers[0].worker_id);
-			used_worker_ids.insert(core.workers[1].worker_id);
-			active_cores.insert(core.key);
-			result.diagnostics.o3_workers += 2;
 		}
-		active_sockets.insert(best_socket);
+		auto capacity = MinValue<idx_t>(socket_slots.size(), budget - used_worker_ids.size());
+		vector<OptionalToken> socket_tokens;
+		while (socket_tokens.size() < capacity) {
+			OptionalToken best;
+			for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+				if (result.queries[query_index].optional_workers >=
+				    input.logical_allocation.optional[query_index]) {
+					continue;
+				}
+				auto token = BuildOptionalToken(
+				    input.queries[query_index], result.queries[query_index], query_index,
+				    QuerySLAEnergyOptionalStage::O3, selected_socket,
+				    input.queries[query_index].reference_hardware, all_hardware);
+				if (token.valid && OptionalTokenPreferred(token, best)) {
+					best = token;
+				}
+			}
+			if (!best.valid) {
+				break;
+			}
+			CommitOptionalToken(result.queries[best.query_index], input.queries[best.query_index], best);
+			socket_tokens.push_back(best);
+		}
+		if (socket_tokens.empty()) {
+			break;
+		}
+		SortOptionalTokensForPacking(socket_tokens);
+		for (idx_t i = 0; i < socket_tokens.size(); i++) {
+			PlaceOptionalToken(result, socket_tokens[i], socket_slots[i].worker_id);
+			used_worker_ids.insert(socket_slots[i].worker_id);
+			active_cores.insert(CoreKey(socket_slots[i].socket_id, socket_slots[i].physical_core_id));
+		}
+		active_sockets.insert(selected_socket);
 	}
 
-	// Narrow liveness fallback: only active queries with no allocation receive one reference worker.
-	for (idx_t query_index = 0; query_index < result.queries.size() && used_worker_ids.size() < budget; query_index++) {
-		if (!result.queries[query_index].workers.empty() || !input.queries[query_index].reference_model.valid ||
-		    input.queries[query_index].reference_model.demand_cap == 0) {
+	// A fixed SLA token may not have an EDP-qualified O1-O3 placement. It must still run.
+	for (const auto &logical_token : input.logical_allocation.tokens) {
+		if (!logical_token.optional || logical_token.query_index >= input.queries.size() ||
+		    result.queries[logical_token.query_index].optional_workers >=
+		        input.logical_allocation.optional[logical_token.query_index]) {
 			continue;
 		}
-		auto slot = std::find_if(input.topology.begin(), input.topology.end(), [&](const QueryHardwareWorkerTopology &w) {
-			return used_worker_ids.find(w.worker_id) == used_worker_ids.end();
+		auto slot = std::find_if(dense_slots.begin(), dense_slots.end(), [&](const QueryHardwareWorkerTopology &worker) {
+			return used_worker_ids.find(worker.worker_id) == used_worker_ids.end();
 		});
-		if (slot == input.topology.end()) {
-			break;
+		if (slot == dense_slots.end()) {
+			result.error = "SLA-energy planner could not place a fixed optional token";
+			return result;
 		}
-		ApplyOptionalWorker(result, input, query_index, slot->worker_id, input.queries[query_index].reference_hardware,
-		                    input.queries[query_index].reference_model.throughput, true);
+		auto reference_hardware = input.queries[logical_token.query_index].reference_hardware;
+		auto token = BuildOptionalToken(
+		    input.queries[logical_token.query_index], result.queries[logical_token.query_index],
+		    logical_token.query_index, QuerySLAEnergyOptionalStage::REFERENCE_FALLBACK, slot->socket_id,
+		    reference_hardware, {reference_hardware});
+		if (!token.valid) {
+			result.error = "SLA-energy planner could not model a fixed optional reference fallback";
+			return result;
+		}
+		CommitOptionalToken(result.queries[token.query_index], input.queries[token.query_index], token);
+		PlaceOptionalToken(result, token, slot->worker_id);
 		used_worker_ids.insert(slot->worker_id);
-		result.diagnostics.liveness_workers++;
+	}
+	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+		if (result.queries[query_index].mandatory_workers != input.logical_allocation.mandatory[query_index] ||
+		    result.queries[query_index].optional_workers != input.logical_allocation.optional[query_index]) {
+			result.error = "SLA-energy physical placement changed the fixed logical allocation";
+			return result;
+		}
 	}
 
-	idx_t final_promotions = 0;
-	if (!ReconcileNormalHardwarePairs(result.workers, input, final_promotions)) {
-		result.error = "SLA-energy planner could not reconcile final hardware domains";
+	ResolveActualHardware(result.workers, input.topology);
+	result.diagnostics.domain_frequency_inflations = CountDomainFrequencyInflations(result.workers);
+	validation_error.clear();
+	if (!RebuildQueryAllocationsFromPreferences(result, input, validation_error)) {
+		result.error = "SLA-energy planner could not validate final hardware preferences: " + validation_error;
 		return result;
 	}
-	result.diagnostics.domain_pair_promotions += final_promotions;
-	if (!RebuildQueryAllocationsFromActualHardware(result, input)) {
-		result.error = "SLA-energy planner could not model final reconciled hardware";
-		return result;
+	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+		auto &allocation = result.queries[query_index];
+		auto simulation = allocation;
+		auto service_rate = simulation.aggregate_service_rate;
+		auto worker_count = simulation.workers.size();
+		while (worker_count < input.queries[query_index].reference_model.demand_cap) {
+			auto assignment = SelectQuerySLAMandatoryAddition(
+			    input.queries[query_index], input.queries[query_index].reference_model, service_rate, worker_count);
+			if (!assignment.valid || assignment.mandatory_gain <= 0) {
+				break;
+			}
+			allocation.dynamic_mandatory_workers.push_back(assignment);
+			service_rate += assignment.safe_throughput;
+			simulation.workers.push_back(assignment);
+			simulation.aggregate_service_rate = service_rate;
+			auto evaluation = QuerySLAEvaluateServiceRate(input.queries[query_index].sla_input, service_rate,
+			                                             simulation.workers.size());
+			if (evaluation.valid) {
+				simulation.predicted_sla_cost = evaluation.mandatory_cost;
+				simulation.predicted_optional_risk = evaluation.optional_risk;
+			}
+			worker_count++;
+		}
+		while (simulation.workers.size() < input.queries[query_index].reference_model.demand_cap) {
+			auto token = BuildOptionalToken(
+			    input.queries[query_index], simulation, query_index, QuerySLAEnergyOptionalStage::DYNAMIC, -1,
+			    input.queries[query_index].reference_hardware, all_hardware);
+			if (!token.valid || token.gain <= 0) {
+				break;
+			}
+			QuerySLAEnergyWorkerAssignment assignment;
+			assignment.valid = true;
+			assignment.hardware = token.hardware;
+			assignment.safe_throughput = token.throughput;
+			assignment.active_power_w = token.active_power_w;
+			assignment.normalized_edp = token.normalized_edp;
+			assignment.optional_fragility_before = token.fragility_before;
+			assignment.optional_fragility_target = token.fragility_target;
+			assignment.optional_fragility_after = token.fragility_after;
+			assignment.optional_gain = token.gain;
+			assignment.profile_version = token.profile_version;
+			assignment.worker_ordinal = token.worker_ordinal;
+			assignment.optional_stage = token.stage;
+			assignment.optional = true;
+			allocation.dynamic_optional_workers.push_back(assignment);
+			CommitOptionalToken(simulation, input.queries[query_index], token);
+		}
 	}
 	ApplyExplorationOverlay(result, input, input.topology);
 	result.diagnostics.parked_workers = budget - used_worker_ids.size();
 	result.valid = true;
 	return result;
+}
+
+const char *QuerySLAEnergyOptionalStageToString(QuerySLAEnergyOptionalStage stage) {
+	switch (stage) {
+	case QuerySLAEnergyOptionalStage::NONE:
+		return "none";
+	case QuerySLAEnergyOptionalStage::O1:
+		return "o1";
+	case QuerySLAEnergyOptionalStage::O2:
+		return "o2";
+	case QuerySLAEnergyOptionalStage::O3:
+		return "o3";
+	case QuerySLAEnergyOptionalStage::REFERENCE_FALLBACK:
+		return "reference_fallback";
+	case QuerySLAEnergyOptionalStage::DYNAMIC:
+		return "dynamic";
+	default:
+		return "unknown";
+	}
 }
 
 } // namespace duckdb

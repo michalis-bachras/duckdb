@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <deque>
 #include <mutex>
@@ -30,7 +31,7 @@ static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
 static constexpr double HARDWARE_POWER_EWMA_ALPHA = 0.7;
 static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
 static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
-static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 4;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 5;
 static const char *PROFILE_SNAPSHOT_MAGIC = "DUCKDB_QUERY_REQUEST_PROFILE";
 
 class ProfileSnapshotWriter {
@@ -596,6 +597,7 @@ struct PipelineHardwareProfileKeyHash {
 
 struct PipelineHardwareProfileAggregate {
 	PipelineHardwareProfileKey key;
+	uint64_t version = 0;
 	BoundedSamples throughput;
 	BoundedSamples active_power_w;
 	BoundedSamples charged_power_w;
@@ -679,6 +681,7 @@ using namespace query_request_profile_store_internal;
 
 struct QueryRequestProfileStoreState {
 	std::mutex lock;
+	std::atomic<uint64_t> pipeline_hardware_profile_generation {1};
 	std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> query_profiles;
 	std::unordered_map<PipelineProfileKey, PipelineProfileAggregate, PipelineProfileKeyHash> pipeline_profiles;
 	std::unordered_map<uint64_t, SuffixHistogramAggregate> scale_downstream_suffix_profiles;
@@ -921,6 +924,7 @@ static void WritePipelineHardwareProfile(ProfileSnapshotWriter &writer,
 	writer.Write<uint64_t>(profile.key.pipeline.pipeline_signature_hash);
 	writer.Write<uint32_t>(profile.key.hardware.core_frequency_khz);
 	writer.Write<uint32_t>(profile.key.hardware.uncore_frequency_khz);
+	writer.Write<uint64_t>(profile.version);
 	WriteBoundedSamples(writer, profile.throughput);
 	WriteBoundedSamples(writer, profile.active_power_w);
 	WriteBoundedSamples(writer, profile.charged_power_w);
@@ -941,6 +945,7 @@ static PipelineHardwareProfileAggregate ReadPipelineHardwareProfile(ProfileSnaps
 	if (!result.key.hardware.IsValid()) {
 		throw SerializationException("Invalid hardware pair in query profile snapshot");
 	}
+	result.version = reader.Read<uint64_t>();
 	result.throughput = ReadBoundedSamples(reader);
 	result.active_power_w = ReadBoundedSamples(reader);
 	result.charged_power_w = ReadBoundedSamples(reader);
@@ -1212,6 +1217,7 @@ static void InstallSnapshotState(QueryRequestProfileStoreState &state, ProfileSn
 	state.scale_internal_event_profiles = std::move(snapshot.scale_internal_event_profiles);
 	state.global_internal_event_profiles = std::move(snapshot.global_internal_event_profiles);
 	state.pipeline_hardware_profiles = std::move(snapshot.pipeline_hardware_profiles);
+	state.pipeline_hardware_profile_generation.fetch_add(1);
 	state.global_finish_tail_profile = std::move(snapshot.global_finish_tail_profile);
 	state.query_samples.clear();
 	state.pipeline_instances.clear();
@@ -1998,6 +2004,7 @@ static PipelineHardwareProfileKey BuildPipelineHardwareProfileKey(
 static QueryRequestPipelineHardwareProfileEstimate BuildPipelineHardwareProfileEstimate(
     const PipelineHardwareProfileAggregate &profile) {
 	QueryRequestPipelineHardwareProfileEstimate result;
+	result.profile_version = profile.version;
 	result.template_id = profile.key.pipeline.template_id;
 	result.scale_factor = profile.key.pipeline.scale_factor;
 	result.pipeline_id = profile.key.pipeline.pipeline_id;
@@ -2021,6 +2028,10 @@ static QueryRequestPipelineHardwareProfileEstimate BuildPipelineHardwareProfileE
 	}
 	if (result.ewma_active_power_w > 0) {
 		result.safe_throughput_per_active_watt = result.safe_work_units_per_s / result.ewma_active_power_w;
+		if (result.safe_work_units_per_s > 0) {
+			result.normalized_edp =
+			    result.ewma_active_power_w / (result.safe_work_units_per_s * result.safe_work_units_per_s);
+		}
 	}
 	result.valid = result.throughput_sample_count > 0 || result.power_sample_count > 0;
 	result.mature = result.throughput_sample_count >= PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES &&
@@ -2046,6 +2057,8 @@ void QueryRequestProfileStore::RecordPipelineHardwareThroughput(
 	}
 	auto throughput = work_units * 1000000000.0 / static_cast<double>(worker_duration_ns);
 	profile.AddThroughput(throughput);
+	profile.version++;
+	state->pipeline_hardware_profile_generation.fetch_add(1);
 }
 
 void QueryRequestProfileStore::RecordPipelineHardwareEnergy(
@@ -2069,6 +2082,8 @@ void QueryRequestProfileStore::RecordPipelineHardwareEnergy(
 	auto active_power_w = attributed_active_energy_j * 1000000000.0 / static_cast<double>(duration_ns);
 	auto charged_power_w = charged_energy_j * 1000000000.0 / static_cast<double>(duration_ns);
 	profile.AddPower(active_power_w, charged_power_w);
+	profile.version++;
+	state->pipeline_hardware_profile_generation.fetch_add(1);
 }
 
 vector<QueryRequestPipelineHardwareProfileEstimate> QueryRequestProfileStore::GetPipelineHardwareProfiles(
@@ -2095,6 +2110,10 @@ vector<QueryRequestPipelineHardwareProfileEstimate> QueryRequestProfileStore::Ge
 		return left.hardware.uncore_frequency_khz < right.hardware.uncore_frequency_khz;
 	});
 	return result;
+}
+
+uint64_t QueryRequestProfileStore::GetPipelineHardwareProfileGeneration() const {
+	return state->pipeline_hardware_profile_generation.load();
 }
 
 vector<QueryRequestPipelineHardwareProfileEstimate>
@@ -2635,6 +2654,7 @@ void QueryRequestProfileStore::Clear() {
 	state->scale_internal_event_profiles.clear();
 	state->global_internal_event_profiles.clear();
 	state->pipeline_hardware_profiles.clear();
+	state->pipeline_hardware_profile_generation.fetch_add(1);
 	state->global_finish_tail_profile = ContinuationAggregate();
 	state->query_samples.clear();
 	state->pipeline_instances.clear();

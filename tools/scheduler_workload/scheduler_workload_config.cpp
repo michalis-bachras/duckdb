@@ -169,9 +169,6 @@ static void ValidateConfig(WorkloadConfig &config) {
 		if (config.energy_power_model_path.empty()) {
 			throw InvalidInputException("SLA-energy runs require --energy-power-model");
 		}
-		if (!std::isfinite(config.sla_energy_lambda) || config.sla_energy_lambda < 0) {
-			throw InvalidInputException("--energy-lambda must be finite and non-negative");
-		}
 		if (config.energy_attribution_enabled && !config.sla_energy_hardware_control) {
 			throw InvalidInputException(
 			    "SLA-energy attribution requires real hardware control; disable attribution for dry-run targets");
@@ -241,9 +238,8 @@ Run options:
 	  --scheduler-trace-queries Q2,Q9,...
 	                              Enable debug epoch tracing only for these templates.
 	  --sla-residual-policy work_conserving|park
-	                              SLA-only zero-gain residual-worker policy (default: work_conserving).
+	                              SLA-only zero-gain residual-worker policy (default: park).
 	  --energy-power-model PATH  Calibrated socket/core power table for SLA-energy and attribution.
-	  --energy-lambda X          Energy weight for optional-worker utility (default: 1).
 	  --energy-exploration on|off
 	                              Enable epoch-scoped warmup exploration (default: off).
 	  --energy-exploration-seed N
@@ -383,8 +379,6 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			}
 		} else if (name == "energy-power-model") {
 			config.energy_power_model_path = value;
-		} else if (name == "energy-lambda") {
-			config.sla_energy_lambda = ParseDouble(value, name);
 		} else if (name == "energy-exploration") {
 			config.sla_energy_exploration = ParseBool(value, name);
 		} else if (name == "energy-exploration-seed") {

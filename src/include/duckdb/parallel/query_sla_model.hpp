@@ -53,10 +53,19 @@ struct QuerySLAServiceEvaluation {
 };
 
 //! The three allocation classes remain separate so derived policies can park residual capacity.
+struct QuerySLAAllocationToken {
+	idx_t query_index = DConstants::INVALID_INDEX;
+	idx_t worker_ordinal = DConstants::INVALID_INDEX;
+	double gain = 0;
+	bool mandatory = false;
+	bool optional = false;
+};
+
 struct QuerySLAAllocation {
 	vector<idx_t> mandatory;
 	vector<idx_t> optional;
 	vector<idx_t> residual;
+	vector<QuerySLAAllocationToken> tokens;
 	idx_t unassigned_workers = 0;
 };
 

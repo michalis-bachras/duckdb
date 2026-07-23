@@ -39,6 +39,7 @@ struct QueryRequestHardwareConfiguration {
 struct QueryRequestPipelineHardwareProfileEstimate {
 	bool valid = false;
 	bool mature = false;
+	uint64_t profile_version = 0;
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
 	idx_t pipeline_id = 0;
@@ -56,6 +57,7 @@ struct QueryRequestPipelineHardwareProfileEstimate {
 	double ewma_charged_power_w = 0;
 	double safe_throughput_per_active_watt = 0;
 	double mean_throughput_per_active_watt = 0;
+	double normalized_edp = 0;
 	idx_t rejected_unstable_samples = 0;
 };
 
@@ -319,6 +321,7 @@ public:
 	vector<QueryRequestPipelineHardwareProfileEstimate>
 	GetPipelineHardwareProfiles(uint64_t template_id, uint64_t scale_factor,
 	                            const PipelineProfileIdentity &pipeline_identity) const;
+	uint64_t GetPipelineHardwareProfileGeneration() const;
 	vector<QueryRequestPipelineHardwareProfileEstimate> GetPipelineHardwareProfilesSnapshot() const;
 	vector<DownstreamSuffixEstimate>
 	PrepareDownstreamSuffixEpoch(const vector<DownstreamSuffixEpochRequest> &requests) const;

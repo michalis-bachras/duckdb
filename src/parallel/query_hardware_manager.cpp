@@ -625,6 +625,41 @@ struct QueryHardwareManagerState {
 		return QueryRequestHardwareConfiguration();
 	}
 
+	QueryHardwareWorkerDomainContext GetDomainContextExcludingWorker(idx_t worker_id) const {
+		lock_guard<mutex> publish_guard(target_plan_lock);
+		lock_guard<mutex> guard(lock);
+		QueryHardwareWorkerDomainContext result;
+		auto worker = workers.find(worker_id);
+		auto plan = std::atomic_load_explicit(&published_plan, std::memory_order_acquire);
+		if (worker == workers.end() || !plan) {
+			return result;
+		}
+		result.plan_generation = plan->generation;
+		for (const auto &target : plan->workers) {
+			if (!target.assigned || target.worker_id == worker_id) {
+				continue;
+			}
+			auto other = workers.find(target.worker_id);
+			if (other == workers.end()) {
+				continue;
+			}
+			if (other->second.core.socket_id != worker->second.core.socket_id) {
+				continue;
+			}
+			result.socket_active_without_worker = true;
+			result.requested_hardware.uncore_frequency_khz =
+			    MaxValue<uint32_t>(result.requested_hardware.uncore_frequency_khz,
+			                       target.hardware.uncore_frequency_khz);
+			if (other->second.core.core_id == worker->second.core.core_id) {
+				result.core_active_without_worker = true;
+				result.requested_hardware.core_frequency_khz =
+				    MaxValue<uint32_t>(result.requested_hardware.core_frequency_khz,
+				                       target.hardware.core_frequency_khz);
+			}
+		}
+		return result;
+	}
+
 	QueryRequestHardwareConfiguration Reference() const {
 		QueryRequestHardwareConfiguration result;
 		result.core_frequency_khz = core_levels_khz.back();
@@ -709,6 +744,10 @@ bool QueryHardwareManager::IsWorkerAtConfiguration(idx_t worker_id,
 
 QueryRequestHardwareConfiguration QueryHardwareManager::GetAppliedConfigurationForCPU(int logical_cpu) const {
 	return state->GetAppliedConfigurationForCPU(logical_cpu);
+}
+
+QueryHardwareWorkerDomainContext QueryHardwareManager::GetDomainContextExcludingWorker(idx_t worker_id) const {
+	return state->GetDomainContextExcludingWorker(worker_id);
 }
 
 QueryRequestHardwareConfiguration QueryHardwareManager::ReferenceConfiguration() const {

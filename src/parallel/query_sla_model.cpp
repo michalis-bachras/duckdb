@@ -203,8 +203,16 @@ DownstreamSuffixEstimate QuerySLALifecycleSuffixPointMass() {
 QuerySLAServiceEvaluation QuerySLAEvaluateServiceRate(const QuerySLAModelInput &input,
 	                                                  double aggregate_service_rate, idx_t workers) {
 	QuerySLAServiceEvaluation result;
+	auto work = input.work;
+	if (workers == 0 && aggregate_service_rate <= 0 && !work.selected_throughput_valid &&
+	    input.service_rates.size() > 1 && input.service_rates[1] > 0) {
+		// An explicit service curve fully models this event. The first positive rate is
+		// only a validity witness here: a zero-worker epoch still makes no progress.
+		work.selected_throughput_valid = true;
+		work.selected_single_worker_chunks_per_s = input.service_rates[1];
+	}
 	result.current_pipeline_finish_ns = QuerySLACurrentPipelineFinishNs(
-	    input.work, input.event_kind, aggregate_service_rate, workers > 0, input.now_ns, input.epoch_ns);
+	    work, input.event_kind, aggregate_service_rate, workers > 0, input.now_ns, input.epoch_ns);
 	if (result.current_pipeline_finish_ns <= 0 || !input.suffix.valid || input.suffix.bucket_count == 0) {
 		return result;
 	}
@@ -309,6 +317,12 @@ QuerySLAAllocation AllocateQuerySLAWorkers(const vector<QuerySLAModel> &models, 
 		if (top.gain <= 0) {
 			break;
 		}
+		QuerySLAAllocationToken token;
+		token.query_index = top.query_index;
+		token.worker_ordinal = top.workers;
+		token.gain = top.gain;
+		token.mandatory = true;
+		result.tokens.push_back(token);
 		result.mandatory[top.query_index]++;
 		worker_budget--;
 		auto next = result.mandatory[top.query_index];
@@ -330,6 +344,12 @@ QuerySLAAllocation AllocateQuerySLAWorkers(const vector<QuerySLAModel> &models, 
 		if (top.gain <= 0) {
 			break;
 		}
+		QuerySLAAllocationToken token;
+		token.query_index = top.query_index;
+		token.worker_ordinal = top.workers;
+		token.gain = top.gain;
+		token.optional = true;
+		result.tokens.push_back(token);
 		result.optional[top.query_index]++;
 		worker_budget--;
 		auto workers = result.mandatory[top.query_index] + result.optional[top.query_index];

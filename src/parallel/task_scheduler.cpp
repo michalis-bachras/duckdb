@@ -280,7 +280,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 #ifndef DUCKDB_NO_THREADS
 	static constexpr const int64_t INITIAL_FLUSH_WAIT = 500000; // initial wait time of 0.5s (in mus) before flushing
-	static constexpr const int64_t SLA_NO_TASK_RETRY_WAIT = 100; // avoid a hot retry loop on temporarily ineligible work
+	static constexpr const int64_t STRIDE_NO_TASK_RETRY_WAIT = 100;
 
 	const auto &block_allocator = BlockAllocator::Get(db);
 	const auto &config = DBConfig::GetConfig(db);
@@ -292,9 +292,12 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 	}
 
 	shared_ptr<Task> task;
+	bool skip_semaphore_wait = false;
 	// loop until the marker is set to false
 	while (*marker) {
-		if (!block_allocator.SupportsFlush()) {
+		if (skip_semaphore_wait) {
+			skip_semaphore_wait = false;
+		} else if (!block_allocator.SupportsFlush()) {
 			// allocator can't flush, just start an untimed wait
 			queue->semaphore.wait();
 		} else if (!queue->semaphore.wait(INITIAL_FLUSH_WAIT)) {
@@ -360,42 +363,84 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 			if (Settings::Get<SchedulerProcessPartialSetting>(config) || policy != QuerySchedulerPolicy::DEFAULT) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 			}
-			auto stride_start = std::chrono::steady_clock::time_point();
-			if (stride_result == QueryStrideDequeueResult::TASK_FOUND) {
-				stride_start = std::chrono::steady_clock::now();
-			}
-			auto execute_result = task->Execute(process_mode);
-			if (stride_result == QueryStrideDequeueResult::TASK_FOUND) {
-				auto elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-				                                                std::chrono::steady_clock::now() - stride_start)
-				                                                .count());
-				db.GetQueryStrideScheduler().OnQuantumCompleted(stride_worker, stride_selection,
-				                                                      MaxValue<uint64_t>(elapsed_us, 1));
-			}
+			while (task) {
+				if (!*marker) {
+					auto &token = *task->token;
+					queue->Enqueue(token, std::move(task));
+					break;
+				}
+				auto stride_start = std::chrono::steady_clock::time_point();
+				if (stride_result == QueryStrideDequeueResult::TASK_FOUND) {
+					stride_start = std::chrono::steady_clock::now();
+				}
+				auto execute_result = task->Execute(process_mode);
+				if (stride_result == QueryStrideDequeueResult::TASK_FOUND) {
+					auto elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+					                                                std::chrono::steady_clock::now() - stride_start)
+					                                                .count());
+					db.GetQueryStrideScheduler().OnQuantumCompleted(stride_worker, stride_selection,
+					                                                      MaxValue<uint64_t>(elapsed_us, 1));
+				}
 
-			switch (execute_result) {
-			case TaskExecutionResult::TASK_FINISHED:
-			case TaskExecutionResult::TASK_ERROR:
-				task.reset();
-				break;
-			case TaskExecutionResult::TASK_NOT_FINISHED: {
-				// task is not finished - reschedule immediately
-				auto &token = *task->token;
-				queue->Enqueue(token, std::move(task));
-				break;
-			}
-			case TaskExecutionResult::TASK_BLOCKED:
-				task->Deschedule();
-				task.reset();
-				break;
+				switch (execute_result) {
+				case TaskExecutionResult::TASK_FINISHED:
+				case TaskExecutionResult::TASK_ERROR:
+					task.reset();
+					break;
+				case TaskExecutionResult::TASK_NOT_FINISHED: {
+					if (IsQuerySLAPolicy(policy) && sla_result == QuerySLADequeueResult::TASK_FOUND &&
+					    worker_id != DConstants::INVALID_INDEX) {
+						QuerySLAWorkerSelection current_selection;
+						auto continuation = db.GetQuerySLAScheduler().CheckTaskContinuation(
+						    worker_id, sla_selection, current_selection);
+						if (continuation == QuerySLAContinuationResult::CONTINUE) {
+							if (policy == QuerySchedulerPolicy::SLA_ENERGY &&
+							    !(current_selection.hardware == sla_selection.hardware)) {
+								auto &hardware_manager = db.GetQuerySLAScheduler().GetHardwareManager();
+								auto hardware = current_selection.hardware;
+								if (!hardware.IsValid()) {
+									hardware = hardware_manager.ReferenceConfiguration();
+								}
+								hardware_manager.UpdateWorkerTarget(worker_id, hardware, true,
+								                                    current_selection.plan_generation);
+							}
+							sla_selection = current_selection;
+							continue;
+						}
+					}
+					auto &token = *task->token;
+					queue->Enqueue(token, std::move(task));
+					break;
+				}
+				case TaskExecutionResult::TASK_BLOCKED:
+					task->Deschedule();
+					task.reset();
+					break;
+				}
 			}
 		} else if (queue->GetTasksInQueue() > 0) {
-			// failed to dequeue but there are still tasks remaining - signal again to retry
-			if (sla_result == QuerySLADequeueResult::NO_TASK ||
-			    stride_result == QueryStrideDequeueResult::NO_TASK) {
-				std::this_thread::sleep_for(std::chrono::microseconds(SLA_NO_TASK_RETRY_WAIT));
+			if (sla_result == QuerySLADequeueResult::NO_TASK) {
+				uint64_t deadline_ns = 0;
+				auto &sla_scheduler = db.GetQuerySLAScheduler();
+				if (sla_scheduler.TryAcquireEpochSentinel(deadline_ns)) {
+					auto now_ns = static_cast<uint64_t>(
+					    std::chrono::duration_cast<std::chrono::nanoseconds>(
+					        std::chrono::steady_clock::now().time_since_epoch())
+					        .count());
+					if (deadline_ns > now_ns) {
+						auto wait_us = (deadline_ns - now_ns + 999) / 1000;
+						queue->semaphore.wait(UnsafeNumericCast<int64_t>(wait_us));
+					}
+					sla_scheduler.ReleaseEpochSentinel();
+					skip_semaphore_wait = true;
+				}
+			} else {
+				// STRIDE retains its optimistic local-slot retry behavior; ordinary queue races are retried too.
+				if (stride_result == QueryStrideDequeueResult::NO_TASK) {
+					std::this_thread::sleep_for(std::chrono::microseconds(STRIDE_NO_TASK_RETRY_WAIT));
+				}
+				queue->semaphore.signal(1);
 			}
-			queue->semaphore.signal(1);
 		}
 	}
 	if (stride_registered) {

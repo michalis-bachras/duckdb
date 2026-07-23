@@ -1139,16 +1139,6 @@ struct QuerySLAEnergyHardwareControlEnableSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
-struct QuerySLAEnergyLambdaSetting {
-	using RETURN_TYPE = double;
-	static constexpr const char *Name = "query_sla_energy_lambda";
-	static constexpr const char *Description = "Energy weight used by the SLA-energy optional-worker objective";
-	static constexpr const char *InputType = "DOUBLE";
-	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
-	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
-	static Value GetSetting(const ClientContext &context);
-};
-
 struct QuerySLAEnergyExplorationEnableSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "query_sla_energy_exploration_enable";
