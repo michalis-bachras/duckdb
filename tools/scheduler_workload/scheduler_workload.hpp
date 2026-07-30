@@ -53,6 +53,7 @@ struct WorkloadConfig {
 	string profile_snapshot_in;
 	string profile_snapshot_out;
 	QuerySchedulerPolicy scheduler_policy = QuerySchedulerPolicy::DEFAULT;
+	string pin_threads = "auto";
 	idx_t threads = 1;
 	idx_t submitter_threads = 2;
 	idx_t completion_threads = 2;
@@ -64,15 +65,19 @@ struct WorkloadConfig {
 	double sla_tag = 30;
 	double sla_penalty_per_s = 1;
 	double max_driver_lag_ms = 10;
+	double no_progress_diagnostic_s = 0;
+	idx_t sla_epoch_ms = 200;
 	bool sla_residual_workers_enabled = false;
 	uint64_t sla_energy_exploration_seed = 1;
 	idx_t energy_attribution_period_ms = 100;
 	string energy_power_model_path;
+	string energy_attribution_model = "legacy";
 	bool sla_energy_exploration = false;
 	bool sla_energy_hardware_control = true;
 	bool energy_attribution_enabled = false;
 	bool energy_attribution_export = true;
 	bool energy_attribution_debug_export = false;
+	bool energy_process_required = false;
 	bool fail_on_invalid = true;
 };
 

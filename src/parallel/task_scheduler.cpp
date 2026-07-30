@@ -286,6 +286,8 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 	const auto &config = DBConfig::GetConfig(db);
 	QueryStrideWorkerState stride_worker;
 	bool stride_registered = false;
+	QuerySLAWorkerSelection sla_hardware_reservation;
+	bool sla_hardware_reserved = false;
 	if (GetQuerySchedulerPolicy() == QuerySchedulerPolicy::STRIDE && worker_id != DConstants::INVALID_INDEX) {
 		db.GetQueryStrideScheduler().RegisterWorker(stride_worker);
 		stride_registered = true;
@@ -339,32 +341,77 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 			stride_result =
 			    db.GetQueryStrideScheduler().TryDequeueTask(worker_id, stride_worker, task, stride_selection);
 		}
-		auto has_task = sla_result == QuerySLADequeueResult::TASK_FOUND ||
-		                stride_result == QueryStrideDequeueResult::TASK_FOUND;
-		if (sla_result == QuerySLADequeueResult::NOT_ACTIVE &&
-		    stride_result == QueryStrideDequeueResult::NOT_ACTIVE) {
-			has_task = queue->Dequeue(task);
-		}
-		if (policy == QuerySchedulerPolicy::SLA_ENERGY && worker_id != DConstants::INVALID_INDEX) {
-			auto &hardware_manager = db.GetQuerySLAScheduler().GetHardwareManager();
-			auto hardware = sla_selection.hardware;
-			if (has_task && sla_result == QuerySLADequeueResult::TASK_FOUND) {
-				if (!hardware.IsValid()) {
-					hardware = hardware_manager.ReferenceConfiguration();
-				}
-				hardware_manager.UpdateWorkerTarget(worker_id, hardware, true, sla_selection.plan_generation);
-				} else {
-					hardware_manager.UpdateWorkerTarget(worker_id, hardware_manager.MinimumConfiguration(), false,
-					                                    sla_selection.plan_generation);
+			auto has_task = sla_result == QuerySLADequeueResult::TASK_FOUND ||
+			                stride_result == QueryStrideDequeueResult::TASK_FOUND;
+			if (sla_result == QuerySLADequeueResult::NOT_ACTIVE &&
+			    stride_result == QueryStrideDequeueResult::NOT_ACTIVE) {
+				has_task = queue->Dequeue(task);
 			}
-		}
+			auto hardware_transition_context = [](const QuerySLAWorkerSelection &selection) {
+				QueryHardwareTransitionContext result;
+				result.db_query_id = selection.db_query_id;
+				result.request_id = selection.request_id;
+				result.pipeline_generation = selection.pipeline_generation;
+				result.lease_generation = selection.lease_generation;
+				result.pipeline_id = selection.pipeline_id;
+				result.mandatory = selection.mandatory;
+				result.optional = selection.optional;
+				result.trace_enabled = selection.debug_trace_enabled;
+				return result;
+			};
+			if (policy == QuerySchedulerPolicy::SLA_ENERGY && worker_id != DConstants::INVALID_INDEX) {
+				auto &hardware_manager = db.GetQuerySLAScheduler().GetHardwareManager();
+				QuerySLAWorkerSelection desired_reservation;
+				auto reservation_valid = false;
+				if (has_task && sla_result == QuerySLADequeueResult::TASK_FOUND) {
+					desired_reservation = sla_selection;
+					reservation_valid = true;
+				} else {
+					reservation_valid =
+					    db.GetQuerySLAScheduler().GetWorkerHardwareReservation(worker_id, desired_reservation);
+				}
+				if (reservation_valid) {
+					auto hardware = desired_reservation.hardware;
+					if (!hardware.IsValid()) {
+						hardware = hardware_manager.ReferenceConfiguration();
+					}
+					auto target_changed =
+					    !sla_hardware_reserved || !(sla_hardware_reservation.hardware == hardware);
+					desired_reservation.hardware = hardware;
+					if (target_changed) {
+						hardware_manager.UpdateWorkerTarget(
+						    worker_id, hardware, true, desired_reservation.plan_generation,
+						    hardware_transition_context(desired_reservation));
+					}
+					sla_hardware_reservation = desired_reservation;
+					sla_hardware_reserved = true;
+				} else if (sla_hardware_reserved) {
+					hardware_manager.UpdateWorkerTarget(worker_id, hardware_manager.MinimumConfiguration(), false,
+					                                    sla_hardware_reservation.plan_generation);
+					sla_hardware_reservation = QuerySLAWorkerSelection();
+					sla_hardware_reserved = false;
+				}
+			} else if (sla_hardware_reserved && worker_id != DConstants::INVALID_INDEX) {
+				auto &hardware_manager = db.GetQuerySLAScheduler().GetHardwareManager();
+				hardware_manager.UpdateWorkerTarget(worker_id, hardware_manager.MinimumConfiguration(), false,
+				                                    sla_hardware_reservation.plan_generation);
+				sla_hardware_reservation = QuerySLAWorkerSelection();
+				sla_hardware_reserved = false;
+			}
 		if (has_task) {
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
 			if (Settings::Get<SchedulerProcessPartialSetting>(config) || policy != QuerySchedulerPolicy::DEFAULT) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 			}
+			auto release_sla_assignment = [&]() {
+				if (sla_result == QuerySLADequeueResult::TASK_FOUND &&
+				    IsQuerySLAPolicy(sla_selection.policy) && worker_id != DConstants::INVALID_INDEX) {
+					db.GetQuerySLAScheduler().ReleaseTaskAssignment(worker_id, sla_selection);
+				}
+			};
 			while (task) {
 				if (!*marker) {
+					release_sla_assignment();
 					auto &token = *task->token;
 					queue->Enqueue(token, std::move(task));
 					break;
@@ -385,6 +432,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 				switch (execute_result) {
 				case TaskExecutionResult::TASK_FINISHED:
 				case TaskExecutionResult::TASK_ERROR:
+					release_sla_assignment();
 					task.reset();
 					break;
 				case TaskExecutionResult::TASK_NOT_FINISHED: {
@@ -398,21 +446,26 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 							    !(current_selection.hardware == sla_selection.hardware)) {
 								auto &hardware_manager = db.GetQuerySLAScheduler().GetHardwareManager();
 								auto hardware = current_selection.hardware;
-								if (!hardware.IsValid()) {
-									hardware = hardware_manager.ReferenceConfiguration();
+									if (!hardware.IsValid()) {
+										hardware = hardware_manager.ReferenceConfiguration();
+									}
+									hardware_manager.UpdateWorkerTarget(worker_id, hardware, true,
+									                                    current_selection.plan_generation,
+									                                    hardware_transition_context(current_selection));
 								}
-								hardware_manager.UpdateWorkerTarget(worker_id, hardware, true,
-								                                    current_selection.plan_generation);
-							}
+							sla_hardware_reservation = current_selection;
+							sla_hardware_reserved = policy == QuerySchedulerPolicy::SLA_ENERGY;
 							sla_selection = current_selection;
 							continue;
 						}
 					}
+					release_sla_assignment();
 					auto &token = *task->token;
 					queue->Enqueue(token, std::move(task));
 					break;
 				}
 				case TaskExecutionResult::TASK_BLOCKED:
+					release_sla_assignment();
 					task->Deschedule();
 					task.reset();
 					break;
@@ -445,6 +498,11 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker, idx_t worker_id) {
 	}
 	if (stride_registered) {
 		db.GetQueryStrideScheduler().DeregisterWorker(stride_worker);
+	}
+	if (sla_hardware_reserved && worker_id != DConstants::INVALID_INDEX) {
+		auto &hardware_manager = db.GetQuerySLAScheduler().GetHardwareManager();
+		hardware_manager.UpdateWorkerTarget(worker_id, hardware_manager.MinimumConfiguration(), false,
+		                                    sla_hardware_reservation.plan_generation);
 	}
 	// this thread will exit, flush all of its outstanding allocations
 	if (block_allocator.SupportsFlush()) {

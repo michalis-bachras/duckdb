@@ -846,6 +846,28 @@ struct EnergyAttributionBasePowerPathSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct EnergyAttributionModelSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "energy_attribution_model";
+	static constexpr const char *Description =
+	    "Attribution model: legacy, process_shadow, or process";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct EnergyAttributionProcessRequiredSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "energy_attribution_process_required";
+	static constexpr const char *Description =
+	    "Fail startup when the embedded process-attribution backend is unavailable";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct EnergyAttributionClosedSegmentsExportEnableSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "energy_attribution_closed_segments_export_enable";

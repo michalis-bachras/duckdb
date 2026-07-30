@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/energy_attribution/energy_attribution.hpp"
+#include "duckdb/energy_attribution/process_activity.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_config.hpp"
@@ -59,6 +60,7 @@ static const idx_t DEFAULT_THREAD_SEGMENT_BUFFER_CAPACITY = 1024;
 static const uint64_t DEFAULT_THREAD_SEGMENT_ID_BLOCK_SIZE = 1024;
 
 struct PerfCounters {
+	uint64_t task_clock_ns = 0;
 	uint64_t cycles = 0;
 	uint64_t instructions = 0;
 	uint64_t ref_cycles = 0;
@@ -102,14 +104,33 @@ struct AttributedSegment {
 	uint64_t slice_end_ns = 0;
 	double frequency_ratio = 0;
 	double corrected_cycles = 0;
+	double process_frequency_ratio = 0;
+	double process_corrected_cycles = 0;
 	double activity_weight = 0;
 	double weight_denominator = 0;
 	double attributed_active_energy_j = 0;
 	double base_time_weight = 0;
 	double base_time_denominator_s = 0;
 	double attributed_base_energy_j = 0;
+	double legacy_active_energy_j = 0;
+	double process_active_energy_j = 0;
+	double task_clock_coverage = 0;
 	double throughput = 0;
+	bool process_attribution_valid = false;
+	string process_counter_source;
 	string attribution_status;
+};
+
+struct AttributedProcessActivity {
+	ProcessActivityRecord record;
+	uint64_t window_id = 0;
+	double activity_weight = 0;
+	double weight_denominator = 0;
+	double attributed_active_energy_j = 0;
+	double base_time_weight = 0;
+	double base_time_denominator_ns = 0;
+	double attributed_base_energy_j = 0;
+	bool duckdb_process = false;
 };
 
 struct SocketEnergyWindow {
@@ -123,6 +144,8 @@ struct SocketEnergyWindow {
 	double package_energy_j = 0;
 	double core_freq_hz = 0;
 	double uncore_freq_hz = 0;
+	double modeled_base_energy_j = 0;
+	double base_model_excess_energy_j = 0;
 	double base_energy_j = 0;
 	double active_package_energy_j = 0;
 	double summed_attributed_active_energy_j = 0;
@@ -134,11 +157,134 @@ struct SocketEnergyWindow {
 	double idle_gap_wall_time_s = 0;
 	double busy_base_energy_j = 0;
 	double idle_gap_base_energy_j = 0;
+	double process_attributed_active_energy_j = 0;
+	double process_attributed_base_energy_j = 0;
+	double process_conservation_error_j = 0;
+	double process_base_conservation_error_j = 0;
+	double duckdb_process_active_energy_j = 0;
+	double duckdb_process_base_energy_j = 0;
+	double external_process_active_energy_j = 0;
+	double external_process_base_energy_j = 0;
+	double host_kernel_active_energy_j = 0;
+	double host_kernel_base_energy_j = 0;
+	double host_irq_active_energy_j = 0;
+	double host_irq_base_energy_j = 0;
+	double system_idle_active_energy_j = 0;
+	double system_idle_base_energy_j = 0;
+	double measurement_overhead_active_energy_j = 0;
+	double measurement_overhead_base_energy_j = 0;
+	double duckdb_instrumented_active_energy_j = 0;
+	double duckdb_instrumented_base_energy_j = 0;
+	double duckdb_uninstrumented_active_energy_j = 0;
+	double duckdb_uninstrumented_base_energy_j = 0;
+	double duckdb_hierarchy_error_j = 0;
+	double duckdb_base_hierarchy_error_j = 0;
+	uint32_t process_monitored_cpu_count = 0;
+	uint64_t process_observed_runtime_ns = 0;
+	double process_expected_runtime_ns = 0;
+	double process_runtime_coverage = 0;
+	uint64_t process_generation = 0;
+	uint64_t process_transition_ns = 0;
+	uint64_t process_boundary_min_ns = 0;
+	uint64_t process_boundary_max_ns = 0;
+	uint64_t process_maximum_checkpoint_delay_ns = 0;
+	uint64_t process_checkpoint_duration_ns = 0;
+	uint64_t process_activity_map_insert_failure = 0;
+	uint64_t process_missing_counter = 0;
+	uint64_t process_invalid_counter_delta = 0;
+	uint64_t process_interrupt_underflow = 0;
+	uint64_t process_boundary_split_count = 0;
+	uint64_t process_boundary_split_cpu_count = 0;
+	uint64_t process_boundary_split_runtime_ns = 0;
+	uint64_t process_boundary_split_cycles = 0;
+	uint64_t process_boundary_split_ref_cycles = 0;
+	uint64_t process_late_helper_count = 0;
+	uint64_t process_lost_records = 0;
+	uint64_t process_lookup_failures = 0;
 	idx_t segment_count = 0;
 	bool rapl_valid = false;
 	bool base_power_valid = false;
 	bool used_time_fallback = false;
+	bool process_boundary_corrected = false;
+	bool process_attribution_valid = false;
+	string attribution_model = "legacy";
+	string process_status;
 	string status;
+};
+
+struct ProcessEnergyAggregate {
+	uint64_t process_start_time_ns = 0;
+	uint32_t tgid = 0;
+	int socket_id = -1;
+	ProcessActivityKind kind = ProcessActivityKind::PROCESS;
+	string comm;
+	uint64_t sample_count = 0;
+	uint64_t runtime_ns = 0;
+	uint64_t cycles = 0;
+	uint64_t ref_cycles = 0;
+	double corrected_cycles = 0;
+	double active_energy_j = 0;
+	double base_energy_j = 0;
+};
+
+struct ProcessEnergyProfileKey {
+	uint64_t process_start_time_ns = 0;
+	uint32_t tgid = 0;
+	int socket_id = -1;
+	ProcessActivityKind kind = ProcessActivityKind::PROCESS;
+	string comm;
+
+	bool operator==(const ProcessEnergyProfileKey &other) const {
+		return process_start_time_ns == other.process_start_time_ns && tgid == other.tgid &&
+		       socket_id == other.socket_id && kind == other.kind && comm == other.comm;
+	}
+};
+
+struct ProcessEnergyProfileKeyHash {
+	size_t operator()(const ProcessEnergyProfileKey &key) const {
+		size_t result = std::hash<uint64_t> {}(key.process_start_time_ns);
+		result ^= std::hash<uint32_t> {}(key.tgid) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<int> {}(key.socket_id) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<int> {}(static_cast<int>(key.kind)) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<string> {}(key.comm) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		return result;
+	}
+};
+
+using ProcessEnergyProfileMap =
+    std::unordered_map<ProcessEnergyProfileKey, ProcessEnergyAggregate, ProcessEnergyProfileKeyHash>;
+
+struct PreparedSocketProcessActivity {
+	int socket_id = -1;
+	vector<idx_t> record_indices;
+	double corrected_weight_sum = 0;
+	double runtime_weight_sum = 0;
+	uint32_t monitored_cpu_count = 0;
+	bool has_non_idle_activity = false;
+	bool all_pmu_valid = true;
+};
+
+struct PreparedProcessActivity {
+	const ProcessActivityWindow *source = nullptr;
+	vector<PreparedSocketProcessActivity> sockets;
+	std::unordered_map<int, idx_t> socket_to_index;
+};
+
+struct DuckDBThreadShare {
+	double active_energy_j = 0;
+	double base_energy_j = 0;
+	uint64_t runtime_ns = 0;
+	double corrected_cycles = 0;
+	double corrected_ref_cycles = 0;
+	double activity_weight = 0;
+	double segment_cycle_sum = 0;
+	uint64_t segment_task_clock_sum = 0;
+	double covered_active_energy_j = 0;
+	double covered_base_energy_j = 0;
+	double task_clock_coverage = 0;
+	double segment_denominator = 0;
+	bool use_segment_time = false;
 };
 
 struct PipelineProfileAggregate {
@@ -179,9 +325,12 @@ struct PipelineEfficiencyAggregate {
 	double energy_only_duration_s = 0;
 	double energy_only_active_energy_j = 0;
 	double energy_only_base_time_share_energy_j = 0;
-	double allocated_initialize_energy_j = 0;
-	double allocated_prepare_finish_energy_j = 0;
-	double allocated_finish_energy_j = 0;
+	double allocated_initialize_active_energy_j = 0;
+	double allocated_initialize_base_energy_j = 0;
+	double allocated_prepare_finish_active_energy_j = 0;
+	double allocated_prepare_finish_base_energy_j = 0;
+	double allocated_finish_active_energy_j = 0;
+	double allocated_finish_base_energy_j = 0;
 };
 
 struct SystemEnergyAggregate {
@@ -912,13 +1061,6 @@ private:
 };
 
 #ifdef __linux__
-struct PerfEventSpec {
-	string name;
-	uint32_t type;
-	uint64_t config;
-	bool required;
-};
-
 static long PerfEventOpen(struct perf_event_attr *hw_event, pid_t pid, int cpu, int group_fd, unsigned long flags) {
 	return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
@@ -936,63 +1078,49 @@ public:
 	PerfEventGroup(const PerfEventGroup &) = delete;
 	PerfEventGroup &operator=(const PerfEventGroup &) = delete;
 
-	bool Open(int64_t tid, const string &counter_profile) {
+	bool Open(int64_t tid, const string &counter_profile, bool include_kernel, bool open_ref_cycles) {
 #ifdef __linux__
 		if (IsOpen()) {
-			if (opened_tid == tid && opened_profile == counter_profile) {
+			if (opened_tid == tid && opened_profile == counter_profile && opened_include_kernel == include_kernel &&
+			    opened_ref_cycles == open_ref_cycles) {
 				return true;
 			}
 			Close();
 		}
-		vector<PerfEventSpec> specs;
-		specs.push_back({"cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, true});
-		specs.push_back({"ref_cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_REF_CPU_CYCLES, false});
-		// Diagnostic events intentionally disabled for the counter-weighted model to reduce multiplexing risk.
-		// specs.push_back({"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, false});
-		// specs.push_back({"cache_refs", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES, false});
-		// specs.push_back({"cache_misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES, false});
-		// specs.push_back({"llc_misses", PERF_TYPE_HW_CACHE, LLCacheReadMissConfig(), false});
-
-		int group_fd = -1;
-		for (idx_t i = 0; i < specs.size(); i++) {
-			struct perf_event_attr attr;
-			memset(&attr, 0, sizeof(attr));
-			attr.type = specs[i].type;
-			attr.size = sizeof(attr);
-			attr.config = specs[i].config;
-			attr.disabled = group_fd == -1 ? 1 : 0;
-			attr.exclude_kernel = 1;
-			attr.exclude_hv = 1;
-			attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
-			int fd = NumericCast<int>(PerfEventOpen(&attr, static_cast<pid_t>(tid), -1, group_fd, 0));
-			if (fd < 0) {
-				if (specs[i].required && group_fd == -1) {
-					status = StringUtil::Format("perf_event_open(%s) failed: %s", specs[i].name, std::strerror(errno));
-					Close();
-					return false;
-				}
-				continue;
-			}
-			if (group_fd == -1) {
-				group_fd = fd;
-				leader_fd = fd;
-			}
-			event_names.push_back(specs[i].name);
-			fds.push_back(fd);
-		}
-		if (leader_fd < 0) {
-			status = "no perf events opened";
-			return false;
-		}
-		ioctl(leader_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
-		if (ioctl(leader_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) != 0) {
-			status = StringUtil::Format("PERF_EVENT_IOC_ENABLE failed: %s", std::strerror(errno));
+		struct perf_event_attr task_clock_attr;
+		memset(&task_clock_attr, 0, sizeof(task_clock_attr));
+		task_clock_attr.type = PERF_TYPE_SOFTWARE;
+		task_clock_attr.size = sizeof(task_clock_attr);
+		task_clock_attr.config = PERF_COUNT_SW_TASK_CLOCK;
+		task_clock_attr.disabled = 0;
+		task_clock_attr.exclude_kernel = include_kernel ? 0 : 1;
+		task_clock_attr.exclude_hv = 1;
+		task_clock_attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+		task_clock_fd =
+		    NumericCast<int>(PerfEventOpen(&task_clock_attr, static_cast<pid_t>(tid), -1, -1, 0));
+		if (task_clock_fd < 0) {
+			status = StringUtil::Format("perf_event_open(task_clock) failed: %s", std::strerror(errno));
 			Close();
 			return false;
 		}
+
 		status = counter_profile;
+		cycles_fd = OpenIndependentHardwareCounter(tid, PERF_COUNT_HW_CPU_CYCLES, include_kernel);
+		if (cycles_fd < 0) {
+			status += StringUtil::Format("|cycles_unavailable:%s", std::strerror(errno));
+		}
+		if (open_ref_cycles) {
+			ref_cycles_fd = OpenIndependentHardwareCounter(tid, PERF_COUNT_HW_REF_CPU_CYCLES, include_kernel);
+			if (ref_cycles_fd < 0) {
+				status += StringUtil::Format("|ref_cycles_unavailable:%s", std::strerror(errno));
+			}
+		} else {
+			status += "|ref_cycles_process_proxy";
+		}
 		opened_tid = tid;
 		opened_profile = counter_profile;
+		opened_include_kernel = include_kernel;
+		opened_ref_cycles = open_ref_cycles;
 		return true;
 #else
 		status = "perf_event_open is Linux-only";
@@ -1001,72 +1129,113 @@ public:
 	}
 
 	bool IsOpen() const {
-		return leader_fd >= 0;
+		return task_clock_fd >= 0;
 	}
 
 	EnergyPerfSnapshot ReadSnapshot() const {
 		EnergyPerfSnapshot snapshot;
 		snapshot.status = status;
 #ifdef __linux__
-		if (leader_fd < 0) {
+		if (task_clock_fd < 0) {
 			return snapshot;
 		}
-		uint64_t buffer[32];
-		memset(buffer, 0, sizeof(buffer));
-		auto bytes = read(leader_fd, buffer, sizeof(buffer));
-		if (bytes < static_cast<ssize_t>(sizeof(uint64_t) * 3)) {
+		uint64_t task_clock_buffer[3] = {};
+		auto task_clock_bytes = read(task_clock_fd, task_clock_buffer, sizeof(task_clock_buffer));
+		if (task_clock_bytes != static_cast<ssize_t>(sizeof(task_clock_buffer))) {
 			snapshot.status =
-			    StringUtil::Format("perf read failed: %s", bytes < 0 ? std::strerror(errno) : "short read");
+			    StringUtil::Format("task-clock read failed: %s",
+			                       task_clock_bytes < 0 ? std::strerror(errno) : "short read");
 			return snapshot;
 		}
-		auto nr = buffer[0];
-		snapshot.time_enabled = buffer[1];
-		snapshot.time_running = buffer[2];
-		if (nr > event_names.size()) {
-			nr = event_names.size();
-		}
-		for (idx_t i = 0; i < nr; i++) {
-			if (event_names[i] == "cycles") {
-				snapshot.cycles = buffer[3 + i];
-			} else if (event_names[i] == "instructions") {
-				snapshot.instructions = buffer[3 + i];
-			} else if (event_names[i] == "ref_cycles") {
-				snapshot.ref_cycles = buffer[3 + i];
-			} else if (event_names[i] == "cache_refs") {
-				snapshot.cache_refs = buffer[3 + i];
-			} else if (event_names[i] == "cache_misses") {
-				snapshot.cache_misses = buffer[3 + i];
-			} else if (event_names[i] == "llc_misses") {
-				snapshot.llc_misses = buffer[3 + i];
+		snapshot.task_clock_ns = task_clock_buffer[0];
+		snapshot.task_clock_time_enabled = task_clock_buffer[1];
+		snapshot.task_clock_time_running = task_clock_buffer[2];
+		snapshot.task_clock_valid = true;
+		snapshot.valid = true;
+		snapshot.scaled = snapshot.task_clock_time_running > 0 &&
+		                  snapshot.task_clock_time_enabled > snapshot.task_clock_time_running;
+
+		if (cycles_fd >= 0) {
+			uint64_t cycles_buffer[3] = {};
+			auto cycles_bytes = read(cycles_fd, cycles_buffer, sizeof(cycles_buffer));
+			if (cycles_bytes == static_cast<ssize_t>(sizeof(cycles_buffer))) {
+				snapshot.cycles = cycles_buffer[0];
+				snapshot.cycles_time_enabled = cycles_buffer[1];
+				snapshot.cycles_time_running = cycles_buffer[2];
+				snapshot.cycles_valid = true;
+				snapshot.scaled = snapshot.scaled || (snapshot.cycles_time_running > 0 &&
+				                                      snapshot.cycles_time_enabled > snapshot.cycles_time_running);
+			} else {
+				snapshot.status +=
+				    StringUtil::Format("|cycles_read_failed:%s",
+				                       cycles_bytes < 0 ? std::strerror(errno) : "short read");
 			}
 		}
-		snapshot.scaled = snapshot.time_running > 0 && snapshot.time_enabled > snapshot.time_running;
-		snapshot.valid = true;
+		if (ref_cycles_fd >= 0) {
+			uint64_t ref_cycles_buffer[3] = {};
+			auto ref_cycles_bytes = read(ref_cycles_fd, ref_cycles_buffer, sizeof(ref_cycles_buffer));
+			if (ref_cycles_bytes == static_cast<ssize_t>(sizeof(ref_cycles_buffer))) {
+				snapshot.ref_cycles = ref_cycles_buffer[0];
+				snapshot.ref_cycles_time_enabled = ref_cycles_buffer[1];
+				snapshot.ref_cycles_time_running = ref_cycles_buffer[2];
+				snapshot.ref_cycles_valid = true;
+				snapshot.scaled =
+				    snapshot.scaled || (snapshot.ref_cycles_time_running > 0 &&
+				                        snapshot.ref_cycles_time_enabled > snapshot.ref_cycles_time_running);
+			} else {
+				snapshot.status +=
+				    StringUtil::Format("|ref_cycles_read_failed:%s",
+				                       ref_cycles_bytes < 0 ? std::strerror(errno) : "short read");
+			}
+		}
 #endif
 		return snapshot;
 	}
 
 	void Close() {
 #ifdef __linux__
-		for (idx_t i = 0; i < fds.size(); i++) {
-			if (fds[i] >= 0) {
-				close(fds[i]);
-			}
+		if (task_clock_fd >= 0) {
+			close(task_clock_fd);
+		}
+		if (cycles_fd >= 0) {
+			close(cycles_fd);
+		}
+		if (ref_cycles_fd >= 0) {
+			close(ref_cycles_fd);
 		}
 #endif
-		fds.clear();
-		event_names.clear();
-		leader_fd = -1;
+		task_clock_fd = -1;
+		cycles_fd = -1;
+		ref_cycles_fd = -1;
 		opened_tid = -1;
 		opened_profile.clear();
+		opened_include_kernel = false;
+		opened_ref_cycles = true;
 	}
 
 private:
-	vector<int> fds;
-	vector<string> event_names;
-	int leader_fd = -1;
+#ifdef __linux__
+	static int OpenIndependentHardwareCounter(int64_t tid, uint64_t config, bool include_kernel) {
+		struct perf_event_attr attr;
+		memset(&attr, 0, sizeof(attr));
+		attr.type = PERF_TYPE_HARDWARE;
+		attr.size = sizeof(attr);
+		attr.config = config;
+		attr.disabled = 0;
+		attr.exclude_kernel = include_kernel ? 0 : 1;
+		attr.exclude_hv = 1;
+		attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+		return NumericCast<int>(PerfEventOpen(&attr, static_cast<pid_t>(tid), -1, -1, 0));
+	}
+#endif
+
+	int task_clock_fd = -1;
+	int cycles_fd = -1;
+	int ref_cycles_fd = -1;
 	int64_t opened_tid = -1;
 	string opened_profile;
+	bool opened_include_kernel = false;
+	bool opened_ref_cycles = true;
 	string status = "not opened";
 };
 
@@ -1085,29 +1254,70 @@ static PerfCounters DeltaPerfCounters(const EnergyPerfSnapshot &start, const Ene
 		counters.status = counters.status.empty() ? "perf snapshot unavailable" : counters.status;
 		return counters;
 	}
-	auto time_enabled = SnapshotDeltaValue(start.time_enabled, end.time_enabled);
-	auto time_running = SnapshotDeltaValue(start.time_running, end.time_running);
-	double scale = 1.0;
-	if (time_running > 0 && time_enabled > time_running) {
-		scale = static_cast<double>(time_enabled) / static_cast<double>(time_running);
+	auto task_time_enabled =
+	    SnapshotDeltaValue(start.task_clock_time_enabled, end.task_clock_time_enabled);
+	auto task_time_running =
+	    SnapshotDeltaValue(start.task_clock_time_running, end.task_clock_time_running);
+	double task_scale = 1.0;
+	if (start.task_clock_valid && end.task_clock_valid && task_time_running > 0 &&
+	    task_time_enabled > task_time_running) {
+		task_scale = static_cast<double>(task_time_enabled) / static_cast<double>(task_time_running);
 		counters.scaled = true;
-	} else if (time_running == 0 && time_enabled > 0) {
-		counters.status = "perf counters never ran during segment";
-		return counters;
+	} else if (start.task_clock_valid && end.task_clock_valid && task_time_running == 0 && task_time_enabled > 0) {
+		counters.status += "|task clock never ran during segment";
+	} else if (!start.task_clock_valid || !end.task_clock_valid) {
+		counters.status += "|task clock unavailable";
 	}
-	counters.cycles = ScaleCounterDelta(SnapshotDeltaValue(start.cycles, end.cycles), scale);
-	counters.instructions = ScaleCounterDelta(SnapshotDeltaValue(start.instructions, end.instructions), scale);
-	counters.ref_cycles = ScaleCounterDelta(SnapshotDeltaValue(start.ref_cycles, end.ref_cycles), scale);
-	counters.cache_refs = ScaleCounterDelta(SnapshotDeltaValue(start.cache_refs, end.cache_refs), scale);
-	counters.cache_misses = ScaleCounterDelta(SnapshotDeltaValue(start.cache_misses, end.cache_misses), scale);
-	counters.llc_misses = ScaleCounterDelta(SnapshotDeltaValue(start.llc_misses, end.llc_misses), scale);
-	counters.offcore_responses =
-	    ScaleCounterDelta(SnapshotDeltaValue(start.offcore_responses, end.offcore_responses), scale);
-	counters.valid = counters.cycles > 0 || counters.ref_cycles > 0 || counters.instructions > 0;
+	counters.task_clock_ns =
+	    ScaleCounterDelta(SnapshotDeltaValue(start.task_clock_ns, end.task_clock_ns), task_scale);
+
+	auto cycles_time_enabled =
+	    SnapshotDeltaValue(start.cycles_time_enabled, end.cycles_time_enabled);
+	auto cycles_time_running =
+	    SnapshotDeltaValue(start.cycles_time_running, end.cycles_time_running);
+	double cycles_scale = 1.0;
+	if (start.cycles_valid && end.cycles_valid && cycles_time_running > 0 &&
+	    cycles_time_enabled > cycles_time_running) {
+		cycles_scale = static_cast<double>(cycles_time_enabled) / static_cast<double>(cycles_time_running);
+		counters.scaled = true;
+	} else if (start.cycles_valid && end.cycles_valid && cycles_time_running == 0 && cycles_time_enabled > 0) {
+		counters.status += "|cycles never ran during segment";
+	} else if (!start.cycles_valid || !end.cycles_valid) {
+		counters.status += "|cycles unavailable";
+	}
+	if (start.cycles_valid && end.cycles_valid && cycles_time_running > 0) {
+		counters.cycles =
+		    ScaleCounterDelta(SnapshotDeltaValue(start.cycles, end.cycles), cycles_scale);
+	}
+
+	auto ref_cycles_time_enabled =
+	    SnapshotDeltaValue(start.ref_cycles_time_enabled, end.ref_cycles_time_enabled);
+	auto ref_cycles_time_running =
+	    SnapshotDeltaValue(start.ref_cycles_time_running, end.ref_cycles_time_running);
+	double ref_cycles_scale = 1.0;
+	if (start.ref_cycles_valid && end.ref_cycles_valid && ref_cycles_time_running > 0 &&
+	    ref_cycles_time_enabled > ref_cycles_time_running) {
+		ref_cycles_scale =
+		    static_cast<double>(ref_cycles_time_enabled) / static_cast<double>(ref_cycles_time_running);
+		counters.scaled = true;
+	} else if (start.ref_cycles_valid && end.ref_cycles_valid && ref_cycles_time_running == 0 &&
+	           ref_cycles_time_enabled > 0) {
+		counters.status += "|ref cycles never ran during segment";
+	} else if ((!start.ref_cycles_valid || !end.ref_cycles_valid) &&
+	           counters.status.find("ref_cycles_process_proxy") == string::npos) {
+		counters.status += "|ref cycles unavailable";
+	}
+	if (start.ref_cycles_valid && end.ref_cycles_valid && ref_cycles_time_running > 0) {
+		counters.ref_cycles =
+		    ScaleCounterDelta(SnapshotDeltaValue(start.ref_cycles, end.ref_cycles), ref_cycles_scale);
+	}
+	counters.valid =
+	    counters.task_clock_ns > 0 || counters.cycles > 0 || counters.ref_cycles > 0 || counters.instructions > 0;
 	return counters;
 }
 
 static void AddPerfCounters(PerfCounters &target, const PerfCounters &delta) {
+	target.task_clock_ns += delta.task_clock_ns;
 	target.cycles += delta.cycles;
 	target.instructions += delta.instructions;
 	target.ref_cycles += delta.ref_cycles;
@@ -1127,6 +1337,7 @@ static void AddPerfCounters(PerfCounters &target, const PerfCounters &delta) {
 }
 
 static void ApplyPerfCounters(EnergySegmentRecord &record, const PerfCounters &counters) {
+	record.task_clock_ns = counters.task_clock_ns;
 	record.cycles = counters.cycles;
 	record.instructions = counters.instructions;
 	record.ref_cycles = counters.ref_cycles;
@@ -1214,6 +1425,8 @@ struct EnergyThreadState {
 	string perf_status = "not opened";
 	bool perf_attempted = false;
 	bool perf_open = false;
+	bool perf_include_kernel = false;
+	bool perf_open_ref_cycles = true;
 
 	int64_t GetTID() {
 		if (tid < 0) {
@@ -1242,10 +1455,15 @@ struct EnergyThreadState {
 			snapshot.status = "perf disabled";
 			return snapshot;
 		}
-		if (perf_open && perf_profile == settings.counter_profile) {
+		auto process_counter_mode = settings.attribution_model != "legacy";
+		auto include_kernel = process_counter_mode;
+		auto open_ref_cycles = !process_counter_mode;
+		if (perf_open && perf_profile == settings.counter_profile && perf_include_kernel == include_kernel &&
+		    perf_open_ref_cycles == open_ref_cycles) {
 			return perf_group.ReadSnapshot();
 		}
-		if (perf_attempted && !perf_open && perf_profile == settings.counter_profile) {
+		if (perf_attempted && !perf_open && perf_profile == settings.counter_profile &&
+		    perf_include_kernel == include_kernel && perf_open_ref_cycles == open_ref_cycles) {
 			snapshot.status = perf_status;
 			return snapshot;
 		}
@@ -1255,8 +1473,10 @@ struct EnergyThreadState {
 		}
 		tid = current_tid;
 		perf_profile = settings.counter_profile;
+		perf_include_kernel = include_kernel;
+		perf_open_ref_cycles = open_ref_cycles;
 		perf_attempted = true;
-		perf_open = perf_group.Open(current_tid, settings.counter_profile);
+		perf_open = perf_group.Open(current_tid, settings.counter_profile, include_kernel, open_ref_cycles);
 		perf_status = perf_open ? settings.counter_profile : perf_group.ReadSnapshot().status;
 		if (!perf_open) {
 			snapshot.status = perf_status;
@@ -1455,6 +1675,38 @@ static double AverageUncoreFreqForSocket(const vector<AttributedSegment> &segmen
 	return ReadUncoreFrequencyHz(socket_id);
 }
 
+struct SocketFrequencyAverages {
+	double core_hz = 0;
+	double uncore_hz = 0;
+};
+
+static SocketFrequencyAverages AverageFrequenciesForSocket(const vector<AttributedSegment> &segments, int socket_id) {
+	double core_weighted = 0;
+	double core_duration = 0;
+	double uncore_weighted = 0;
+	double uncore_duration = 0;
+	for (idx_t i = 0; i < segments.size(); i++) {
+		const auto &segment = segments[i].record;
+		if (segment.socket_id != socket_id) {
+			continue;
+		}
+		auto segment_duration = SegmentDuration(segment);
+		if (segment.core_freq_hz > 0) {
+			core_weighted += segment.core_freq_hz * segment_duration;
+			core_duration += segment_duration;
+		}
+		if (segment.uncore_freq_hz > 0) {
+			uncore_weighted += segment.uncore_freq_hz * segment_duration;
+			uncore_duration += segment_duration;
+		}
+	}
+	SocketFrequencyAverages result;
+	result.core_hz = core_duration > 0 ? core_weighted / core_duration : 0;
+	result.uncore_hz =
+	    uncore_duration > 0 ? uncore_weighted / uncore_duration : ReadUncoreFrequencyHz(socket_id);
+	return result;
+}
+
 static uint64_t RaplDeltaUJ(const RaplSnapshot &start, const RaplSnapshot &end) {
 	if (!start.valid || !end.valid) {
 		return 0;
@@ -1466,6 +1718,41 @@ static uint64_t RaplDeltaUJ(const RaplSnapshot &start, const RaplSnapshot &end) 
 		return (start.max_energy_range_uj - start.energy_uj) + end.energy_uj;
 	}
 	return 0;
+}
+
+static vector<RaplSnapshot> InterpolateRaplSnapshots(const vector<RaplSnapshot> &before,
+                                                     const vector<RaplSnapshot> &after, uint64_t before_ns,
+                                                     uint64_t after_ns, uint64_t boundary_ns) {
+	vector<RaplSnapshot> result;
+	std::map<int, RaplSnapshot> before_by_socket;
+	for (const auto &snapshot : before) {
+		before_by_socket[snapshot.socket_id] = snapshot;
+	}
+	auto fraction = after_ns > before_ns
+	                    ? static_cast<double>(MinValue<uint64_t>(MaxValue<uint64_t>(boundary_ns, before_ns), after_ns) -
+	                                          before_ns) /
+	                          static_cast<double>(after_ns - before_ns)
+	                    : 0;
+	for (const auto &end : after) {
+		auto start_entry = before_by_socket.find(end.socket_id);
+		if (start_entry == before_by_socket.end()) {
+			result.push_back(end);
+			continue;
+		}
+		const auto &start = start_entry->second;
+		RaplSnapshot interpolated = start;
+		interpolated.valid = start.valid && end.valid;
+		if (interpolated.valid) {
+			auto interpolated_delta = static_cast<uint64_t>(static_cast<double>(RaplDeltaUJ(start, end)) * fraction);
+			interpolated.energy_uj = start.energy_uj + interpolated_delta;
+			if (interpolated.max_energy_range_uj > 0 &&
+			    interpolated.energy_uj >= interpolated.max_energy_range_uj) {
+				interpolated.energy_uj %= interpolated.max_energy_range_uj;
+			}
+		}
+		result.push_back(interpolated);
+	}
+	return result;
 }
 
 static string SegmentStatusBase(const EnergySegmentRecord &segment) {
@@ -1553,7 +1840,12 @@ static vector<SocketEnergyWindow> BuildSocketWindows(QueryEnergyState &state, co
 		double base_power_w = 0;
 		window.base_power_valid = LookupBasePower(state.base_power_entries, window.socket_id, window.core_freq_hz,
 		                                          window.uncore_freq_hz, 0, base_power_w);
-		window.base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
+		window.modeled_base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
+		window.base_energy_j = window.rapl_valid
+		                           ? MinValue<double>(window.modeled_base_energy_j, window.package_energy_j)
+		                           : window.modeled_base_energy_j;
+		window.base_model_excess_energy_j =
+		    MaxValue<double>(0, window.modeled_base_energy_j - window.base_energy_j);
 		window.total_base_energy_j = window.base_energy_j;
 		window.active_package_energy_j = std::max(0.0, window.package_energy_j - window.base_energy_j);
 		if (!window.rapl_valid) {
@@ -1592,7 +1884,7 @@ static vector<SocketEnergyWindow> BuildSocketWindows(QueryEnergyState &state, co
 	return windows;
 }
 
-static void AttributeSegments(vector<AttributedSegment> &segments, vector<SocketEnergyWindow> &windows) {
+static void PrepareSegmentsForAttribution(vector<AttributedSegment> &segments) {
 	ComputeSMTOccupancy(segments);
 	for (idx_t i = 0; i < segments.size(); i++) {
 		auto &segment = segments[i];
@@ -1612,7 +1904,10 @@ static void AttributeSegments(vector<AttributedSegment> &segments, vector<Socket
 			segment.throughput = static_cast<double>(segment.record.work_units) / duration;
 		}
 	}
+}
 
+static void AttributeSegments(vector<AttributedSegment> &segments, vector<SocketEnergyWindow> &windows) {
+	PrepareSegmentsForAttribution(segments);
 	vector<std::pair<idx_t, double>> eligible_segments;
 	eligible_segments.reserve(segments.size());
 	vector<std::pair<uint64_t, uint64_t>> busy_intervals;
@@ -1679,6 +1974,434 @@ static void AttributeSegments(vector<AttributedSegment> &segments, vector<Socket
 		window.active_conservation_error_j = window.active_package_energy_j - window.summed_attributed_active_energy_j;
 		window.base_conservation_error_j = window.busy_base_energy_j - window.summed_attributed_base_energy_j;
 	}
+}
+
+static void PrepareProcessActivity(const ProcessActivityWindow &activity, PreparedProcessActivity &prepared) {
+	prepared.source = &activity;
+	for (auto &socket : prepared.sockets) {
+		socket.record_indices.clear();
+		socket.corrected_weight_sum = 0;
+		socket.runtime_weight_sum = 0;
+		socket.monitored_cpu_count = 0;
+		socket.has_non_idle_activity = false;
+		socket.all_pmu_valid = true;
+	}
+	auto find_or_create_socket = [&](int socket_id) -> PreparedSocketProcessActivity & {
+		auto socket_entry = prepared.socket_to_index.find(socket_id);
+		if (socket_entry != prepared.socket_to_index.end()) {
+			return prepared.sockets[socket_entry->second];
+		}
+		auto socket_index = prepared.sockets.size();
+		PreparedSocketProcessActivity socket;
+		socket.socket_id = socket_id;
+		prepared.sockets.push_back(std::move(socket));
+		prepared.socket_to_index.emplace(socket_id, socket_index);
+		return prepared.sockets[socket_index];
+	};
+	for (const auto &topology : activity.socket_topology) {
+		if (topology.socket_id < 0) {
+			continue;
+		}
+		find_or_create_socket(topology.socket_id).monitored_cpu_count = topology.monitored_cpu_count;
+	}
+	for (idx_t i = 0; i < activity.records.size(); i++) {
+		const auto &record = activity.records[i];
+		if (record.socket_id < 0 || record.runtime_ns == 0) {
+			continue;
+		}
+		auto &socket = find_or_create_socket(record.socket_id);
+		auto activity_weight = record.corrected_cycles * record.frequency_ratio;
+		socket.record_indices.push_back(i);
+		socket.runtime_weight_sum += static_cast<double>(record.runtime_ns);
+		if (record.kind != ProcessActivityKind::SYSTEM_IDLE) {
+			socket.has_non_idle_activity = true;
+			socket.corrected_weight_sum += record.pmu_valid && activity_weight > 0 ? activity_weight : 0;
+			socket.all_pmu_valid = socket.all_pmu_valid && record.pmu_valid && activity_weight > 0;
+		}
+	}
+}
+
+static const PreparedSocketProcessActivity *FindPreparedSocketActivity(const PreparedProcessActivity &prepared,
+                                                                       int socket_id) {
+	auto entry = prepared.socket_to_index.find(socket_id);
+	if (entry == prepared.socket_to_index.end()) {
+		return nullptr;
+	}
+	return &prepared.sockets[entry->second];
+}
+
+static void UpdateProcessProfile(ProcessEnergyProfileMap &profiles, const ProcessActivityRecord &record,
+                                 double active_energy_j, double base_energy_j) {
+	ProcessEnergyProfileKey key;
+	key.process_start_time_ns = record.process_start_time_ns;
+	key.tgid = record.tgid;
+	key.socket_id = record.socket_id;
+	key.kind = record.kind;
+	key.comm = record.comm;
+	auto &profile = profiles[key];
+	profile.process_start_time_ns = record.process_start_time_ns;
+	profile.tgid = record.tgid;
+	profile.socket_id = record.socket_id;
+	profile.kind = record.kind;
+	profile.comm = record.comm;
+	profile.sample_count++;
+	profile.runtime_ns += record.runtime_ns;
+	profile.cycles += record.cycles;
+	profile.ref_cycles += record.ref_cycles;
+	profile.corrected_cycles += record.corrected_cycles;
+	profile.active_energy_j += active_energy_j;
+	profile.base_energy_j += base_energy_j;
+}
+
+static void AttributeSegmentsByProcess(
+    vector<AttributedSegment> &segments, const ProcessActivityWindow &activity,
+    const PreparedSocketProcessActivity *prepared_socket, uint32_t duckdb_tgid, SocketEnergyWindow &window,
+    vector<AttributedProcessActivity> &process_rows, bool materialize_process_rows,
+    vector<DuckDBThreadShare> &thread_shares, std::unordered_map<int64_t, idx_t> &tid_to_thread,
+    vector<int32_t> &segment_thread_slots, ProcessEnergyProfileMap &process_profiles) {
+
+	process_rows.clear();
+	thread_shares.clear();
+	tid_to_thread.clear();
+	segment_thread_slots.assign(segments.size(), -1);
+	window.process_generation = activity.generation;
+	window.process_transition_ns = activity.transition_ns;
+	window.process_boundary_min_ns = activity.boundary_min_ns;
+	window.process_boundary_max_ns = activity.boundary_max_ns;
+	window.process_maximum_checkpoint_delay_ns = activity.maximum_checkpoint_delay_ns;
+	window.process_checkpoint_duration_ns = activity.checkpoint_duration_ns;
+	window.process_activity_map_insert_failure = activity.activity_map_insert_failure;
+	window.process_missing_counter = activity.missing_counter;
+	window.process_invalid_counter_delta = activity.invalid_counter_delta;
+	window.process_interrupt_underflow = activity.interrupt_underflow;
+	window.process_boundary_split_count = activity.boundary_split_count;
+	window.process_boundary_split_cpu_count = activity.boundary_split_cpu_count;
+	window.process_boundary_split_runtime_ns = activity.boundary_split_runtime_ns;
+	window.process_boundary_split_cycles = activity.boundary_split_cycles;
+	window.process_boundary_split_ref_cycles = activity.boundary_split_ref_cycles;
+	window.process_late_helper_count = activity.late_helper_count;
+	window.process_lost_records = activity.lost_records;
+	window.process_lookup_failures = activity.lookup_failures;
+	window.process_boundary_corrected = activity.boundary_corrected;
+	window.process_status = activity.status;
+
+	if (!prepared_socket || prepared_socket->record_indices.empty() || prepared_socket->runtime_weight_sum <= 0) {
+		window.process_attribution_valid = false;
+		if (window.process_status.empty() || window.process_status == "ok") {
+			window.process_status = "no_process_activity";
+		}
+		return;
+	}
+
+	auto idle_only = !prepared_socket->has_non_idle_activity;
+	auto use_time_fallback =
+	    !idle_only && (!prepared_socket->all_pmu_valid || prepared_socket->corrected_weight_sum <= 0);
+	auto weight_denominator = use_time_fallback || idle_only ? prepared_socket->runtime_weight_sum
+	                                                        : prepared_socket->corrected_weight_sum;
+	auto base_time_denominator = prepared_socket->runtime_weight_sum;
+	window.process_monitored_cpu_count = prepared_socket->monitored_cpu_count;
+	window.process_observed_runtime_ns =
+	    prepared_socket->runtime_weight_sum > 0
+	        ? static_cast<uint64_t>(std::llround(prepared_socket->runtime_weight_sum))
+	        : 0;
+	window.process_expected_runtime_ns =
+	    window.duration_s * static_cast<double>(prepared_socket->monitored_cpu_count) *
+	    static_cast<double>(NSEC_PER_SEC);
+	window.process_runtime_coverage =
+	    window.process_expected_runtime_ns > 0
+	        ? prepared_socket->runtime_weight_sum / window.process_expected_runtime_ns
+	        : 0;
+	auto runtime_coverage_valid = prepared_socket->monitored_cpu_count > 0 &&
+	                              window.process_runtime_coverage >= 0.98 &&
+	                              window.process_runtime_coverage <= 1.02;
+	if (materialize_process_rows) {
+		process_rows.reserve(prepared_socket->record_indices.size());
+	}
+	for (const auto record_index : prepared_socket->record_indices) {
+		const auto &record = activity.records[record_index];
+		auto activity_weight =
+		    use_time_fallback || idle_only
+		        ? static_cast<double>(record.runtime_ns)
+		        : (record.kind != ProcessActivityKind::SYSTEM_IDLE && record.pmu_valid
+		               ? record.corrected_cycles * record.frequency_ratio
+		               : 0);
+		auto attributed_active_energy_j =
+		    weight_denominator > 0 ? window.active_package_energy_j * activity_weight / weight_denominator : 0;
+		auto attributed_base_energy_j =
+		    base_time_denominator > 0
+		        ? window.base_energy_j * static_cast<double>(record.runtime_ns) / base_time_denominator
+		        : 0;
+		auto duckdb_process = record.tgid == duckdb_tgid;
+		window.process_attributed_active_energy_j += attributed_active_energy_j;
+		window.process_attributed_base_energy_j += attributed_base_energy_j;
+		if (duckdb_process) {
+			window.duckdb_process_active_energy_j += attributed_active_energy_j;
+			window.duckdb_process_base_energy_j += attributed_base_energy_j;
+		}
+		if (record.kind == ProcessActivityKind::MEASUREMENT_OVERHEAD) {
+			window.measurement_overhead_active_energy_j += attributed_active_energy_j;
+			window.measurement_overhead_base_energy_j += attributed_base_energy_j;
+		} else if (record.kind == ProcessActivityKind::HOST_IRQ) {
+			window.host_irq_active_energy_j += attributed_active_energy_j;
+			window.host_irq_base_energy_j += attributed_base_energy_j;
+		} else if (record.kind == ProcessActivityKind::HOST_KERNEL) {
+			window.host_kernel_active_energy_j += attributed_active_energy_j;
+			window.host_kernel_base_energy_j += attributed_base_energy_j;
+		} else if (record.kind == ProcessActivityKind::SYSTEM_IDLE) {
+			window.system_idle_active_energy_j += attributed_active_energy_j;
+			window.system_idle_base_energy_j += attributed_base_energy_j;
+		} else if (duckdb_process) {
+			auto tid = static_cast<int64_t>(record.tid);
+			auto thread_entry = tid_to_thread.find(tid);
+			idx_t thread_index;
+			if (thread_entry == tid_to_thread.end()) {
+				thread_index = thread_shares.size();
+				thread_shares.emplace_back();
+				tid_to_thread.emplace(tid, thread_index);
+			} else {
+				thread_index = thread_entry->second;
+			}
+			auto &thread = thread_shares[thread_index];
+			thread.active_energy_j += attributed_active_energy_j;
+			thread.base_energy_j += attributed_base_energy_j;
+			thread.runtime_ns += record.runtime_ns;
+			if (record.pmu_valid && record.frequency_ratio > 0) {
+				thread.corrected_cycles += record.corrected_cycles;
+				thread.corrected_ref_cycles += record.corrected_cycles / record.frequency_ratio;
+				thread.activity_weight += record.corrected_cycles * record.frequency_ratio;
+			}
+		} else {
+			window.external_process_active_energy_j += attributed_active_energy_j;
+			window.external_process_base_energy_j += attributed_base_energy_j;
+		}
+		UpdateProcessProfile(process_profiles, record, attributed_active_energy_j, attributed_base_energy_j);
+		if (materialize_process_rows) {
+			AttributedProcessActivity row;
+			row.record = record;
+			row.window_id = window.window_id;
+			row.activity_weight = activity_weight;
+			row.weight_denominator = weight_denominator;
+			row.attributed_active_energy_j = attributed_active_energy_j;
+			row.base_time_weight = static_cast<double>(record.runtime_ns);
+			row.base_time_denominator_ns = base_time_denominator;
+			row.attributed_base_energy_j = attributed_base_energy_j;
+			row.duckdb_process = duckdb_process;
+			process_rows.push_back(std::move(row));
+		}
+	}
+
+	for (idx_t i = 0; i < segments.size(); i++) {
+		auto &segment = segments[i];
+		if (segment.record.socket_id != window.socket_id) {
+			continue;
+		}
+		segment.attributed_active_energy_j = 0;
+		segment.attributed_base_energy_j = 0;
+		segment.base_time_weight = 0;
+		segment.base_time_denominator_s = 0;
+		segment.process_active_energy_j = 0;
+		segment.process_attribution_valid = false;
+		segment.process_frequency_ratio = 0;
+		segment.process_corrected_cycles = 0;
+		segment.process_counter_source.clear();
+		auto thread_entry = tid_to_thread.find(segment.record.linux_tid);
+		if (thread_entry == tid_to_thread.end()) {
+			continue;
+		}
+		auto thread_index = thread_entry->second;
+		auto &thread = thread_shares[thread_index];
+		auto reference_rate =
+		    thread.runtime_ns > 0 ? thread.corrected_ref_cycles / static_cast<double>(thread.runtime_ns) : 0;
+		auto thread_frequency_ratio =
+		    thread.corrected_ref_cycles > 0 ? thread.corrected_cycles / thread.corrected_ref_cycles : 0;
+		auto activity_rate =
+		    thread.runtime_ns > 0 ? thread.activity_weight / static_cast<double>(thread.runtime_ns) : 0;
+		if (segment.record.cycles > 0 && segment.record.ref_cycles > 0) {
+			segment.frequency_ratio = SegmentFrequencyRatio(segment.record);
+			segment.corrected_cycles = SegmentCorrectedCycles(segment.record);
+			segment.process_counter_source = "direct_segment_ref_cycles";
+			segment.attribution_status += "|direct_segment_ref_cycles";
+		} else if (segment.record.cycles > 0 && segment.record.task_clock_ns > 0 && reference_rate > 0) {
+			auto estimated_ref_cycles = reference_rate * static_cast<double>(segment.record.task_clock_ns);
+			segment.frequency_ratio =
+			    estimated_ref_cycles > 0 ? static_cast<double>(segment.record.cycles) / estimated_ref_cycles : 0;
+			segment.corrected_cycles = static_cast<double>(segment.record.cycles) * segment.frequency_ratio;
+			segment.process_counter_source = "process_ref_cycles_proxy";
+			segment.attribution_status += "|process_ref_cycles_proxy";
+		} else if (segment.record.task_clock_ns > 0 && activity_rate > 0) {
+			segment.frequency_ratio = thread_frequency_ratio;
+			segment.corrected_cycles = activity_rate * static_cast<double>(segment.record.task_clock_ns);
+			segment.process_counter_source = "process_activity_rate_fallback";
+			segment.attribution_status += "|process_activity_rate_fallback";
+		}
+		segment.process_frequency_ratio = segment.frequency_ratio;
+		segment.process_corrected_cycles = segment.corrected_cycles;
+		segment_thread_slots[i] = NumericCast<int32_t>(thread_index);
+		thread.segment_cycle_sum += segment.corrected_cycles;
+		thread.segment_task_clock_sum += segment.record.task_clock_ns;
+	}
+
+	for (idx_t thread_index = 0; thread_index < thread_shares.size(); thread_index++) {
+		auto &thread = thread_shares[thread_index];
+		if (thread.runtime_ns == 0 || thread.segment_task_clock_sum == 0) {
+			window.duckdb_uninstrumented_active_energy_j += thread.active_energy_j;
+			window.duckdb_uninstrumented_base_energy_j += thread.base_energy_j;
+			continue;
+		}
+		auto covered_task_clock = MinValue<uint64_t>(thread.runtime_ns, thread.segment_task_clock_sum);
+		auto coverage = static_cast<double>(covered_task_clock) / static_cast<double>(thread.runtime_ns);
+		auto covered_active_energy = thread.active_energy_j * coverage;
+		auto covered_base_energy = thread.base_energy_j * coverage;
+		window.duckdb_uninstrumented_active_energy_j += thread.active_energy_j - covered_active_energy;
+		window.duckdb_uninstrumented_base_energy_j += thread.base_energy_j - covered_base_energy;
+		auto use_segment_time = use_time_fallback || thread.segment_cycle_sum <= 0;
+		auto segment_denominator =
+		    use_segment_time ? static_cast<double>(thread.segment_task_clock_sum) : thread.segment_cycle_sum;
+		if (segment_denominator <= 0) {
+			window.duckdb_uninstrumented_active_energy_j += covered_active_energy;
+			window.duckdb_uninstrumented_base_energy_j += covered_base_energy;
+			continue;
+		}
+		thread.covered_active_energy_j = covered_active_energy;
+		thread.covered_base_energy_j = covered_base_energy;
+		thread.task_clock_coverage = coverage;
+		thread.segment_denominator = segment_denominator;
+		thread.use_segment_time = use_segment_time;
+	}
+	for (idx_t i = 0; i < segments.size(); i++) {
+		auto thread_slot = segment_thread_slots[i];
+		if (thread_slot < 0) {
+			continue;
+		}
+		auto thread_index = static_cast<idx_t>(thread_slot);
+		const auto &thread = thread_shares[thread_index];
+		if (thread.segment_denominator <= 0) {
+			continue;
+		}
+		auto &segment = segments[i];
+		auto use_segment_time = thread.use_segment_time;
+		auto segment_weight =
+		    use_segment_time ? static_cast<double>(segment.record.task_clock_ns) : segment.corrected_cycles;
+		segment.activity_weight = segment_weight;
+		segment.weight_denominator = thread.segment_denominator;
+		segment.task_clock_coverage = thread.task_clock_coverage;
+		segment.process_active_energy_j =
+		    thread.covered_active_energy_j * segment_weight / thread.segment_denominator;
+		segment.attributed_active_energy_j = segment.process_active_energy_j;
+		segment.base_time_weight =
+		    static_cast<double>(segment.record.task_clock_ns) / static_cast<double>(NSEC_PER_SEC);
+		segment.base_time_denominator_s =
+		    static_cast<double>(thread.segment_task_clock_sum) / static_cast<double>(NSEC_PER_SEC);
+		segment.attributed_base_energy_j =
+		    thread.segment_task_clock_sum > 0
+		        ? thread.covered_base_energy_j * static_cast<double>(segment.record.task_clock_ns) /
+		              static_cast<double>(thread.segment_task_clock_sum)
+		        : 0;
+		segment.process_attribution_valid = activity.valid && !use_time_fallback;
+		segment.attribution_status += use_segment_time ? "|process_task_clock_fallback" : "|process_corrected_cycles";
+		window.duckdb_instrumented_active_energy_j += segment.process_active_energy_j;
+		window.duckdb_instrumented_base_energy_j += segment.attributed_base_energy_j;
+	}
+	window.process_conservation_error_j =
+	    window.active_package_energy_j - window.process_attributed_active_energy_j;
+	window.process_base_conservation_error_j =
+	    window.base_energy_j - window.process_attributed_base_energy_j;
+	window.duckdb_hierarchy_error_j =
+	    window.duckdb_process_active_energy_j -
+	    (window.duckdb_instrumented_active_energy_j + window.duckdb_uninstrumented_active_energy_j +
+	     window.measurement_overhead_active_energy_j);
+	window.duckdb_base_hierarchy_error_j =
+	    window.duckdb_process_base_energy_j -
+	    (window.duckdb_instrumented_base_energy_j + window.duckdb_uninstrumented_base_energy_j +
+	     window.measurement_overhead_base_energy_j);
+	auto process_tolerance = std::max(1e-12, window.active_package_energy_j * 1e-9);
+	auto process_base_tolerance = std::max(1e-12, window.base_energy_j * 1e-9);
+	auto duckdb_tolerance = std::max(1e-12, window.duckdb_process_active_energy_j * 1e-9);
+	auto duckdb_base_tolerance = std::max(1e-12, window.duckdb_process_base_energy_j * 1e-9);
+	window.process_attribution_valid = window.rapl_valid && window.base_power_valid && activity.valid &&
+	                                   !use_time_fallback && runtime_coverage_valid &&
+	                                   std::abs(window.process_conservation_error_j) <= process_tolerance &&
+	                                   std::abs(window.process_base_conservation_error_j) <= process_base_tolerance &&
+	                                   std::abs(window.duckdb_hierarchy_error_j) <= duckdb_tolerance &&
+	                                   std::abs(window.duckdb_base_hierarchy_error_j) <= duckdb_base_tolerance;
+	if (use_time_fallback) {
+		window.process_status += "|socket_task_clock_fallback";
+	}
+	if (idle_only) {
+		window.process_status += "|socket_idle_active_residual";
+	}
+	if (!runtime_coverage_valid) {
+		window.process_status += "|socket_runtime_coverage_invalid";
+	}
+	if (std::abs(window.process_base_conservation_error_j) > process_base_tolerance) {
+		window.process_status += "|process_base_conservation_failed";
+	}
+	if (std::abs(window.duckdb_hierarchy_error_j) > duckdb_tolerance) {
+		window.process_status += "|duckdb_hierarchy_conservation_failed";
+	}
+	if (std::abs(window.duckdb_base_hierarchy_error_j) > duckdb_base_tolerance) {
+		window.process_status += "|duckdb_base_hierarchy_conservation_failed";
+	}
+	if (!window.rapl_valid || !window.base_power_valid) {
+		window.process_status += "|energy_input_invalid";
+	}
+	if (!window.process_attribution_valid) {
+		for (auto &segment : segments) {
+			if (segment.record.socket_id == window.socket_id) {
+				segment.process_attribution_valid = false;
+			}
+		}
+	}
+}
+
+static void CopyProcessDiagnostics(SocketEnergyWindow &target, const SocketEnergyWindow &source) {
+	target.process_attributed_active_energy_j = source.process_attributed_active_energy_j;
+	target.process_attributed_base_energy_j = source.process_attributed_base_energy_j;
+	target.process_conservation_error_j = source.process_conservation_error_j;
+	target.process_base_conservation_error_j = source.process_base_conservation_error_j;
+	target.duckdb_process_active_energy_j = source.duckdb_process_active_energy_j;
+	target.duckdb_process_base_energy_j = source.duckdb_process_base_energy_j;
+	target.external_process_active_energy_j = source.external_process_active_energy_j;
+	target.external_process_base_energy_j = source.external_process_base_energy_j;
+	target.host_kernel_active_energy_j = source.host_kernel_active_energy_j;
+	target.host_kernel_base_energy_j = source.host_kernel_base_energy_j;
+	target.host_irq_active_energy_j = source.host_irq_active_energy_j;
+	target.host_irq_base_energy_j = source.host_irq_base_energy_j;
+	target.system_idle_active_energy_j = source.system_idle_active_energy_j;
+	target.system_idle_base_energy_j = source.system_idle_base_energy_j;
+	target.measurement_overhead_active_energy_j = source.measurement_overhead_active_energy_j;
+	target.measurement_overhead_base_energy_j = source.measurement_overhead_base_energy_j;
+	target.duckdb_instrumented_active_energy_j = source.duckdb_instrumented_active_energy_j;
+	target.duckdb_instrumented_base_energy_j = source.duckdb_instrumented_base_energy_j;
+	target.duckdb_uninstrumented_active_energy_j = source.duckdb_uninstrumented_active_energy_j;
+	target.duckdb_uninstrumented_base_energy_j = source.duckdb_uninstrumented_base_energy_j;
+	target.duckdb_hierarchy_error_j = source.duckdb_hierarchy_error_j;
+	target.duckdb_base_hierarchy_error_j = source.duckdb_base_hierarchy_error_j;
+	target.process_monitored_cpu_count = source.process_monitored_cpu_count;
+	target.process_observed_runtime_ns = source.process_observed_runtime_ns;
+	target.process_expected_runtime_ns = source.process_expected_runtime_ns;
+	target.process_runtime_coverage = source.process_runtime_coverage;
+	target.process_generation = source.process_generation;
+	target.process_transition_ns = source.process_transition_ns;
+	target.process_boundary_min_ns = source.process_boundary_min_ns;
+	target.process_boundary_max_ns = source.process_boundary_max_ns;
+	target.process_maximum_checkpoint_delay_ns = source.process_maximum_checkpoint_delay_ns;
+	target.process_checkpoint_duration_ns = source.process_checkpoint_duration_ns;
+	target.process_activity_map_insert_failure = source.process_activity_map_insert_failure;
+	target.process_missing_counter = source.process_missing_counter;
+	target.process_invalid_counter_delta = source.process_invalid_counter_delta;
+	target.process_interrupt_underflow = source.process_interrupt_underflow;
+	target.process_boundary_split_count = source.process_boundary_split_count;
+	target.process_boundary_split_cpu_count = source.process_boundary_split_cpu_count;
+	target.process_boundary_split_runtime_ns = source.process_boundary_split_runtime_ns;
+	target.process_boundary_split_cycles = source.process_boundary_split_cycles;
+	target.process_boundary_split_ref_cycles = source.process_boundary_split_ref_cycles;
+	target.process_late_helper_count = source.process_late_helper_count;
+	target.process_lost_records = source.process_lost_records;
+	target.process_lookup_failures = source.process_lookup_failures;
+	target.process_boundary_corrected = source.process_boundary_corrected;
+	target.process_attribution_valid = source.process_attribution_valid;
+	target.process_status = source.process_status;
 }
 
 static string ProfileKey(const EnergySegmentRecord &record) {
@@ -2000,7 +2723,12 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 	       "input_corrected_cycles_per_row,energy_only_duration_s,energy_only_active_energy_j,"
 	       "energy_only_base_time_share_energy_j,energy_only_charged_energy_j,allocated_initialize_energy_j,"
 	       "allocated_prepare_finish_energy_j,allocated_finish_energy_j,allocated_lifecycle_energy_j,"
-	       "total_with_lifecycle_energy_j\n";
+	       "total_with_lifecycle_energy_j,allocated_initialize_active_energy_j,"
+	       "allocated_initialize_base_energy_j,allocated_prepare_finish_active_energy_j,"
+	       "allocated_prepare_finish_base_energy_j,allocated_finish_active_energy_j,"
+	       "allocated_finish_base_energy_j,allocated_lifecycle_active_energy_j,"
+	       "allocated_lifecycle_base_energy_j,total_with_lifecycle_active_energy_j,"
+	       "total_with_lifecycle_base_energy_j\n";
 	for (idx_t i = 0; i < profiles.size(); i++) {
 		const auto &p = profiles[i];
 		double total_throughput = p.total_duration_s > 0 ? p.total_input_rows / p.total_duration_s : 0;
@@ -2017,8 +2745,18 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 		double input_corrected_cycles_per_row =
 		    p.total_input_rows > 0 ? p.input_corrected_cycles / p.total_input_rows : 0;
 		double energy_only_charged_energy = p.energy_only_active_energy_j + p.energy_only_base_time_share_energy_j;
-		double allocated_lifecycle_energy = p.allocated_initialize_energy_j + p.allocated_prepare_finish_energy_j +
-		                                    p.allocated_finish_energy_j;
+		double allocated_initialize_energy =
+		    p.allocated_initialize_active_energy_j + p.allocated_initialize_base_energy_j;
+		double allocated_prepare_finish_energy =
+		    p.allocated_prepare_finish_active_energy_j + p.allocated_prepare_finish_base_energy_j;
+		double allocated_finish_energy = p.allocated_finish_active_energy_j + p.allocated_finish_base_energy_j;
+		double allocated_lifecycle_active_energy =
+		    p.allocated_initialize_active_energy_j + p.allocated_prepare_finish_active_energy_j +
+		    p.allocated_finish_active_energy_j;
+		double allocated_lifecycle_base_energy =
+		    p.allocated_initialize_base_energy_j + p.allocated_prepare_finish_base_energy_j +
+		    p.allocated_finish_base_energy_j;
+		double allocated_lifecycle_energy = allocated_lifecycle_active_energy + allocated_lifecycle_base_energy;
 		double elapsed_s =
 		    p.end_ns > p.start_ns ? static_cast<double>(p.end_ns - p.start_ns) / static_cast<double>(NSEC_PER_SEC) : 0;
 		out << p.query_id << ",";
@@ -2036,9 +2774,15 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 		    << charged_energy_per_row << "," << p.corrected_cycles << "," << corrected_cycles_per_row << ","
 		    << input_corrected_cycles_per_row << "," << p.energy_only_duration_s << "," << p.energy_only_active_energy_j
 		    << "," << p.energy_only_base_time_share_energy_j << "," << energy_only_charged_energy << ","
-		    << p.allocated_initialize_energy_j << "," << p.allocated_prepare_finish_energy_j << ","
-		    << p.allocated_finish_energy_j << "," << allocated_lifecycle_energy << ","
-		    << charged_total_energy + allocated_lifecycle_energy << "\n";
+		    << allocated_initialize_energy << "," << allocated_prepare_finish_energy << ","
+		    << allocated_finish_energy << "," << allocated_lifecycle_energy << ","
+		    << charged_total_energy + allocated_lifecycle_energy << ","
+		    << p.allocated_initialize_active_energy_j << "," << p.allocated_initialize_base_energy_j << ","
+		    << p.allocated_prepare_finish_active_energy_j << "," << p.allocated_prepare_finish_base_energy_j << ","
+		    << p.allocated_finish_active_energy_j << "," << p.allocated_finish_base_energy_j << ","
+		    << allocated_lifecycle_active_energy << "," << allocated_lifecycle_base_energy << ","
+		    << p.attributed_active_energy_j + allocated_lifecycle_active_energy << ","
+		    << p.base_time_share_energy_j + allocated_lifecycle_base_energy << "\n";
 	}
 }
 
@@ -2182,6 +2926,7 @@ static EnergySegmentRecord SliceSegmentRecord(const EnergySegmentRecord &record,
 	result.work_units = ScaleByFraction(record.work_units, fraction);
 	result.tuples = ScaleByFraction(record.tuples, fraction);
 	result.chunks = ScaleByFraction(record.chunks, fraction);
+	result.task_clock_ns = ScaleByFraction(record.task_clock_ns, fraction);
 	result.cycles = ScaleByFraction(record.cycles, fraction);
 	result.instructions = ScaleByFraction(record.instructions, fraction);
 	result.ref_cycles = ScaleByFraction(record.ref_cycles, fraction);
@@ -2288,9 +3033,12 @@ static void MergeEfficiencyAggregate(PipelineEfficiencyAggregate &target, const 
 	target.energy_only_duration_s += source.energy_only_duration_s;
 	target.energy_only_active_energy_j += source.energy_only_active_energy_j;
 	target.energy_only_base_time_share_energy_j += source.energy_only_base_time_share_energy_j;
-	target.allocated_initialize_energy_j += source.allocated_initialize_energy_j;
-	target.allocated_prepare_finish_energy_j += source.allocated_prepare_finish_energy_j;
-	target.allocated_finish_energy_j += source.allocated_finish_energy_j;
+	target.allocated_initialize_active_energy_j += source.allocated_initialize_active_energy_j;
+	target.allocated_initialize_base_energy_j += source.allocated_initialize_base_energy_j;
+	target.allocated_prepare_finish_active_energy_j += source.allocated_prepare_finish_active_energy_j;
+	target.allocated_prepare_finish_base_energy_j += source.allocated_prepare_finish_base_energy_j;
+	target.allocated_finish_active_energy_j += source.allocated_finish_active_energy_j;
+	target.allocated_finish_base_energy_j += source.allocated_finish_base_energy_j;
 }
 
 static bool AddLifecycleSegmentToProfile(LifecyclePhaseProfileAggregate &profile, const AttributedSegment &segment) {
@@ -2319,7 +3067,8 @@ static bool AddLifecycleSegmentToProfile(LifecyclePhaseProfileAggregate &profile
 }
 
 static void AddAllocatedLifecycleEnergy(PipelineEfficiencyAggregate &profile, const AttributedSegment &segment,
-                                        uint64_t pipeline_id, double allocated_energy_j) {
+                                        uint64_t pipeline_id, double allocated_active_energy_j,
+                                        double allocated_base_energy_j) {
 	if (profile.sample_count == 0 && profile.valid_input_sample_count == 0 && profile.energy_only_sample_count == 0) {
 		profile.query_id = segment.record.query_id;
 		profile.pipeline_id = pipeline_id;
@@ -2331,13 +3080,16 @@ static void AddAllocatedLifecycleEnergy(PipelineEfficiencyAggregate &profile, co
 	UpdateEfficiencyAggregateTimeRange(profile, segment.record.start_ns, segment.record.end_ns);
 	switch (segment.record.phase) {
 	case EnergySegmentPhase::INITIALIZE:
-		profile.allocated_initialize_energy_j += allocated_energy_j;
+		profile.allocated_initialize_active_energy_j += allocated_active_energy_j;
+		profile.allocated_initialize_base_energy_j += allocated_base_energy_j;
 		break;
 	case EnergySegmentPhase::PREPARE_FINISH:
-		profile.allocated_prepare_finish_energy_j += allocated_energy_j;
+		profile.allocated_prepare_finish_active_energy_j += allocated_active_energy_j;
+		profile.allocated_prepare_finish_base_energy_j += allocated_base_energy_j;
 		break;
 	case EnergySegmentPhase::FINISH:
-		profile.allocated_finish_energy_j += allocated_energy_j;
+		profile.allocated_finish_active_energy_j += allocated_active_energy_j;
+		profile.allocated_finish_base_energy_j += allocated_base_energy_j;
 		break;
 	case EnergySegmentPhase::INTERNAL:
 	case EnergySegmentPhase::EXECUTE:
@@ -2349,6 +3101,7 @@ static void AddAllocatedLifecycleEnergy(PipelineEfficiencyAggregate &profile, co
 struct PeriodicPendingWindow {
 	SocketEnergyWindow window;
 	vector<AttributedSegment> segments;
+	shared_ptr<ProcessActivityWindow> process_activity;
 };
 
 struct SchedulerWorkerRegistration {
@@ -2441,6 +3194,8 @@ struct PeriodicWorkerSegmentState {
 	PerfEventGroup perf_group;
 	string perf_profile;
 	bool perf_open = false;
+	bool perf_include_kernel = false;
+	bool perf_open_ref_cycles = true;
 	string perf_status = "not opened";
 	bool active = false;
 	bool in_active_worker_list = false;
@@ -2724,8 +3479,10 @@ private:
 		       lhs.migration_check_enabled == rhs.migration_check_enabled &&
 		       lhs.profile_update_enabled == rhs.profile_update_enabled &&
 		       lhs.periodic_enabled == rhs.periodic_enabled && lhs.period_ms == rhs.period_ms &&
+		       lhs.process_attribution_required == rhs.process_attribution_required &&
 		       lhs.output_dir == rhs.output_dir && lhs.base_power_path == rhs.base_power_path &&
-		       lhs.counter_profile == rhs.counter_profile && lhs.fail_policy == rhs.fail_policy;
+		       lhs.counter_profile == rhs.counter_profile && lhs.fail_policy == rhs.fail_policy &&
+		       lhs.attribution_model == rhs.attribution_model;
 	}
 
 	void StartLocked(DatabaseInstance &db, const EnergyAttributionSettings &settings_p) {
@@ -2739,10 +3496,14 @@ private:
 		running = true;
 		finalized_window_count = 0;
 		attributed_segment_count = 0;
+		process_window_count = 0;
+		process_valid_window_count = 0;
 		next_runtime_overhead_id.store(1, std::memory_order_relaxed);
 		total_active_conservation_error_j = 0;
 		total_base_conservation_error_j = 0;
 		total_package_gap_j = 0;
+		total_duckdb_hierarchy_error_j = 0;
+		total_duckdb_base_hierarchy_error_j = 0;
 		output_opened = false;
 		observed_query_activity.store(false, std::memory_order_relaxed);
 		queries.clear();
@@ -2759,15 +3520,27 @@ private:
 		scratch_worker_states.clear();
 		scratch_sampled_segments.clear();
 		scratch_closed_segments.clear();
-		scratch_queue_segments.clear();
-		scratch_queue_closed_segments.clear();
-		scratch_hardware_energy_observations.clear();
+			scratch_queue_segments.clear();
+			scratch_queue_closed_segments.clear();
+			scratch_process_rows.clear();
+			scratch_process_segments.clear();
+			scratch_legacy_segments.clear();
+			scratch_attribution_windows.clear();
+			scratch_hardware_energy_observations.clear();
+			scratch_prepared_process_activity.source = nullptr;
+			scratch_process_thread_shares.clear();
+			scratch_process_tid_to_thread.clear();
+			scratch_process_tid_to_thread.reserve(64);
+			scratch_segment_thread_slots.clear();
+			scratch_prepared_process_activity.socket_to_index.reserve(8);
 		scratch_rapl_snapshots.clear();
 		scratch_pipeline_profile_updates.clear();
 		scratch_query_profile_updates.clear();
 		for (auto &entry : scratch_pending_windows_by_socket) {
 			entry.second.clear();
 		}
+		scratch_segment_counts_by_socket.clear();
+		scratch_segment_counts_by_socket.reserve(8);
 		scratch_remaining_segment_records.clear();
 		{
 			lock_guard<mutex> active_guard(active_worker_lock);
@@ -2783,6 +3556,8 @@ private:
 		lifecycle_phase_profiles.clear();
 		query_profiles.clear();
 		system_energy_profiles.clear();
+		process_energy_profiles.clear();
+		process_energy_profiles.reserve(512);
 		runtime_overhead.clear();
 		base_power_entries.clear();
 		base_power_loaded = false;
@@ -2792,6 +3567,24 @@ private:
 		uncore_freq_by_socket = BuildQueryUncoreFrequencyCache(true);
 		auto base_dir = settings.output_dir.empty() ? string(DEFAULT_OUTPUT_DIR) : settings.output_dir;
 		output_dir = base_dir + "/" + StringUtil::Format("periodic_run_%llu", run_start_ns);
+		process_collector.reset();
+		process_collector_status = "legacy";
+		if (settings.attribution_model != "legacy") {
+			process_collector = ProcessActivityCollector::Create();
+			if (!process_collector || !process_collector->Start(settings.process_attribution_required)) {
+				process_collector_status =
+				    process_collector ? process_collector->LastError() : "process attribution was not compiled";
+				process_collector.reset();
+				if (settings.attribution_model == "process" || settings.process_attribution_required) {
+					running = false;
+					stop_requested = false;
+					throw InvalidInputException("Process energy attribution is unavailable: %s",
+					                            process_collector_status);
+				}
+			} else {
+				process_collector_status = "ok";
+			}
+		}
 		runtime_generation.fetch_add(1, std::memory_order_acq_rel);
 		runtime_active.store(true, std::memory_order_release);
 		worker = std::thread([this]() { Run(); });
@@ -2834,15 +3627,24 @@ private:
 				scratch_worker_states.clear();
 				scratch_sampled_segments.clear();
 				scratch_closed_segments.clear();
-				scratch_queue_segments.clear();
-				scratch_queue_closed_segments.clear();
-				scratch_hardware_energy_observations.clear();
+					scratch_queue_segments.clear();
+					scratch_queue_closed_segments.clear();
+					scratch_process_rows.clear();
+					scratch_process_segments.clear();
+					scratch_legacy_segments.clear();
+					scratch_attribution_windows.clear();
+					scratch_hardware_energy_observations.clear();
+					scratch_prepared_process_activity.source = nullptr;
+					scratch_process_thread_shares.clear();
+					scratch_process_tid_to_thread.clear();
+					scratch_segment_thread_slots.clear();
 				scratch_rapl_snapshots.clear();
 				scratch_pipeline_profile_updates.clear();
 				scratch_query_profile_updates.clear();
 				for (auto &entry : scratch_pending_windows_by_socket) {
 					entry.second.clear();
 				}
+				scratch_segment_counts_by_socket.clear();
 				scratch_remaining_segment_records.clear();
 				{
 					lock_guard<mutex> active_guard(active_worker_lock);
@@ -2854,6 +3656,10 @@ private:
 					active_worker_states.clear();
 				}
 				worker_segment_states.clear();
+				if (process_collector) {
+					process_collector->Stop();
+					process_collector.reset();
+				}
 				active_db = nullptr;
 				running = false;
 				runtime_active.store(false, std::memory_order_release);
@@ -3022,7 +3828,12 @@ private:
 			snapshot.status = "perf disabled";
 			return snapshot;
 		}
-		if (worker_state.perf_open && worker_state.perf_profile == segment_settings.counter_profile) {
+		auto process_counter_mode = segment_settings.attribution_model != "legacy";
+		auto include_kernel = process_counter_mode;
+		auto open_ref_cycles = !process_counter_mode;
+		if (worker_state.perf_open && worker_state.perf_profile == segment_settings.counter_profile &&
+		    worker_state.perf_include_kernel == include_kernel &&
+		    worker_state.perf_open_ref_cycles == open_ref_cycles) {
 			return worker_state.perf_group.ReadSnapshot();
 		}
 		if (worker_state.perf_open) {
@@ -3030,7 +3841,10 @@ private:
 			worker_state.perf_open = false;
 		}
 		worker_state.perf_profile = segment_settings.counter_profile;
-		worker_state.perf_open = worker_state.perf_group.Open(worker_state.linux_tid, segment_settings.counter_profile);
+		worker_state.perf_include_kernel = include_kernel;
+		worker_state.perf_open_ref_cycles = open_ref_cycles;
+		worker_state.perf_open = worker_state.perf_group.Open(
+		    worker_state.linux_tid, segment_settings.counter_profile, include_kernel, open_ref_cycles);
 		worker_state.perf_status =
 		    worker_state.perf_open ? segment_settings.counter_profile : worker_state.perf_group.ReadSnapshot().status;
 		if (!worker_state.perf_open) {
@@ -3229,6 +4043,7 @@ private:
 			scratch_remaining_segment_records.clear();
 			scratch_remaining_segment_records.reserve(records.size());
 		}
+		ReservePendingWindowSegmentCapacityLocked(records);
 		for (idx_t i = 0; i < records.size(); i++) {
 			auto &record = records[i];
 			auto added = AddSegmentToPendingWindowsLocked(record);
@@ -3258,13 +4073,36 @@ private:
 		auto detail_overhead = DetailOverhead(&overhead);
 		InitializeRuntimeOverhead(overhead, "periodic_sample", wall_start_ns);
 		auto now_ns = TimestampNs();
+		shared_ptr<ProcessActivityWindow> process_activity;
 		if (settings.rapl_enabled) {
 			auto phase_start_ns = TimestampNs();
-			rapl.Read(scratch_rapl_snapshots);
+			if (process_collector && process_collector->Available()) {
+				scratch_rapl_before.clear();
+				scratch_rapl_after.clear();
+				auto before_ns = TimestampNs();
+				rapl.Read(scratch_rapl_before);
+				auto maximum_skew_ns =
+				    MinValue<uint64_t>(5000000, MaxValue<uint64_t>(100000, period_ms * 100000));
+				auto boundary_lead_ns =
+				    MinValue<uint64_t>(1000000, MaxValue<uint64_t>(100000, period_ms * 10000));
+				auto transition_ns = TimestampNs() + boundary_lead_ns;
+				auto captured = process_collector->RotateWindow(transition_ns, maximum_skew_ns);
+				auto after_ns = TimestampNs();
+				rapl.Read(scratch_rapl_after);
+				auto boundary_ns = captured.transition_ns > before_ns && captured.transition_ns <= after_ns
+				                       ? captured.transition_ns
+				                       : transition_ns;
+				scratch_rapl_snapshots =
+				    InterpolateRaplSnapshots(scratch_rapl_before, scratch_rapl_after, before_ns, after_ns, boundary_ns);
+				now_ns = boundary_ns;
+				process_activity = make_shared_ptr<ProcessActivityWindow>(std::move(captured));
+			} else {
+				rapl.Read(scratch_rapl_snapshots);
+			}
 			overhead.rapl_read_ns += DurationNs(TimestampNs(), phase_start_ns);
 			auto windows_before = pending_windows.size();
 			phase_start_ns = TimestampNs();
-			CreateWindowsLocked(scratch_rapl_snapshots, now_ns);
+			CreateWindowsLocked(scratch_rapl_snapshots, now_ns, process_activity);
 			overhead.create_windows_ns += DurationNs(TimestampNs(), phase_start_ns);
 			overhead.windows_created += pending_windows.size() - windows_before;
 			last_rapl = scratch_rapl_snapshots;
@@ -3337,7 +4175,8 @@ private:
 		FinishRuntimeOverhead(overhead, cpu_start_ns);
 	}
 
-	void CreateWindowsLocked(const vector<RaplSnapshot> &current_rapl, uint64_t now_ns) {
+	void CreateWindowsLocked(const vector<RaplSnapshot> &current_rapl, uint64_t now_ns,
+	                         const shared_ptr<ProcessActivityWindow> &process_activity) {
 		if (last_rapl.empty() || now_ns <= last_sample_ns) {
 			return;
 		}
@@ -3365,6 +4204,7 @@ private:
 			auto uncore_entry = uncore_freq_by_socket.find(window.socket_id);
 			window.uncore_freq_hz = uncore_entry == uncore_freq_by_socket.end() ? 0 : uncore_entry->second;
 			window.status = window.rapl_valid ? "ok" : "rapl_unavailable";
+			pending.process_activity = process_activity;
 			pending_windows.push_back(std::move(pending));
 		}
 		pending_window_count.store(pending_windows.size(), std::memory_order_relaxed);
@@ -3410,7 +4250,29 @@ private:
 		}
 	}
 
-	idx_t AddSegmentToPendingWindowsLocked(const EnergySegmentRecord &record) {
+	void ReservePendingWindowSegmentCapacityLocked(const vector<EnergySegmentRecord> &records) {
+		scratch_segment_counts_by_socket.clear();
+		for (idx_t i = 0; i < records.size(); i++) {
+			const auto &record = records[i];
+			if (record.end_ns <= record.start_ns || record.socket_id < 0) {
+				continue;
+			}
+			scratch_segment_counts_by_socket[record.socket_id]++;
+		}
+		for (const auto &entry : scratch_segment_counts_by_socket) {
+			auto socket_entry = scratch_pending_windows_by_socket.find(entry.first);
+			if (socket_entry == scratch_pending_windows_by_socket.end()) {
+				continue;
+			}
+			for (auto pending_ptr : socket_entry->second) {
+				if (pending_ptr) {
+					pending_ptr->segments.reserve(pending_ptr->segments.size() + entry.second);
+				}
+			}
+		}
+	}
+
+	idx_t AddSegmentToPendingWindowsLocked(EnergySegmentRecord &record) {
 		if (record.end_ns <= record.start_ns || record.socket_id < 0) {
 			return 0;
 		}
@@ -3420,6 +4282,19 @@ private:
 		}
 		idx_t added = 0;
 		auto &socket_windows = socket_entry->second;
+		if (socket_windows.size() == 1 && socket_windows[0]) {
+			auto &pending = *socket_windows[0];
+			auto &window = pending.window;
+			if (record.start_ns >= window.start_ns && record.end_ns <= window.end_ns) {
+				AttributedSegment attributed;
+				attributed.window_id = window.window_id;
+				attributed.slice_start_ns = record.start_ns;
+				attributed.slice_end_ns = record.end_ns;
+				attributed.record = std::move(record);
+				pending.segments.push_back(std::move(attributed));
+				return 1;
+			}
+		}
 		for (idx_t i = 0; i < socket_windows.size(); i++) {
 			auto pending_ptr = socket_windows[i];
 			if (!pending_ptr) {
@@ -3485,21 +4360,31 @@ private:
 		(void)force;
 		// Periodic sampling creates closed slices for active segments, so old query-buffer open segments do not gate
 		// window finalization.
+		scratch_prepared_process_activity.source = nullptr;
 		while (!pending_windows.empty()) {
 			auto &pending = pending_windows.front();
-			FinalizeWindowLocked(pending, overhead);
+			const PreparedSocketProcessActivity *prepared_socket = nullptr;
+			if (pending.process_activity) {
+				if (scratch_prepared_process_activity.source != pending.process_activity.get()) {
+					PrepareProcessActivity(*pending.process_activity, scratch_prepared_process_activity);
+				}
+				prepared_socket =
+				    FindPreparedSocketActivity(scratch_prepared_process_activity, pending.window.socket_id);
+			}
+			FinalizeWindowLocked(pending, prepared_socket, overhead);
 			pending_windows.pop_front();
 		}
 		pending_window_count.store(pending_windows.size(), std::memory_order_relaxed);
 	}
 
-	void FinalizeWindowLocked(PeriodicPendingWindow &pending, PeriodicRuntimeOverheadRecord *overhead = nullptr) {
+	void FinalizeWindowLocked(PeriodicPendingWindow &pending, const PreparedSocketProcessActivity *prepared_socket,
+	                          PeriodicRuntimeOverheadRecord *overhead = nullptr) {
 		auto &window = pending.window;
 		if (!pending.segments.empty()) {
-			window.core_freq_hz = AverageCoreFreqForSocket(pending.segments, window.socket_id);
-			auto segment_uncore = AverageUncoreFreqForSocket(pending.segments, window.socket_id);
-			if (segment_uncore > 0) {
-				window.uncore_freq_hz = segment_uncore;
+			auto frequencies = AverageFrequenciesForSocket(pending.segments, window.socket_id);
+			window.core_freq_hz = frequencies.core_hz;
+			if (frequencies.uncore_hz > 0) {
+				window.uncore_freq_hz = frequencies.uncore_hz;
 			}
 		}
 		if (window.uncore_freq_hz <= 0) {
@@ -3508,7 +4393,12 @@ private:
 		double base_power_w = 0;
 		window.base_power_valid = LookupBasePower(base_power_entries, window.socket_id, window.core_freq_hz,
 		                                          window.uncore_freq_hz, 0, base_power_w);
-		window.base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
+		window.modeled_base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
+		window.base_energy_j = window.rapl_valid
+		                           ? MinValue<double>(window.modeled_base_energy_j, window.package_energy_j)
+		                           : window.modeled_base_energy_j;
+		window.base_model_excess_energy_j =
+		    MaxValue<double>(0, window.modeled_base_energy_j - window.base_energy_j);
 		window.total_base_energy_j = window.base_energy_j;
 		window.active_package_energy_j = std::max(0.0, window.package_energy_j - window.base_energy_j);
 		if (!window.rapl_valid) {
@@ -3518,14 +4408,143 @@ private:
 		} else {
 			window.status = "ok";
 		}
-		vector<SocketEnergyWindow> one_window;
-		one_window.push_back(window);
 		auto phase_start_ns = TimestampNs();
-		AttributeSegments(pending.segments, one_window);
+		auto authoritative_process = settings.attribution_model == "process";
+		auto retain_legacy_shadow = authoritative_process && settings.debug_export_enabled;
+		bool legacy_result_available = false;
+		SocketEnergyWindow legacy_window;
+		if (authoritative_process) {
+			PrepareSegmentsForAttribution(pending.segments);
+			if (retain_legacy_shadow) {
+				scratch_legacy_segments = pending.segments;
+				scratch_attribution_windows.clear();
+				scratch_attribution_windows.push_back(window);
+				AttributeSegments(scratch_legacy_segments, scratch_attribution_windows);
+				legacy_window = scratch_attribution_windows[0];
+				legacy_result_available = true;
+				for (idx_t i = 0; i < pending.segments.size(); i++) {
+					pending.segments[i].legacy_active_energy_j =
+					    scratch_legacy_segments[i].attributed_active_energy_j;
+				}
+				window = legacy_window;
+			}
+		} else {
+			scratch_attribution_windows.clear();
+			scratch_attribution_windows.push_back(window);
+			AttributeSegments(pending.segments, scratch_attribution_windows);
+			window = scratch_attribution_windows[0];
+			for (auto &segment : pending.segments) {
+				segment.legacy_active_energy_j = segment.attributed_active_energy_j;
+			}
+		}
+		window.attribution_model = settings.attribution_model;
+		scratch_process_rows.clear();
+		bool process_profile_valid = !authoritative_process;
+		if (pending.process_activity && process_collector) {
+			auto process_window = window;
+			process_window.process_attributed_active_energy_j = 0;
+			process_window.process_attributed_base_energy_j = 0;
+			process_window.process_conservation_error_j = 0;
+			process_window.process_base_conservation_error_j = 0;
+			process_window.duckdb_process_active_energy_j = 0;
+			process_window.duckdb_process_base_energy_j = 0;
+			process_window.external_process_active_energy_j = 0;
+			process_window.external_process_base_energy_j = 0;
+			process_window.host_kernel_active_energy_j = 0;
+			process_window.host_kernel_base_energy_j = 0;
+			process_window.host_irq_active_energy_j = 0;
+			process_window.host_irq_base_energy_j = 0;
+			process_window.system_idle_active_energy_j = 0;
+			process_window.system_idle_base_energy_j = 0;
+			process_window.measurement_overhead_active_energy_j = 0;
+			process_window.measurement_overhead_base_energy_j = 0;
+			process_window.duckdb_instrumented_active_energy_j = 0;
+			process_window.duckdb_instrumented_base_energy_j = 0;
+			process_window.duckdb_uninstrumented_active_energy_j = 0;
+			process_window.duckdb_uninstrumented_base_energy_j = 0;
+			process_window.duckdb_hierarchy_error_j = 0;
+			process_window.duckdb_base_hierarchy_error_j = 0;
+			auto process_segments = &pending.segments;
+			if (!authoritative_process) {
+				scratch_process_segments = pending.segments;
+				process_segments = &scratch_process_segments;
+			}
+			auto materialize_process_rows = settings.export_enabled && settings.debug_export_enabled &&
+			                                observed_query_activity.load(std::memory_order_acquire);
+			AttributeSegmentsByProcess(
+			    *process_segments, *pending.process_activity, prepared_socket, process_collector->DuckDBProcessID(),
+			    process_window, scratch_process_rows, materialize_process_rows, scratch_process_thread_shares,
+			    scratch_process_tid_to_thread, scratch_segment_thread_slots, process_energy_profiles);
+			CopyProcessDiagnostics(window, process_window);
+			process_window_count++;
+			if (process_window.process_attribution_valid) {
+				process_valid_window_count++;
+			}
+			total_duckdb_hierarchy_error_j += process_window.duckdb_hierarchy_error_j;
+			total_duckdb_base_hierarchy_error_j += process_window.duckdb_base_hierarchy_error_j;
+			if (!authoritative_process) {
+				for (idx_t i = 0; i < pending.segments.size(); i++) {
+					pending.segments[i].process_active_energy_j = (*process_segments)[i].process_active_energy_j;
+					pending.segments[i].task_clock_coverage = (*process_segments)[i].task_clock_coverage;
+					pending.segments[i].process_attribution_valid =
+					    (*process_segments)[i].process_attribution_valid;
+					pending.segments[i].process_frequency_ratio = (*process_segments)[i].process_frequency_ratio;
+					pending.segments[i].process_corrected_cycles = (*process_segments)[i].process_corrected_cycles;
+					pending.segments[i].process_counter_source = (*process_segments)[i].process_counter_source;
+				}
+			}
+			if (authoritative_process && process_window.process_attribution_valid) {
+				process_profile_valid = true;
+				window.summed_attributed_active_energy_j = window.process_attributed_active_energy_j;
+				window.active_conservation_error_j = window.process_conservation_error_j;
+				window.summed_attributed_base_energy_j = window.process_attributed_base_energy_j;
+				window.base_conservation_error_j = window.process_base_conservation_error_j;
+			} else if (authoritative_process) {
+				if (!legacy_result_available) {
+					scratch_legacy_segments = pending.segments;
+					scratch_attribution_windows.clear();
+					scratch_attribution_windows.push_back(window);
+					scratch_attribution_windows[0].summed_attributed_active_energy_j = 0;
+					scratch_attribution_windows[0].active_conservation_error_j = 0;
+					scratch_attribution_windows[0].summed_attributed_base_energy_j = 0;
+					scratch_attribution_windows[0].base_conservation_error_j = 0;
+					AttributeSegments(scratch_legacy_segments, scratch_attribution_windows);
+					legacy_window = scratch_attribution_windows[0];
+				}
+				for (idx_t i = 0; i < scratch_legacy_segments.size(); i++) {
+					auto &legacy_segment = scratch_legacy_segments[i];
+					const auto &process_segment = pending.segments[i];
+					legacy_segment.legacy_active_energy_j = legacy_segment.attributed_active_energy_j;
+					legacy_segment.process_active_energy_j = process_segment.process_active_energy_j;
+					legacy_segment.task_clock_coverage = process_segment.task_clock_coverage;
+					legacy_segment.process_attribution_valid = process_segment.process_attribution_valid;
+					legacy_segment.process_frequency_ratio = process_segment.process_frequency_ratio;
+					legacy_segment.process_corrected_cycles = process_segment.process_corrected_cycles;
+					legacy_segment.process_counter_source = process_segment.process_counter_source;
+				}
+				pending.segments.swap(scratch_legacy_segments);
+				window = legacy_window;
+				window.attribution_model = settings.attribution_model;
+				CopyProcessDiagnostics(window, process_window);
+				window.status += "|process_window_invalid";
+			}
+		} else if (settings.attribution_model != "legacy") {
+			if (authoritative_process) {
+				scratch_attribution_windows.clear();
+				scratch_attribution_windows.push_back(window);
+				AttributeSegments(pending.segments, scratch_attribution_windows);
+				window = scratch_attribution_windows[0];
+				for (auto &segment : pending.segments) {
+					segment.legacy_active_energy_j = segment.attributed_active_energy_j;
+				}
+				window.attribution_model = settings.attribution_model;
+			}
+			window.process_status = process_collector_status;
+			window.status += "|process_backend_unavailable";
+		}
 		if (overhead) {
 			overhead->attribute_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
 		}
-		window = one_window[0];
 		finalized_window_count++;
 		attributed_segment_count += pending.segments.size();
 		if (overhead) {
@@ -3537,7 +4556,24 @@ private:
 		total_package_gap_j += window.package_energy_j -
 		                       (window.summed_attributed_active_energy_j + window.summed_attributed_base_energy_j);
 		phase_start_ns = TimestampNs();
-		UpdateProfilesLocked(pending.segments);
+		if (process_profile_valid) {
+			UpdateProfilesLocked(pending.segments);
+			if (settings.attribution_model == "process") {
+				auto &uninstrumented = system_energy_profiles[EnergySystemCategory::DUCKDB_UNINSTRUMENTED];
+				uninstrumented.category = EnergySystemCategory::DUCKDB_UNINSTRUMENTED;
+				uninstrumented.sample_count++;
+				uninstrumented.duration_s += window.duration_s;
+				uninstrumented.attributed_active_energy_j += window.duckdb_uninstrumented_active_energy_j;
+				uninstrumented.base_time_share_energy_j += window.duckdb_uninstrumented_base_energy_j;
+				auto &sampler = system_energy_profiles[EnergySystemCategory::ENERGY_SAMPLER];
+				sampler.category = EnergySystemCategory::ENERGY_SAMPLER;
+				sampler.sample_count++;
+				sampler.duration_s += static_cast<double>(window.process_checkpoint_duration_ns) /
+				                      static_cast<double>(NSEC_PER_SEC);
+				sampler.attributed_active_energy_j += window.measurement_overhead_active_energy_j;
+				sampler.base_time_share_energy_j += window.measurement_overhead_base_energy_j;
+			}
+		}
 		if (overhead) {
 			overhead->profile_update_ns += DurationNs(TimestampNs(), phase_start_ns);
 		}
@@ -3547,6 +4583,7 @@ private:
 			OpenOutputFilesIfNeededLocked();
 			AppendWindowLocked(window);
 			AppendSegmentsLocked(pending.segments);
+			AppendProcessRowsLocked(scratch_process_rows);
 			if (overhead) {
 				overhead->csv_append_ns += DurationNs(TimestampNs(), phase_start_ns);
 			}
@@ -3598,13 +4635,17 @@ private:
 			if (!AddLifecycleSegmentToProfile(lifecycle_phase_profiles[lifecycle_key], segment)) {
 				continue;
 			}
-			auto charged_energy = segment.attributed_active_energy_j + segment.attributed_base_energy_j;
 			auto member_count = static_cast<double>(segment.record.lifecycle_member_pipeline_ids.size());
-			auto allocated_energy = member_count > 0 ? charged_energy / member_count : charged_energy;
+			auto allocated_active_energy =
+			    member_count > 0 ? segment.attributed_active_energy_j / member_count
+			                     : segment.attributed_active_energy_j;
+			auto allocated_base_energy =
+			    member_count > 0 ? segment.attributed_base_energy_j / member_count
+			                     : segment.attributed_base_energy_j;
 			for (auto member_pipeline_id : segment.record.lifecycle_member_pipeline_ids) {
 				auto member_key = BuildPeriodicPipelineProfileKeyForPipeline(segment.record, member_pipeline_id);
 				AddAllocatedLifecycleEnergy(pipeline_profiles[member_key], segment, member_pipeline_id,
-				                            allocated_energy);
+				                            allocated_active_energy, allocated_base_energy);
 			}
 		}
 	}
@@ -3625,19 +4666,50 @@ private:
 	void OpenOutputFilesLocked() {
 		window_out.open((output_dir + "/period_socket_energy_windows.csv").c_str());
 		segment_out.open((output_dir + "/period_attributed_segments.csv").c_str());
+		process_out.open((output_dir + "/period_process_activity_windows.csv").c_str());
 		window_out << "window_id,socket_id,start_ns,end_ns,duration_s,rapl_start_uj,rapl_end_uj,package_energy_j,"
 		              "core_freq_hz,uncore_freq_hz,base_energy_j,active_package_energy_j,"
 		              "summed_attributed_active_energy_j,active_conservation_error_j,summed_attributed_base_energy_j,"
 		              "base_conservation_error_j,summed_charged_energy_j,package_conservation_error_j,rapl_valid,"
 		              "base_power_valid,used_time_fallback,status,segment_count,total_base_energy_j,busy_wall_time_s,"
-		              "idle_gap_wall_time_s,busy_base_energy_j,idle_gap_base_energy_j\n";
+		              "idle_gap_wall_time_s,busy_base_energy_j,idle_gap_base_energy_j,attribution_model,"
+		              "process_generation,process_transition_ns,process_boundary_min_ns,process_boundary_max_ns,"
+		              "process_maximum_checkpoint_delay_ns,process_checkpoint_duration_ns,"
+		              "process_activity_map_insert_failure,process_missing_counter,"
+		              "process_invalid_counter_delta,process_interrupt_underflow,"
+		              "process_boundary_split_count,process_boundary_split_cpu_count,"
+		              "process_boundary_split_runtime_ns,process_boundary_split_cycles,"
+		              "process_boundary_split_ref_cycles,process_late_helper_count,process_boundary_corrected,"
+		              "process_lost_records,process_lookup_failures,"
+		              "process_attribution_valid,process_status,process_attributed_active_energy_j,"
+		              "process_conservation_error_j,duckdb_process_active_energy_j,"
+		              "external_process_active_energy_j,host_kernel_active_energy_j,host_irq_active_energy_j,"
+		              "measurement_overhead_active_energy_j,duckdb_instrumented_active_energy_j,"
+		              "duckdb_uninstrumented_active_energy_j,duckdb_hierarchy_error_j,"
+		              "modeled_base_energy_j,base_model_excess_energy_j,process_attributed_base_energy_j,"
+		              "process_base_conservation_error_j,duckdb_process_base_energy_j,"
+		              "external_process_base_energy_j,host_kernel_base_energy_j,host_irq_base_energy_j,"
+		              "system_idle_active_energy_j,system_idle_base_energy_j,"
+		              "measurement_overhead_base_energy_j,duckdb_instrumented_base_energy_j,"
+		              "duckdb_uninstrumented_base_energy_j,duckdb_base_hierarchy_error_j,"
+		              "process_monitored_cpu_count,process_observed_runtime_ns,process_expected_runtime_ns,"
+		              "process_runtime_coverage\n";
 		segment_out << "window_id,segment_id,query_id,pipeline_id,pipeline_signature,phase_kind,system_category,"
 		               "lifecycle_group_id,"
-		               "owner_pipeline_id,lifecycle_member_count,socket_id,physical_core_id,logical_cpu_id,"
+		               "owner_pipeline_id,lifecycle_member_count,socket_id,physical_core_id,logical_cpu_id,linux_tid,"
 		               "slice_start_ns,slice_end_ns,duration_s,work_units,frequency_ratio,"
 		               "corrected_cycles,activity_weight,weight_denominator,attributed_active_energy_j,"
 		               "base_time_weight,base_time_denominator_s,attributed_base_energy_j,charged_total_energy_j,"
-		               "throughput,corrected_cycles_per_work,active_power_w,charged_power_w,attribution_status\n";
+		               "throughput,corrected_cycles_per_work,active_power_w,charged_power_w,task_clock_ns,"
+		               "task_clock_coverage,legacy_active_energy_j,process_active_energy_j,"
+		               "process_attribution_valid,counter_status,attribution_status,"
+		               "process_frequency_ratio,process_corrected_cycles,process_counter_source\n";
+		process_out << "window_id,generation,process_start_time_ns,tgid,tid,socket_id,kind,comm,runtime_ns,"
+		               "cycles,ref_cycles,time_enabled_ns,time_running_ns,ref_time_enabled_ns,ref_time_running_ns,"
+		               "pmu_running_ratio,ref_pmu_running_ratio,pmu_valid,"
+		               "corrected_cycles,frequency_ratio,activity_weight,weight_denominator,"
+		               "attributed_active_energy_j,duckdb_process,base_time_weight,"
+		               "base_time_denominator_ns,attributed_base_energy_j,charged_total_energy_j\n";
 		output_opened = true;
 	}
 
@@ -3664,7 +4736,32 @@ private:
 		           << "," << w.rapl_valid << "," << w.base_power_valid << "," << w.used_time_fallback << ","
 		           << CsvEscape(w.status) << "," << w.segment_count << "," << w.total_base_energy_j << ","
 		           << w.busy_wall_time_s << "," << w.idle_gap_wall_time_s << "," << w.busy_base_energy_j << ","
-		           << w.idle_gap_base_energy_j << "\n";
+		           << w.idle_gap_base_energy_j << "," << CsvEscape(w.attribution_model) << ","
+		           << w.process_generation << "," << w.process_transition_ns << "," << w.process_boundary_min_ns
+		           << "," << w.process_boundary_max_ns << "," << w.process_maximum_checkpoint_delay_ns << ","
+		           << w.process_checkpoint_duration_ns << "," << w.process_activity_map_insert_failure << ","
+		           << w.process_missing_counter << "," << w.process_invalid_counter_delta << ","
+		           << w.process_interrupt_underflow << "," << w.process_boundary_split_count << ","
+		           << w.process_boundary_split_cpu_count << "," << w.process_boundary_split_runtime_ns << ","
+		           << w.process_boundary_split_cycles << "," << w.process_boundary_split_ref_cycles << ","
+		           << w.process_late_helper_count << "," << w.process_boundary_corrected << ","
+		           << w.process_lost_records << "," << w.process_lookup_failures << ","
+		           << w.process_attribution_valid << ","
+		           << CsvEscape(w.process_status) << "," << w.process_attributed_active_energy_j << ","
+		           << w.process_conservation_error_j << "," << w.duckdb_process_active_energy_j << ","
+		           << w.external_process_active_energy_j << "," << w.host_kernel_active_energy_j << ","
+		           << w.host_irq_active_energy_j << "," << w.measurement_overhead_active_energy_j << ","
+		           << w.duckdb_instrumented_active_energy_j << "," << w.duckdb_uninstrumented_active_energy_j << ","
+		           << w.duckdb_hierarchy_error_j << "," << w.modeled_base_energy_j << ","
+		           << w.base_model_excess_energy_j << "," << w.process_attributed_base_energy_j << ","
+		           << w.process_base_conservation_error_j << "," << w.duckdb_process_base_energy_j << ","
+		           << w.external_process_base_energy_j << "," << w.host_kernel_base_energy_j << ","
+		           << w.host_irq_base_energy_j << "," << w.system_idle_active_energy_j << ","
+		           << w.system_idle_base_energy_j << "," << w.measurement_overhead_base_energy_j << ","
+		           << w.duckdb_instrumented_base_energy_j << "," << w.duckdb_uninstrumented_base_energy_j << ","
+		           << w.duckdb_base_hierarchy_error_j << "," << w.process_monitored_cpu_count << ","
+		           << w.process_observed_runtime_ns << "," << w.process_expected_runtime_ns << ","
+		           << w.process_runtime_coverage << "\n";
 	}
 
 	void AppendSegmentsLocked(const vector<AttributedSegment> &segments) {
@@ -3686,13 +4783,75 @@ private:
 			            << s.record.lifecycle_group_id << ","
 			            << s.record.owner_pipeline_id << "," << s.record.lifecycle_member_count << ","
 			            << s.record.socket_id << "," << s.record.physical_core_id << "," << s.record.logical_cpu_id
+			            << "," << s.record.linux_tid
 			            << "," << s.slice_start_ns << "," << s.slice_end_ns << "," << duration << ","
 			            << s.record.work_units << "," << s.frequency_ratio << "," << s.corrected_cycles << ","
 			            << s.activity_weight << "," << s.weight_denominator << "," << s.attributed_active_energy_j
 			            << "," << s.base_time_weight << "," << s.base_time_denominator_s << ","
 			            << s.attributed_base_energy_j << "," << charged_total_energy << "," << s.throughput << ","
 			            << cycles_per_work << "," << active_power << "," << charged_power << ","
-			            << CsvEscape(s.attribution_status) << "\n";
+			            << s.record.task_clock_ns << "," << s.task_clock_coverage << "," << s.legacy_active_energy_j
+			            << "," << s.process_active_energy_j << "," << s.process_attribution_valid << ","
+			            << CsvEscape(s.record.counter_status) << "," << CsvEscape(s.attribution_status) << ","
+			            << s.process_frequency_ratio << "," << s.process_corrected_cycles << ","
+			            << CsvEscape(s.process_counter_source) << "\n";
+		}
+	}
+
+	void AppendProcessRowsLocked(const vector<AttributedProcessActivity> &rows) {
+		if (!process_out.good()) {
+			return;
+		}
+		for (const auto &row : rows) {
+			process_out << row.window_id << "," << row.record.generation << ","
+			            << row.record.process_start_time_ns << "," << row.record.tgid << "," << row.record.tid << ","
+			            << row.record.socket_id << "," << ProcessActivityKindToString(row.record.kind) << ","
+			            << CsvEscape(row.record.comm) << "," << row.record.runtime_ns << "," << row.record.cycles
+			            << "," << row.record.ref_cycles << "," << row.record.time_enabled_ns << ","
+			            << row.record.time_running_ns << "," << row.record.ref_time_enabled_ns << ","
+			            << row.record.ref_time_running_ns << "," << row.record.pmu_running_ratio << ","
+			            << row.record.ref_pmu_running_ratio << "," << row.record.pmu_valid << ","
+			            << row.record.corrected_cycles << ","
+			            << row.record.frequency_ratio << "," << row.activity_weight << "," << row.weight_denominator
+			            << "," << row.attributed_active_energy_j << "," << row.duckdb_process << ","
+			            << row.base_time_weight << "," << row.base_time_denominator_ns << ","
+			            << row.attributed_base_energy_j << ","
+			            << row.attributed_active_energy_j + row.attributed_base_energy_j << "\n";
+		}
+	}
+
+	void WriteProcessEnergyProfilesLocked() {
+		std::ofstream out((output_dir + "/period_process_energy_profiles.csv").c_str());
+		out << "process_start_time_ns,tgid,socket_id,kind,comm,sample_count,runtime_ns,cycles,ref_cycles,"
+		       "corrected_cycles,active_energy_j,base_energy_j,charged_total_energy_j\n";
+		vector<const ProcessEnergyAggregate *> sorted_profiles;
+		sorted_profiles.reserve(process_energy_profiles.size());
+		for (const auto &entry : process_energy_profiles) {
+			sorted_profiles.push_back(&entry.second);
+		}
+		std::sort(sorted_profiles.begin(), sorted_profiles.end(),
+		          [](const ProcessEnergyAggregate *lhs, const ProcessEnergyAggregate *rhs) {
+			          if (lhs->process_start_time_ns != rhs->process_start_time_ns) {
+				          return lhs->process_start_time_ns < rhs->process_start_time_ns;
+			          }
+			          if (lhs->tgid != rhs->tgid) {
+				          return lhs->tgid < rhs->tgid;
+			          }
+			          if (lhs->socket_id != rhs->socket_id) {
+				          return lhs->socket_id < rhs->socket_id;
+			          }
+			          if (lhs->kind != rhs->kind) {
+				          return lhs->kind < rhs->kind;
+			          }
+			          return lhs->comm < rhs->comm;
+		          });
+		for (const auto profile_ptr : sorted_profiles) {
+			const auto &profile = *profile_ptr;
+			out << profile.process_start_time_ns << "," << profile.tgid << "," << profile.socket_id << ","
+			    << ProcessActivityKindToString(profile.kind) << "," << CsvEscape(profile.comm) << ","
+			    << profile.sample_count << "," << profile.runtime_ns << "," << profile.cycles << ","
+			    << profile.ref_cycles << "," << profile.corrected_cycles << "," << profile.active_energy_j << ","
+			    << profile.base_energy_j << "," << profile.active_energy_j + profile.base_energy_j << "\n";
 		}
 	}
 
@@ -3711,12 +4870,17 @@ private:
 		if (output_opened) {
 			window_out.flush();
 			segment_out.flush();
+			process_out.flush();
 		}
 		vector<PipelineEfficiencyAggregate> pipeline_result;
 		for (auto entry = pipeline_profiles.begin(); entry != pipeline_profiles.end(); ++entry) {
-			auto allocated_lifecycle_energy = entry->second.allocated_initialize_energy_j +
-			                                  entry->second.allocated_prepare_finish_energy_j +
-			                                  entry->second.allocated_finish_energy_j;
+			auto allocated_lifecycle_energy =
+			    entry->second.allocated_initialize_active_energy_j +
+			    entry->second.allocated_initialize_base_energy_j +
+			    entry->second.allocated_prepare_finish_active_energy_j +
+			    entry->second.allocated_prepare_finish_base_energy_j +
+			    entry->second.allocated_finish_active_energy_j +
+			    entry->second.allocated_finish_base_energy_j;
 			if (entry->second.sample_count > 0 || entry->second.valid_input_sample_count > 0 ||
 			    allocated_lifecycle_energy > 0) {
 				pipeline_result.push_back(entry->second);
@@ -3776,6 +4940,7 @@ private:
 		WriteLifecyclePhaseProfilesCSV(output_dir + "/period_lifecycle_phase_profiles.csv", lifecycle_result);
 		WriteLifecycleGroupMembersCSV(output_dir + "/period_lifecycle_group_members.csv", lifecycle_result);
 		WriteSystemEnergyProfilesCSV(output_dir + "/period_system_energy_profiles.csv", system_energy_profiles);
+		WriteProcessEnergyProfilesLocked();
 		if (settings.closed_segments_export_enabled) {
 			WriteClosedSegmentsCSV(output_dir + "/period_closed_segments.csv", closed_segment_records);
 		}
@@ -3872,6 +5037,20 @@ private:
 		out << "  \"system_attributed_base_energy_j\": " << system_base_energy_j << ",\n";
 		out << "  \"base_power_loaded\": " << (base_power_loaded ? "true" : "false") << ",\n";
 		out << "  \"period_ms\": " << period_ms << ",\n";
+		out << "  \"attribution_model\": \"" << settings.attribution_model << "\",\n";
+		out << "  \"process_collector_compiled\": "
+		    << (ProcessActivityCollector::IsCompiled() ? "true" : "false") << ",\n";
+		out << "  \"process_collector_status\": \"" << process_collector_status << "\",\n";
+		out << "  \"process_window_count\": " << process_window_count << ",\n";
+		out << "  \"process_valid_window_count\": " << process_valid_window_count << ",\n";
+		out << "  \"process_valid_window_fraction\": "
+		    << (process_window_count == 0
+		            ? 0
+		            : static_cast<double>(process_valid_window_count) / static_cast<double>(process_window_count))
+		    << ",\n";
+		out << "  \"duckdb_hierarchy_conservation_error_j\": " << total_duckdb_hierarchy_error_j << ",\n";
+		out << "  \"duckdb_base_hierarchy_conservation_error_j\": "
+		    << total_duckdb_base_hierarchy_error_j << ",\n";
 		out << "  \"debug_export_enabled\": " << (settings.debug_export_enabled ? "true" : "false") << ",\n";
 		out << "  \"closed_segments_export_enabled\": " << (settings.closed_segments_export_enabled ? "true" : "false")
 		    << ",\n";
@@ -3903,6 +5082,9 @@ private:
 		}
 		if (segment_out.is_open()) {
 			segment_out.close();
+		}
+		if (process_out.is_open()) {
+			process_out.close();
 		}
 	}
 
@@ -3944,13 +5126,24 @@ private:
 	vector<EnergySegmentRecord> scratch_closed_segments;
 	vector<EnergySegmentRecord> scratch_queue_segments;
 	vector<EnergySegmentRecord> scratch_queue_closed_segments;
+	vector<AttributedProcessActivity> scratch_process_rows;
+	vector<AttributedSegment> scratch_process_segments;
+	vector<AttributedSegment> scratch_legacy_segments;
+	vector<SocketEnergyWindow> scratch_attribution_windows;
 	vector<PendingHardwareEnergyObservation> scratch_hardware_energy_observations;
+	PreparedProcessActivity scratch_prepared_process_activity;
+	vector<DuckDBThreadShare> scratch_process_thread_shares;
+	std::unordered_map<int64_t, idx_t> scratch_process_tid_to_thread;
+	vector<int32_t> scratch_segment_thread_slots;
 	vector<RaplSnapshot> scratch_rapl_snapshots;
+	vector<RaplSnapshot> scratch_rapl_before;
+	vector<RaplSnapshot> scratch_rapl_after;
 	std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
 	    scratch_pipeline_profile_updates;
 	std::unordered_map<uint64_t, PipelineEfficiencyAggregate> scratch_query_profile_updates;
 	std::deque<PeriodicPendingWindow> pending_windows;
 	std::unordered_map<int, vector<PeriodicPendingWindow *>> scratch_pending_windows_by_socket;
+	std::unordered_map<int, idx_t> scratch_segment_counts_by_socket;
 	std::atomic<idx_t> pending_window_count {0};
 	vector<EnergySegmentRecord> pending_segment_records;
 	vector<EnergySegmentRecord> scratch_remaining_segment_records;
@@ -3961,14 +5154,22 @@ private:
 	    lifecycle_phase_profiles;
 	std::unordered_map<uint64_t, PipelineEfficiencyAggregate> query_profiles;
 	std::map<EnergySystemCategory, SystemEnergyAggregate> system_energy_profiles;
+	ProcessEnergyProfileMap process_energy_profiles;
+	unique_ptr<ProcessActivityCollector> process_collector;
+	string process_collector_status = "legacy";
 	vector<PeriodicRuntimeOverheadRecord> runtime_overhead;
 	std::ofstream window_out;
 	std::ofstream segment_out;
+	std::ofstream process_out;
 	idx_t finalized_window_count = 0;
 	idx_t attributed_segment_count = 0;
+	idx_t process_window_count = 0;
+	idx_t process_valid_window_count = 0;
 	double total_active_conservation_error_j = 0;
 	double total_base_conservation_error_j = 0;
 	double total_package_gap_j = 0;
+	double total_duckdb_hierarchy_error_j = 0;
+	double total_duckdb_base_hierarchy_error_j = 0;
 };
 
 } // namespace
@@ -4020,6 +5221,8 @@ const char *EnergySystemCategoryToString(EnergySystemCategory category) {
 		return "STRIDE_SCHEDULER";
 	case EnergySystemCategory::ENERGY_SAMPLER:
 		return "ENERGY_SAMPLER";
+	case EnergySystemCategory::DUCKDB_UNINSTRUMENTED:
+		return "DUCKDB_UNINSTRUMENTED";
 	case EnergySystemCategory::NONE:
 	default:
 		return "NONE";

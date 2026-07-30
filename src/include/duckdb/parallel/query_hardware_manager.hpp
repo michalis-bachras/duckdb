@@ -37,6 +37,26 @@ struct QueryHardwareManagerSnapshot {
 	idx_t physical_core_domains = 0;
 	idx_t socket_domains = 0;
 	uint64_t msr_write_count = 0;
+	uint64_t core_msr_write_count = 0;
+	uint64_t uncore_msr_write_count = 0;
+	uint64_t publish_call_count = 0;
+	uint64_t worker_target_update_count = 0;
+	uint64_t worker_target_noop_count = 0;
+	uint64_t worker_assignment_count = 0;
+	uint64_t worker_release_count = 0;
+	uint64_t worker_retarget_count = 0;
+	uint64_t worker_lease_handoff_count = 0;
+	uint64_t core_transition_count = 0;
+	uint64_t uncore_transition_count = 0;
+	uint64_t target_plan_lock_wait_ns = 0;
+	uint64_t manager_lock_wait_ns = 0;
+	uint64_t target_update_wall_ns = 0;
+	uint64_t target_update_thread_cpu_ns = 0;
+	uint64_t target_update_max_wall_ns = 0;
+	uint64_t hardware_apply_wall_ns = 0;
+	uint64_t hardware_apply_thread_cpu_ns = 0;
+	uint64_t hardware_apply_max_wall_ns = 0;
+	uint64_t transition_trace_dropped_count = 0;
 	uint64_t verification_failure_count = 0;
 	uint64_t restoration_attempt_count = 0;
 	uint64_t restoration_verified_count = 0;
@@ -44,6 +64,46 @@ struct QueryHardwareManagerSnapshot {
 	bool power_model_loaded = false;
 	string status;
 	string restoration_status;
+};
+
+struct QueryHardwareTransitionContext {
+	uint64_t db_query_id = 0;
+	uint64_t request_id = 0;
+	uint64_t pipeline_generation = 0;
+	uint64_t lease_generation = 0;
+	idx_t pipeline_id = 0;
+	bool mandatory = false;
+	bool optional = false;
+	bool trace_enabled = false;
+};
+
+struct QueryHardwareTransitionSnapshot {
+	uint64_t timestamp_ns = 0;
+	uint64_t plan_generation = 0;
+	uint64_t db_query_id = 0;
+	uint64_t request_id = 0;
+	uint64_t pipeline_generation = 0;
+	uint64_t lease_generation = 0;
+	idx_t pipeline_id = 0;
+	idx_t worker_id = 0;
+	int logical_cpu = -1;
+	int socket_id = -1;
+	int physical_core_id = -1;
+	string action;
+	bool mandatory = false;
+	bool optional = false;
+	bool previous_assigned = false;
+	bool assigned = false;
+	QueryRequestHardwareConfiguration previous_hardware;
+	QueryRequestHardwareConfiguration requested_hardware;
+	QueryRequestHardwareConfiguration applied_before;
+	QueryRequestHardwareConfiguration applied_after;
+	bool core_changed = false;
+	bool uncore_changed = false;
+	uint64_t msr_write_delta = 0;
+	uint64_t target_plan_lock_wait_ns = 0;
+	uint64_t update_wall_ns = 0;
+	uint64_t update_thread_cpu_ns = 0;
 };
 
 struct QueryHardwareWorkerTopology {
@@ -94,7 +154,7 @@ public:
 	void Deactivate();
 	void PublishTargets(std::shared_ptr<const QueryHardwareTargetPlan> plan);
 	void UpdateWorkerTarget(idx_t worker_id, const QueryRequestHardwareConfiguration &hardware, bool assigned,
-	                        uint64_t generation);
+	                        uint64_t generation, const QueryHardwareTransitionContext &context = {});
 	bool IsWorkerAtConfiguration(idx_t worker_id, const QueryRequestHardwareConfiguration &hardware) const;
 	QueryRequestHardwareConfiguration GetAppliedConfigurationForCPU(int logical_cpu) const;
 	QueryHardwareWorkerDomainContext GetDomainContextExcludingWorker(idx_t worker_id) const;
@@ -106,6 +166,8 @@ public:
 	vector<QueryHardwareWorkerTopology> GetWorkerTopology() const;
 	QueryHardwarePowerModelSnapshot GetPowerModelSnapshot() const;
 	QueryHardwareManagerSnapshot GetSnapshot() const;
+	vector<QueryHardwareTransitionSnapshot> GetTransitionTrace() const;
+	uint64_t TransitionTraceDroppedCount() const;
 
 private:
 	DatabaseInstance &db;

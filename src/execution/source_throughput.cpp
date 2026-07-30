@@ -10,6 +10,8 @@
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/execution/pipeline_continuation.hpp"
 
+#include <cmath>
+
 namespace duckdb {
 
 const char *SourceThroughputKindToString(SourceThroughputKind kind) {
@@ -189,6 +191,8 @@ const char *PipelineThroughputEstimateLevelToString(PipelineThroughputEstimateLe
 		return "global_compatible";
 	case PipelineThroughputEstimateLevel::SCALE_FACTOR:
 		return "scale_factor";
+	case PipelineThroughputEstimateLevel::CONTINUATION_FALLBACK:
+		return "continuation_fallback";
 	default:
 		return "none";
 	}
@@ -233,6 +237,42 @@ const char *ContinuationEstimateKindToString(ContinuationEstimateKind kind) {
 	default:
 		return "invalid";
 	}
+}
+
+PipelineThroughputEstimate
+DerivePipelineThroughputFromContinuation(const PipelineContinuationEstimate &continuation, idx_t planned_work_units) {
+	PipelineThroughputEstimate result;
+	if (!continuation.valid || planned_work_units == 0) {
+		return result;
+	}
+	auto conservative_duration_ns = MaxValue<double>(continuation.mean, continuation.p90);
+	if (!std::isfinite(conservative_duration_ns) || conservative_duration_ns <= 0) {
+		return result;
+	}
+	double work_units;
+	switch (continuation.kind) {
+	case ContinuationEstimateKind::NS_PER_WORK_UNIT:
+		work_units = 1;
+		break;
+	case ContinuationEstimateKind::RAW_LATENCY_NS:
+		work_units = static_cast<double>(planned_work_units);
+		break;
+	default:
+		return result;
+	}
+	auto safe_rate = work_units * 1000000000.0 / conservative_duration_ns;
+	auto mean_duration_ns =
+	    std::isfinite(continuation.mean) && continuation.mean > 0 ? continuation.mean : conservative_duration_ns;
+	auto mean_rate = work_units * 1000000000.0 / mean_duration_ns;
+	if (!std::isfinite(safe_rate) || safe_rate <= 0 || !std::isfinite(mean_rate) || mean_rate <= 0) {
+		return result;
+	}
+	result.valid = true;
+	result.level = PipelineThroughputEstimateLevel::CONTINUATION_FALLBACK;
+	result.sample_count = continuation.sample_count;
+	result.mean_work_units_per_s = mean_rate;
+	result.ewma_work_units_per_s = safe_rate;
+	return result;
 }
 
 idx_t SourceThroughputCounters::EstimateStandardChunks(idx_t tuples) {

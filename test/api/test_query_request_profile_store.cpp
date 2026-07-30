@@ -5,7 +5,9 @@
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/query_pipeline_debug.hpp"
+#include "duckdb/parallel/query_hardware_manager.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "test_helpers.hpp"
 
 #include <chrono>
@@ -157,14 +159,18 @@ TEST_CASE("Pipeline hardware profiles require stable exact-pair observations", "
 	REQUIRE(estimate.mature);
 	REQUIRE(estimate.throughput_sample_count == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
 	REQUIRE(estimate.power_sample_count == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
+	REQUIRE(estimate.base_power_sample_count == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
 	REQUIRE(estimate.rejected_unstable_samples == 1);
 	REQUIRE(estimate.safe_work_units_per_s > 0);
 	REQUIRE(estimate.safe_work_units_per_s <= estimate.ewma_work_units_per_s);
 	REQUIRE(estimate.safe_work_units_per_s <= estimate.p10_work_units_per_s);
 	REQUIRE(estimate.mean_active_power_w > 0);
 	REQUIRE(estimate.ewma_active_power_w > 0);
+	REQUIRE(estimate.mean_base_power_w > 0);
+	REQUIRE(estimate.ewma_base_power_w > 0);
 	REQUIRE(estimate.mean_charged_power_w > 0);
-	REQUIRE(estimate.mean_charged_power_w > estimate.mean_active_power_w);
+	REQUIRE(estimate.mean_charged_power_w ==
+	        Approx(estimate.mean_active_power_w + estimate.mean_base_power_w));
 	REQUIRE(estimate.safe_throughput_per_active_watt > 0);
 	REQUIRE(estimate.profile_version == 2 * PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
 	REQUIRE(store.GetPipelineHardwareProfileGeneration() ==
@@ -186,8 +192,8 @@ TEST_CASE("Pipeline hardware profiles are exposed through the debug SQL surface"
 	}
 	Connection con(db);
 	auto result = con.Query(
-	    "SELECT mature, throughput_sample_count, power_sample_count, safe_work_units_per_s, "
-	    "ewma_active_power_w, safe_throughput_per_active_watt FROM "
+	    "SELECT mature, throughput_sample_count, power_sample_count, base_power_sample_count, "
+	    "safe_work_units_per_s, ewma_active_power_w, ewma_base_power_w, safe_throughput_per_active_watt FROM "
 	    "duckdb_debug_query_request_pipeline_hardware_profiles() WHERE template_id=19 AND scale_factor=10 "
 	    "AND core_frequency_khz=2200000 AND uncore_frequency_khz=1800000");
 	REQUIRE(!result->HasError());
@@ -195,9 +201,33 @@ TEST_CASE("Pipeline hardware profiles are exposed through the debug SQL surface"
 	REQUIRE(result->GetValue(0, 0).GetValue<bool>());
 	REQUIRE(result->GetValue(1, 0).GetValue<uint64_t>() == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
 	REQUIRE(result->GetValue(2, 0).GetValue<uint64_t>() == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
-	REQUIRE(result->GetValue(3, 0).GetValue<double>() > 0);
+	REQUIRE(result->GetValue(3, 0).GetValue<uint64_t>() == PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES);
 	REQUIRE(result->GetValue(4, 0).GetValue<double>() > 0);
 	REQUIRE(result->GetValue(5, 0).GetValue<double>() > 0);
+	REQUIRE(result->GetValue(6, 0).GetValue<double>() > 0);
+	REQUIRE(result->GetValue(7, 0).GetValue<double>() > 0);
+}
+
+TEST_CASE("Pipeline normalized EDP remains based on active power", "[api][sla_energy]") {
+	QueryRequestProfileStore store;
+	auto identity = PipelineIdentity(PipelineProfile(1000));
+	QueryRequestHardwareConfiguration low_base;
+	low_base.core_frequency_khz = 2200000;
+	low_base.uncore_frequency_khz = 1800000;
+	QueryRequestHardwareConfiguration high_base;
+	high_base.core_frequency_khz = 2600000;
+	high_base.uncore_frequency_khz = 2200000;
+	for (idx_t i = 0; i < PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES; i++) {
+		store.RecordPipelineHardwareThroughput(20, 10, identity, low_base, 10, 1000000, true);
+		store.RecordPipelineHardwareEnergy(20, 10, identity, low_base, 1000000, 0.001, 0.0005, true);
+		store.RecordPipelineHardwareThroughput(20, 10, identity, high_base, 10, 1000000, true);
+		store.RecordPipelineHardwareEnergy(20, 10, identity, high_base, 1000000, 0.001, 0.005, true);
+	}
+	auto profiles = store.GetPipelineHardwareProfiles(20, 10, identity);
+	REQUIRE(profiles.size() == 2);
+	REQUIRE(profiles[0].normalized_edp == Approx(profiles[1].normalized_edp));
+	REQUIRE(profiles[0].mean_active_power_w == Approx(profiles[1].mean_active_power_w));
+	REQUIRE(profiles[0].mean_base_power_w != Approx(profiles[1].mean_base_power_w));
 }
 
 TEST_CASE("Query request profile store aggregates direct observations", "[api]") {
@@ -1096,7 +1126,7 @@ TEST_CASE("SLA energy scheduler executes a trained tagged query in dry-run hardw
 	for (idx_t i = 0; i < 4; i++) {
 		REQUIRE_NO_FAIL(con.Query(MetadataQuery(9150 + i, 97, 10, body)));
 	}
-	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=5"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_scheduler_epoch_ms=1"));
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_hardware_control_enable=false"));
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_exploration_enable=false"));
 	REQUIRE_NO_FAIL(con.Query("SET pin_threads='on'"));
@@ -1105,15 +1135,32 @@ TEST_CASE("SLA energy scheduler executes a trained tagged query in dry-run hardw
 	scheduler.ClearEpochTrace();
 	REQUIRE_NO_FAIL(con.Query(MetadataQueryWithDeadlineOffset(9160, 97, 10, 1.0, 1000000000ULL, body)));
 
+	bool saw_energy_epoch = false;
+	for (const auto &epoch : scheduler.GetEpochTrace()) {
+		if (epoch.request_id != 9160) {
+			continue;
+		}
+		saw_energy_epoch = true;
+		REQUIRE(epoch.scheduler_policy == "sla_energy");
+		REQUIRE(epoch.energy_logical_plan_match);
+		REQUIRE(epoch.mandatory_workers == epoch.reference_mandatory_workers);
+		REQUIRE(epoch.optional_workers == epoch.reference_optional_workers);
+	}
+	REQUIRE(saw_energy_epoch);
 	auto epochs = con.Query(
 	    "SELECT count(*) FROM duckdb_debug_query_sla_scheduler_epochs() WHERE request_id=9160 "
-	    "AND scheduler_policy='sla_energy' AND planned_workers=assigned_workers "
+	    "AND scheduler_policy='sla_energy' AND energy_logical_plan_match");
+	REQUIRE(!epochs->HasError());
+	REQUIRE(epochs->GetValue(0, 0).GetValue<int64_t>() > 0);
+	auto modeled_epochs = con.Query(
+	    "SELECT count(*) FROM duckdb_debug_query_sla_scheduler_epochs() WHERE request_id=9160 "
+	    "AND scheduler_policy='sla_energy' "
 	    "AND predicted_service_rate>0 AND predicted_epoch_energy_j>=0 "
 	    "AND energy_mandatory_target_sla_cost>=0 AND energy_mandatory_target_optional_risk>=0 "
 	    "AND energy_mandatory_reference_safe_throughput>=0 "
 	    "AND energy_mandatory_preferred_normalized_edp>=0");
-	REQUIRE(!epochs->HasError());
-	REQUIRE(epochs->GetValue(0, 0).GetValue<int64_t>() > 0);
+	REQUIRE(!modeled_epochs->HasError());
+	REQUIRE(modeled_epochs->GetValue(0, 0).GetValue<int64_t>() > 0);
 	auto workers = con.Query(
 	    "SELECT count(*) FROM duckdb_debug_query_sla_energy_worker_epochs() WHERE request_id=9160 "
 	    "AND (mandatory OR optional) AND preferred_core_khz>0 AND preferred_uncore_khz>0 "
@@ -1133,6 +1180,11 @@ TEST_CASE("SLA energy scheduler executes a trained tagged query in dry-run hardw
 	REQUIRE(manager->GetValue(2, 0).GetValue<uint64_t>() == 4);
 	REQUIRE(manager->GetValue(3, 0).GetValue<uint64_t>() == 0);
 	REQUIRE(manager->GetValue(4, 0).ToString() == "active_dry_run");
+	auto hardware_snapshot = scheduler.GetHardwareManager().GetSnapshot();
+	INFO("worker_assignment_count=" << hardware_snapshot.worker_assignment_count
+	                                << " worker_release_count=" << hardware_snapshot.worker_release_count);
+	REQUIRE(hardware_snapshot.worker_release_count <= 16);
+	REQUIRE(hardware_snapshot.worker_lease_handoff_count == 0);
 	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='default'"));
 	auto restored = con.Query(
 	    "SELECT active, restoration_attempt_count, restoration_verified_count, restoration_failure_count, "
@@ -1417,6 +1469,168 @@ TEST_CASE("SLA scheduler coordinates concurrent trained queries within demand ca
 	REQUIRE(per_query_bounds_valid);
 	REQUIRE(global_budget_valid);
 	REQUIRE(db.instance->GetQuerySLAScheduler().GetSnapshot().empty());
+}
+
+TEST_CASE("SLA scheduler releases task assignments before workers park", "[api][sla]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(setup.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_residual_policy='park'"));
+	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE sla_assignment_tail_t AS "
+	                            "SELECT i, i % 1009 AS g FROM range(3000000) tbl(i)"));
+
+	const string body = "SELECT g, count(*), sum(i) FROM sla_assignment_tail_t GROUP BY g ORDER BY g";
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE_NO_FAIL(setup.Query(MetadataQuery(9500 + i, 97, 10, body)));
+	}
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_scheduler_epoch_ms=5"));
+	REQUIRE_NO_FAIL(setup.Query("SET scheduler_policy='sla'"));
+
+	static constexpr idx_t QUERY_COUNT = 8;
+	atomic<bool> start(false);
+	atomic<idx_t> completed(0);
+	mutex error_lock;
+	std::vector<string> errors;
+	std::vector<thread> query_threads;
+	for (idx_t query_idx = 0; query_idx < QUERY_COUNT; query_idx++) {
+		query_threads.emplace_back([&, query_idx]() {
+			Connection con(db);
+			auto activation = con.Query("SET query_activation_scheduler_enable=true");
+			auto debug = con.Query("SET query_activation_debug_enable=true");
+			if (activation->HasError() || debug->HasError()) {
+				lock_guard<mutex> guard(error_lock);
+				errors.push_back(activation->HasError() ? activation->GetError() : debug->GetError());
+				completed++;
+				return;
+			}
+			while (!start.load()) {
+				this_thread::yield();
+			}
+			auto result = con.Query(MetadataQueryWithDeadlineOffset(9600 + query_idx, 97, 10, 1.0, 2000000000ULL,
+			                                                       body));
+			if (result->HasError()) {
+				lock_guard<mutex> guard(error_lock);
+				errors.push_back(result->GetError());
+			}
+			completed++;
+		});
+	}
+	start = true;
+
+	auto timeout = chrono::steady_clock::now() + chrono::seconds(20);
+	while (completed.load() < QUERY_COUNT && chrono::steady_clock::now() < timeout) {
+		this_thread::sleep_for(chrono::milliseconds(1));
+	}
+	auto timed_out = completed.load() < QUERY_COUNT;
+	if (timed_out) {
+		REQUIRE_NO_FAIL(setup.Query("SET scheduler_policy='default'"));
+		db.instance->GetScheduler().Signal(4);
+	}
+	for (auto &query_thread : query_threads) {
+		query_thread.join();
+	}
+
+	INFO("completed=" << completed.load() << '/' << QUERY_COUNT);
+	REQUIRE_FALSE(timed_out);
+	REQUIRE(errors.empty());
+	REQUIRE(db.instance->GetQuerySLAScheduler().GetSnapshot().empty());
+}
+
+TEST_CASE("SLA energy scheduler releases task leases before redispatch", "[api][sla_energy]") {
+	DuckDB db(nullptr);
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	store.Clear();
+	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(setup.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_activation_scheduler_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_activation_debug_enable=true"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_residual_policy='park'"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_energy_hardware_control_enable=false"));
+	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE sla_energy_lease_t AS "
+	                            "SELECT i, i % 1009 AS g FROM range(3000000) tbl(i)"));
+
+	const string body = "SELECT g, count(*), sum(i) FROM sla_energy_lease_t GROUP BY g ORDER BY g";
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE_NO_FAIL(setup.Query(MetadataQuery(9700 + i, 98, 10, body)));
+	}
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_scheduler_epoch_ms=5"));
+	REQUIRE_NO_FAIL(setup.Query("SET pin_threads='on'"));
+	REQUIRE_NO_FAIL(setup.Query("SET scheduler_policy='sla_energy'"));
+
+	static constexpr idx_t QUERY_COUNT = 8;
+	atomic<bool> start(false);
+	atomic<idx_t> completed(0);
+	mutex error_lock;
+	std::vector<string> errors;
+	std::vector<thread> query_threads;
+	for (idx_t query_idx = 0; query_idx < QUERY_COUNT; query_idx++) {
+		query_threads.emplace_back([&, query_idx]() {
+			Connection con(db);
+			auto activation = con.Query("SET query_activation_scheduler_enable=true");
+			auto debug = con.Query("SET query_activation_debug_enable=true");
+			if (activation->HasError() || debug->HasError()) {
+				lock_guard<mutex> guard(error_lock);
+				errors.push_back(activation->HasError() ? activation->GetError() : debug->GetError());
+				completed++;
+				return;
+			}
+			while (!start.load()) {
+				this_thread::yield();
+			}
+			auto result = con.Query(MetadataQueryWithDeadlineOffset(9800 + query_idx, 98, 10, 1.0, 2000000000ULL,
+			                                                       body));
+			if (result->HasError()) {
+				lock_guard<mutex> guard(error_lock);
+				errors.push_back(result->GetError());
+			}
+			completed++;
+		});
+	}
+	start = true;
+
+	auto timeout = chrono::steady_clock::now() + chrono::seconds(20);
+	while (completed.load() < QUERY_COUNT && chrono::steady_clock::now() < timeout) {
+		this_thread::sleep_for(chrono::milliseconds(1));
+	}
+	auto timed_out = completed.load() < QUERY_COUNT;
+	string stalled_state;
+	if (timed_out) {
+		for (const auto &snapshot : db.instance->GetQuerySLAScheduler().GetSnapshot()) {
+			if (!snapshot.event_present) {
+				continue;
+			}
+			stalled_state += StringUtil::Format(
+			    " query=%llu pipeline=%llu kind=%s planned=%llu assigned=%llu demand=%llu queued=%llu",
+			    static_cast<unsigned long long>(snapshot.db_query_id),
+			    static_cast<unsigned long long>(snapshot.pipeline_id), snapshot.event_kind,
+			    static_cast<unsigned long long>(snapshot.planned_workers),
+			    static_cast<unsigned long long>(snapshot.assigned_workers),
+			    static_cast<unsigned long long>(snapshot.demand_cap),
+			    static_cast<unsigned long long>(snapshot.producer_queued_tasks));
+		}
+	}
+	if (timed_out) {
+		REQUIRE_NO_FAIL(setup.Query("SET scheduler_policy='default'"));
+		db.instance->GetScheduler().Signal(4);
+	}
+	for (auto &query_thread : query_threads) {
+		query_thread.join();
+	}
+
+	INFO("completed=" << completed.load() << '/' << QUERY_COUNT);
+	INFO(stalled_state);
+	REQUIRE_FALSE(timed_out);
+	REQUIRE(errors.empty());
+	REQUIRE(db.instance->GetQuerySLAScheduler().GetSnapshot().empty());
+	REQUIRE(db.instance->GetQuerySLAScheduler().GetHardwareManager().GetSnapshot().worker_lease_handoff_count == 0);
 }
 
 TEST_CASE("Query request profile store records concurrent metadata queries", "[api]") {

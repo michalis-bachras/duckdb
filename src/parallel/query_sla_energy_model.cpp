@@ -49,6 +49,11 @@ static bool IsLifecycleEvent(QueryActivationEventKind event_kind) {
 	}
 }
 
+static bool UsesWorkerPresenceModel(const QuerySLAEnergyModelInput &input) {
+	return IsLifecycleEvent(input.reference_model.event_kind) ||
+	       input.sla_input.work.remaining_chunks_equiv == 0;
+}
+
 static bool SLACostEquivalent(double candidate, double reference) {
 	auto tolerance = 1e-9 * MaxValue<double>(1.0, std::fabs(reference));
 	return candidate <= reference + tolerance;
@@ -314,14 +319,24 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 	if (!input.reference_model.valid || existing_worker_count >= input.reference_model.demand_cap) {
 		return result;
 	}
-	if (IsLifecycleEvent(input.reference_model.event_kind)) {
+	auto fixed_reference_fallback =
+	    stage == QuerySLAEnergyOptionalStage::REFERENCE_FALLBACK &&
+	    SameHardware(reference_hardware, input.reference_hardware);
+	auto acceptable_gain = [&](double gain) {
+		if (gain > 0) {
+			return true;
+		}
+		auto tolerance = 1e-9 * MaxValue<double>(1.0, std::fabs(existing_optional_risk));
+		return fixed_reference_fallback && gain >= -tolerance;
+	};
+	if (UsesWorkerPresenceModel(input)) {
 		auto next_worker_count = existing_worker_count + 1;
 		if (next_worker_count >= input.reference_model.optional_risk.size()) {
 			return result;
 		}
 		auto target_risk = input.reference_model.optional_risk[next_worker_count];
 		auto gain = existing_optional_risk - target_risk;
-		if (!(gain > 0)) {
+		if (!acceptable_gain(gain)) {
 			return result;
 		}
 		result.valid = true;
@@ -329,7 +344,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 		result.optional_fragility_before = existing_optional_risk;
 		result.optional_fragility_target = target_risk;
 		result.optional_fragility_after = target_risk;
-		result.optional_gain = gain;
+		result.optional_gain = MaxValue<double>(0, gain);
 		result.worker_ordinal = existing_worker_count;
 		result.optional_stage = stage;
 		result.optional = true;
@@ -364,7 +379,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 	}
 	auto reference_risk_before = existing_optional_risk;
 	auto gain = reference_risk_before - reference_evaluation.optional_risk;
-	if (!(gain > 0)) {
+	if (!acceptable_gain(gain)) {
 		return result;
 	}
 	const HardwareCandidate *selected = nullptr;
@@ -404,7 +419,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 	result.optional_fragility_before = reference_risk_before;
 	result.optional_fragility_target = reference_evaluation.optional_risk;
 	result.optional_fragility_after = selected_evaluation.optional_risk;
-	result.optional_gain = gain;
+	result.optional_gain = MaxValue<double>(0, gain);
 	result.profile_version = selected->profile_version;
 	result.worker_ordinal = existing_worker_count;
 	result.optional_stage = stage;

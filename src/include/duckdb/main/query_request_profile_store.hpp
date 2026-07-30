@@ -47,12 +47,15 @@ struct QueryRequestPipelineHardwareProfileEstimate {
 	QueryRequestHardwareConfiguration hardware;
 	idx_t throughput_sample_count = 0;
 	idx_t power_sample_count = 0;
+	idx_t base_power_sample_count = 0;
 	double mean_work_units_per_s = 0;
 	double ewma_work_units_per_s = 0;
 	double p10_work_units_per_s = 0;
 	double safe_work_units_per_s = 0;
 	double mean_active_power_w = 0;
 	double ewma_active_power_w = 0;
+	double mean_base_power_w = 0;
+	double ewma_base_power_w = 0;
 	double mean_charged_power_w = 0;
 	double ewma_charged_power_w = 0;
 	double safe_throughput_per_active_watt = 0;

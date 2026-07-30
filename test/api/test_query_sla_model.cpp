@@ -1,4 +1,5 @@
 #include "catch.hpp"
+#include "test_helpers.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parallel/query_hardware_manager.hpp"
 #include "duckdb/parallel/query_sla_model.hpp"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 
 using namespace duckdb;
 
@@ -194,6 +196,67 @@ TEST_CASE("SLA lifecycle events remain serial and need no throughput model", "[a
 	REQUIRE(model.demand_cap == 1);
 	REQUIRE(model.service_rates == vector<double> {0, 0});
 	REQUIRE(model.mandatory_cost.size() == 2);
+
+	input.now_ns = 3000000000ULL;
+	auto late_model = BuildQuerySLAModel(input);
+	REQUIRE(late_model.valid);
+	REQUIRE(late_model.mandatory_cost[0] > late_model.mandatory_cost[1]);
+	REQUIRE(late_model.mandatory_gain[0] > 0);
+}
+
+TEST_CASE("SLA throughput falls back conservatively to continuation history", "[api][sla][model]") {
+	PipelineContinuationEstimate continuation;
+	continuation.valid = true;
+	continuation.level = ContinuationEstimateLevel::GLOBAL_RAW;
+	continuation.kind = ContinuationEstimateKind::RAW_LATENCY_NS;
+	continuation.sample_count = 17;
+	continuation.mean = 50000000;
+	continuation.p90 = 100000000;
+
+	auto raw = DerivePipelineThroughputFromContinuation(continuation, 20);
+	REQUIRE(raw.valid);
+	REQUIRE(raw.level == PipelineThroughputEstimateLevel::CONTINUATION_FALLBACK);
+	REQUIRE(raw.sample_count == 17);
+	REQUIRE(raw.mean_work_units_per_s == Approx(400));
+	REQUIRE(raw.ewma_work_units_per_s == Approx(200));
+
+	auto raw_input = BaseModelInput();
+	raw_input.metadata.deadline_ns = raw_input.now_ns;
+	raw_input.epoch_ns = 50000000;
+	raw_input.work.total_chunks_equiv = 20;
+	raw_input.work.remaining_chunks_equiv = 20;
+	raw_input.work.continuation_estimate = continuation;
+	raw_input.work.selected_throughput_valid = raw.valid;
+	raw_input.work.selected_single_worker_chunks_per_s = raw.ewma_work_units_per_s;
+	raw_input.work.historical_throughput_estimate = raw;
+	auto raw_model = BuildQuerySLAModel(raw_input);
+	REQUIRE(raw_model.valid);
+	REQUIRE(raw_model.mandatory_cost[0] > raw_model.mandatory_cost[1]);
+	REQUIRE(raw_model.mandatory_gain[0] > 0);
+	auto raw_allocation = AllocateQuerySLAWorkers({raw_model}, 1, false);
+	REQUIRE(raw_allocation.mandatory == vector<idx_t> {1});
+	REQUIRE(raw_allocation.unassigned_workers == 0);
+
+	continuation.kind = ContinuationEstimateKind::NS_PER_WORK_UNIT;
+	continuation.mean = 2000000;
+	continuation.p90 = 4000000;
+	auto normalized = DerivePipelineThroughputFromContinuation(continuation, 20);
+	REQUIRE(normalized.valid);
+	REQUIRE(normalized.mean_work_units_per_s == Approx(500));
+	REQUIRE(normalized.ewma_work_units_per_s == Approx(250));
+
+	auto input = BaseModelInput();
+	input.work.selected_throughput_valid = normalized.valid;
+	input.work.selected_single_worker_chunks_per_s = normalized.ewma_work_units_per_s;
+	input.work.historical_throughput_estimate = normalized;
+	auto model = BuildQuerySLAModel(input);
+	REQUIRE(model.valid);
+	REQUIRE(model.throughput == Approx(250));
+	REQUIRE(model.service_rates == vector<double> {0, 250, 500, 750, 1000});
+
+	REQUIRE_FALSE(DerivePipelineThroughputFromContinuation(continuation, 0).valid);
+	continuation.valid = false;
+	REQUIRE_FALSE(DerivePipelineThroughputFromContinuation(continuation, 20).valid);
 }
 
 TEST_CASE("SLA energy lifecycle optional workers preserve the pure SLA transition without throughput",
@@ -230,6 +293,43 @@ TEST_CASE("SLA energy lifecycle optional workers preserve the pure SLA transitio
 		REQUIRE(selected.optional_fragility_target == Approx(reference_model.optional_risk[1]));
 		REQUIRE(selected.optional_fragility_after == Approx(reference_model.optional_risk[1]));
 	}
+}
+
+TEST_CASE("SLA energy zero-work pipelines use the worker-presence model",
+	      "[api][sla][energy_model][energy_planner]") {
+	auto sla_input = BaseModelInput();
+	sla_input.work.preferred_parallelism = 1;
+	sla_input.work.remaining_chunks_equiv = 0;
+	sla_input.work.selected_throughput_valid = false;
+	sla_input.work.selected_single_worker_chunks_per_s = 0;
+	auto reference_model = BuildQuerySLAModel(sla_input);
+	REQUIRE(reference_model.valid);
+	REQUIRE(reference_model.demand_cap == 1);
+	REQUIRE(reference_model.service_rates == vector<double> {0, 0});
+	REQUIRE(reference_model.mandatory_gain[0] == Approx(0));
+	REQUIRE(reference_model.optional_gain[0] > 0);
+
+	QuerySLAEnergyModelInput query;
+	query.sla_input = sla_input;
+	query.reference_model = reference_model;
+	query.reference_hardware = TestHardware(3000000, 2800000);
+	auto selected = SelectQuerySLAOptionalAddition(
+	    query, 0, reference_model.optional_risk[0], 0, query.reference_hardware,
+	    {query.reference_hardware}, QuerySLAEnergyOptionalStage::O3);
+	REQUIRE(selected.valid);
+	REQUIRE(selected.optional);
+	REQUIRE(selected.hardware == query.reference_hardware);
+	REQUIRE(selected.safe_throughput == Approx(0));
+	REQUIRE(selected.optional_gain == Approx(reference_model.optional_gain[0]));
+
+	auto input = PlannerInput(std::move(query), 1, {TestWorker(0, 0, 0, 0)});
+	auto plan = PlanQuerySLAEnergyEpoch(input);
+	REQUIRE(plan.valid);
+	REQUIRE(plan.workers.size() == 1);
+	REQUIRE(plan.queries[0].mandatory_workers == 0);
+	REQUIRE(plan.queries[0].optional_workers == 1);
+	REQUIRE(plan.workers[0].optional);
+	REQUIRE(plan.workers[0].preferred_safe_throughput == Approx(0));
 }
 
 TEST_CASE("SLA energy allocator lowers hardware only with mature SLA-equivalent profiles",
@@ -379,6 +479,31 @@ TEST_CASE("SLA energy optional eligibility uses the accepted current service",
 	REQUIRE(selected.optional_fragility_target == Approx(current_reference.optional_risk));
 }
 
+TEST_CASE("SLA energy fixed optional fallback permits an already-satisfied fragility target",
+	      "[api][sla][energy_model]") {
+	auto input = PlannerQuery(96, 3500000000ULL);
+	input.hardware_profiles.clear();
+	auto reference = TestHardwareProfile(3000000, 2800000, 10, 10);
+	input.hardware_profiles = {reference};
+	auto target = QuerySLAEvaluateServiceRate(input.sla_input, 20, 2);
+	REQUIRE(target.valid);
+
+	auto ordinary = SelectQuerySLAOptionalAddition(
+	    input, 10, target.optional_risk, 1, input.reference_hardware, {input.reference_hardware},
+	    QuerySLAEnergyOptionalStage::O3);
+	REQUIRE_FALSE(ordinary.valid);
+
+	auto fallback = SelectQuerySLAOptionalAddition(
+	    input, 10, target.optional_risk, 1, input.reference_hardware, {input.reference_hardware},
+	    QuerySLAEnergyOptionalStage::REFERENCE_FALLBACK);
+	REQUIRE(fallback.valid);
+	REQUIRE(fallback.optional);
+	REQUIRE(fallback.hardware == input.reference_hardware);
+	REQUIRE(fallback.worker_ordinal == 1);
+	REQUIRE(fallback.optional_gain == Approx(0));
+	REQUIRE(fallback.optional_fragility_before == Approx(fallback.optional_fragility_after));
+}
+
 TEST_CASE("SLA energy mandatory allocation preserves internal event service curves",
 	      "[api][sla][energy_model]") {
 	auto sla_input = BaseModelInput();
@@ -464,13 +589,14 @@ TEST_CASE("SLA energy planner rejects immature non-reference hardware", "[api][s
 	}
 }
 
-TEST_CASE("SLA energy planner preserves preferences across domain-coupled frequency inflation",
+TEST_CASE("SLA energy planner repairs a domain-coupled throughput regression",
 	      "[api][sla][energy_planner]") {
 	vector<QueryHardwareWorkerTopology> topology = {TestWorker(0, 0, 0, 0), TestWorker(1, 1, 0, 1)};
 	auto query_a = PlannerQuery(201);
 	query_a.hardware_profiles.clear();
 	query_a.hardware_profiles.push_back(TestHardwareProfile(3000000, 2800000, 10, 10));
 	query_a.hardware_profiles.push_back(TestHardwareProfile(1200000, 1200000, 10, 2));
+	query_a.hardware_profiles.push_back(TestHardwareProfile(1200000, 2800000, 5, 2));
 	auto query_b = PlannerQuery(202);
 	query_b.hardware_profiles.clear();
 	query_b.hardware_profiles.push_back(TestHardwareProfile(3000000, 2800000, 10, 10));
@@ -488,22 +614,63 @@ TEST_CASE("SLA energy planner preserves preferences across domain-coupled freque
 
 	REQUIRE(plan.valid);
 	REQUIRE(plan.workers.size() == 2);
-	REQUIRE(plan.diagnostics.domain_frequency_inflations == 1);
+	REQUIRE(plan.diagnostics.worker_frequency_adjustments == 1);
 	for (const auto &worker : plan.workers) {
 		auto preferred = worker.query_index == 0 ? TestHardware(1200000, 1200000)
 		                                         : TestHardware(2200000, 2800000);
-		auto normal = worker.query_index == 0 ? TestHardware(1200000, 2800000)
+		auto normal = worker.query_index == 0 ? TestHardware(3000000, 2800000)
 		                                      : TestHardware(2200000, 2800000);
 		REQUIRE(worker.preferred_hardware == preferred);
 		REQUIRE(worker.normal_hardware == normal);
 		REQUIRE(worker.execution_hardware == worker.normal_hardware);
+		REQUIRE(worker.normal_safe_throughput == Approx(10));
 	}
 	REQUIRE(plan.queries[0].workers.size() == 1);
-	REQUIRE(plan.queries[0].workers[0].hardware == TestHardware(1200000, 1200000));
+	REQUIRE(plan.queries[0].workers[0].hardware == TestHardware(3000000, 2800000));
 	REQUIRE(plan.queries[1].workers.size() == 1);
 	REQUIRE(plan.queries[1].workers[0].hardware == TestHardware(2200000, 2800000));
 	REQUIRE(plan.queries[0].aggregate_service_rate == Approx(10));
 	REQUIRE(plan.queries[1].aggregate_service_rate == Approx(10));
+}
+
+TEST_CASE("SLA energy planner selects a shared core pair by SLA then aggregate EDP",
+	      "[api][sla][energy_planner]") {
+	vector<QueryHardwareWorkerTopology> topology = {TestWorker(0, 0, 0, 0), TestWorker(1, 8, 0, 0)};
+	auto query_a = PlannerQuery(203, 2500000000ULL, 1);
+	query_a.hardware_profiles.clear();
+	query_a.hardware_profiles.push_back(TestHardwareProfile(3000000, 2800000, 10, 10));
+	query_a.hardware_profiles.push_back(TestHardwareProfile(1200000, 1200000, 10, 1));
+	query_a.hardware_profiles.push_back(TestHardwareProfile(2200000, 1800000, 10, 4));
+	auto query_b = PlannerQuery(204, 2500000000ULL, 1);
+	query_b.hardware_profiles.clear();
+	query_b.hardware_profiles.push_back(TestHardwareProfile(3000000, 2800000, 10, 10));
+	query_b.hardware_profiles.push_back(TestHardwareProfile(2200000, 1800000, 10, 5));
+
+	QuerySLAEnergyPlannerInput input;
+	input.queries = {query_a, query_b};
+	input.topology = topology;
+	input.core_frequency_levels_khz = {1200000, 2200000, 3000000};
+	input.uncore_frequency_levels_khz = {1200000, 1800000, 2800000};
+	input.worker_budget = 2;
+	input.epoch_ns = 1000000000ULL;
+	SetLogicalAllocation(input);
+
+	auto plan = PlanQuerySLAEnergyEpoch(input);
+	REQUIRE(plan.valid);
+	REQUIRE(plan.workers.size() == 2);
+	REQUIRE(plan.diagnostics.worker_frequency_adjustments == 1);
+	for (const auto &worker : plan.workers) {
+		REQUIRE(worker.normal_hardware == TestHardware(2200000, 1800000));
+		REQUIRE(worker.execution_hardware == worker.normal_hardware);
+		REQUIRE(worker.normal_safe_throughput == Approx(10));
+		REQUIRE(worker.normal_normalized_edp > 0);
+	}
+	REQUIRE(plan.queries[0].workers[0].hardware == TestHardware(2200000, 1800000));
+	REQUIRE(plan.queries[1].workers[0].hardware == TestHardware(2200000, 1800000));
+	REQUIRE(plan.queries[0].predicted_sla_cost ==
+	        Approx(input.queries[0].reference_model.mandatory_cost[1]));
+	REQUIRE(plan.queries[1].predicted_sla_cost ==
+	        Approx(input.queries[1].reference_model.mandatory_cost[1]));
 }
 
 TEST_CASE("SLA energy planner densely places frequency-sorted mandatory tokens", "[api][sla][energy_planner]") {
@@ -517,6 +684,7 @@ TEST_CASE("SLA energy planner densely places frequency-sorted mandatory tokens",
 		query.hardware_profiles.push_back(TestHardwareProfile(3000000, 2800000, 10, 10));
 		if (i >= 2) {
 			query.hardware_profiles.push_back(TestHardwareProfile(1200000, 1200000, 10, 1));
+			query.hardware_profiles.push_back(TestHardwareProfile(1200000, 2800000, 10, 2));
 		}
 		input.queries.push_back(std::move(query));
 	}
@@ -530,7 +698,7 @@ TEST_CASE("SLA energy planner densely places frequency-sorted mandatory tokens",
 	auto plan = PlanQuerySLAEnergyEpoch(input);
 	REQUIRE(plan.valid);
 	REQUIRE(plan.workers.size() == 6);
-	REQUIRE(plan.diagnostics.domain_frequency_inflations == 2);
+	REQUIRE(plan.diagnostics.worker_frequency_adjustments == 2);
 	for (const auto &worker : plan.workers) {
 		REQUIRE(worker.worker_id == worker.query_index);
 		if (worker.query_index < 2) {
@@ -649,6 +817,24 @@ TEST_CASE("SLA energy planner preserves fixed optional tokens with reference fal
 			REQUIRE(worker.preferred_hardware == input.queries[0].reference_hardware);
 		}
 	}
+}
+
+TEST_CASE("SLA energy planner preserves fixed optional counts after fragility reaches zero",
+	      "[api][sla][energy_planner]") {
+	vector<QueryHardwareWorkerTopology> topology = {TestWorker(0, 0, 0, 0), TestWorker(1, 8, 0, 0),
+	                                                TestWorker(2, 1, 0, 1), TestWorker(3, 9, 0, 1)};
+	auto query = PlannerQuery(108, 3500000000ULL);
+	query.hardware_profiles.push_back(TestHardwareProfile(1200000, 1200000, 100, 1));
+	auto input = PlannerInput(std::move(query), 4, topology);
+	auto logical = input.logical_allocation;
+	REQUIRE(logical.optional[0] > 1);
+
+	auto plan = PlanQuerySLAEnergyEpoch(input);
+	REQUIRE(plan.valid);
+	REQUIRE(plan.queries[0].mandatory_workers == logical.mandatory[0]);
+	REQUIRE(plan.queries[0].optional_workers == logical.optional[0]);
+	REQUIRE(plan.diagnostics.reference_fallback_workers > 0);
+	REQUIRE(plan.workers.size() == logical.mandatory[0] + logical.optional[0]);
 }
 
 TEST_CASE("SLA energy planner places a lifecycle optional worker at reference hardware",
@@ -807,6 +993,9 @@ TEST_CASE("SLA energy hardware manager applies upshifts and downshifts immediate
 
 	auto reference = manager.ReferenceConfiguration();
 	auto minimum = manager.MinimumConfiguration();
+	REQUIRE(reference.core_frequency_khz == 3500000);
+	REQUIRE(reference.uncore_frequency_khz == 2800000);
+	REQUIRE(manager.CoreFrequencyLevelsKHz().back() == 3500000);
 	REQUIRE(manager.IsWorkerAtConfiguration(0, reference));
 	REQUIRE_FALSE(manager.IsWorkerAtConfiguration(0, minimum));
 
@@ -836,4 +1025,99 @@ TEST_CASE("SLA energy hardware manager applies upshifts and downshifts immediate
 	REQUIRE(inactive.restoration_attempt_count == 0);
 	REQUIRE(inactive.restoration_verified_count == 0);
 	REQUIRE(inactive.restoration_failure_count == 0);
+}
+
+TEST_CASE("SLA energy hardware manager derives its frequency grid from calibration",
+          "[api][sla][energy_hardware]") {
+	auto power_model_path = TestCreatePath("sla_energy_frequency_grid.csv");
+	{
+		std::ofstream output(power_model_path);
+		output << "socket_id,core_freq_hz,uncore_freq_hz,smt_state,base_power_w\n";
+		output << "0,1200000000,1200000000,0,10\n";
+		output << "0,1200000000,2800000000,0,11\n";
+		output << "0,3500000000,1200000000,0,12\n";
+		output << "0,3500000000,2800000000,0,13\n";
+	}
+
+	DBConfig config;
+	config.options.query_sla_energy_hardware_control_enabled = false;
+	config.options.query_sla_energy_power_model_path = power_model_path;
+	DuckDB db(nullptr, &config);
+	QueryHardwareManager manager(*db.instance);
+	manager.RegisterWorker(0, 0);
+	manager.Activate();
+
+	REQUIRE(manager.CoreFrequencyLevelsKHz() == vector<uint32_t> {1200000, 3500000});
+	REQUIRE(manager.UncoreFrequencyLevelsKHz() == vector<uint32_t> {1200000, 2800000});
+	REQUIRE(manager.MinimumConfiguration().core_frequency_khz == 1200000);
+	REQUIRE(manager.MinimumConfiguration().uncore_frequency_khz == 1200000);
+	REQUIRE(manager.ReferenceConfiguration().core_frequency_khz == 3500000);
+	REQUIRE(manager.ReferenceConfiguration().uncore_frequency_khz == 2800000);
+
+	manager.Deactivate();
+	db.instance->GetFileSystem().RemoveFile(power_model_path);
+}
+
+TEST_CASE("SLA energy hardware diagnostics classify worker target transitions",
+          "[api][sla][energy_hardware]") {
+	DBConfig config;
+	config.options.query_sla_energy_hardware_control_enabled = false;
+	DuckDB db(nullptr, &config);
+	QueryHardwareManager manager(*db.instance);
+	manager.RegisterWorker(0, 0);
+	manager.Activate();
+
+	QueryHardwareTransitionContext first;
+	first.db_query_id = 101;
+	first.request_id = 7;
+	first.pipeline_generation = 3;
+	first.lease_generation = 11;
+	first.pipeline_id = 4;
+	first.mandatory = true;
+	first.trace_enabled = true;
+
+	auto minimum = manager.MinimumConfiguration();
+	auto reference = manager.ReferenceConfiguration();
+	manager.UpdateWorkerTarget(0, minimum, true, 1, first);
+
+	auto handoff = first;
+	handoff.lease_generation = 12;
+	manager.UpdateWorkerTarget(0, minimum, true, 1, handoff);
+	manager.UpdateWorkerTarget(0, reference, true, 2, handoff);
+	manager.UpdateWorkerTarget(0, minimum, false, 2);
+
+	auto snapshot = manager.GetSnapshot();
+	REQUIRE(snapshot.worker_target_update_count == 4);
+	REQUIRE(snapshot.worker_target_noop_count == 1);
+	REQUIRE(snapshot.worker_assignment_count == 1);
+	REQUIRE(snapshot.worker_release_count == 1);
+	REQUIRE(snapshot.worker_retarget_count == 1);
+	REQUIRE(snapshot.worker_lease_handoff_count == 1);
+	REQUIRE(snapshot.core_transition_count == 3);
+	REQUIRE(snapshot.uncore_transition_count == 3);
+	REQUIRE(snapshot.msr_write_count == 0);
+	REQUIRE(snapshot.core_msr_write_count == 0);
+	REQUIRE(snapshot.uncore_msr_write_count == 0);
+	REQUIRE(snapshot.transition_trace_dropped_count == 0);
+
+	auto trace = manager.GetTransitionTrace();
+	REQUIRE(trace.size() == 4);
+	REQUIRE(trace[0].action == "assign");
+	REQUIRE(trace[0].request_id == 7);
+	REQUIRE(trace[0].pipeline_id == 4);
+	REQUIRE(trace[0].core_changed);
+	REQUIRE(trace[0].uncore_changed);
+	REQUIRE(trace[0].msr_write_delta == 0);
+	REQUIRE(trace[1].action == "lease_handoff");
+	REQUIRE_FALSE(trace[1].core_changed);
+	REQUIRE_FALSE(trace[1].uncore_changed);
+	REQUIRE(trace[2].action == "retarget");
+	REQUIRE(trace[2].core_changed);
+	REQUIRE(trace[2].uncore_changed);
+	REQUIRE(trace[3].action == "release");
+	REQUIRE(trace[3].request_id == 7);
+	REQUIRE(trace[3].core_changed);
+	REQUIRE(trace[3].uncore_changed);
+
+	manager.Deactivate();
 }

@@ -78,6 +78,15 @@ struct OptionalToken {
 	QuerySLAEnergyOptionalStage stage = QuerySLAEnergyOptionalStage::NONE;
 };
 
+struct HardwareReconciliationScore {
+	bool valid = false;
+	bool energy_valid = false;
+	double sla_cost_violation = 0;
+	double fragility_violation = 0;
+	double normalized_edp = 0;
+	uint64_t frequency_sum_khz = 0;
+};
+
 static bool PlannerSameHardware(const QueryRequestHardwareConfiguration &left,
 	                            const QueryRequestHardwareConfiguration &right) {
 	return left == right;
@@ -220,7 +229,7 @@ static bool HardwareAtLeast(const QueryRequestHardwareConfiguration &actual,
 	       actual.uncore_frequency_khz >= preferred.uncore_frequency_khz;
 }
 
-static idx_t CountDomainFrequencyInflations(const vector<QuerySLAEnergyPlacedWorker> &workers) {
+static idx_t CountWorkerFrequencyAdjustments(const vector<QuerySLAEnergyPlacedWorker> &workers) {
 	idx_t result = 0;
 	for (const auto &worker : workers) {
 		result += PlannerSameHardware(worker.normal_hardware, worker.preferred_hardware) ? 0 : 1;
@@ -405,6 +414,423 @@ static bool RebuildQueryAllocationsFromPreferences(QuerySLAEnergyEpochPlan &plan
 		}
 	}
 	plan.queries = std::move(allocations);
+	return true;
+}
+
+static bool PlannerIsLifecycleEvent(QueryActivationEventKind event_kind) {
+	return event_kind == QueryActivationEventKind::INITIALIZE ||
+	       event_kind == QueryActivationEventKind::PREPARE_FINISH ||
+	       event_kind == QueryActivationEventKind::FINISH ||
+	       event_kind == QueryActivationEventKind::COMPLETE;
+}
+
+static bool ResolveNormalWorkerEstimate(QuerySLAEnergyPlacedWorker &worker,
+	                                    const QuerySLAEnergyModelInput &query,
+	                                    const QuerySLAEnergyWorkerAssignment &accepted) {
+	worker.normal_safe_throughput = 0;
+	worker.normal_active_power_w = 0;
+	worker.normal_normalized_edp = 0;
+	worker.normal_profile_version = 0;
+	if (!worker.normal_hardware.IsValid()) {
+		return false;
+	}
+	if (PlannerIsLifecycleEvent(query.reference_model.event_kind)) {
+		worker.normal_safe_throughput = accepted.safe_throughput;
+		return true;
+	}
+	if (PlannerSameHardware(worker.normal_hardware, worker.preferred_hardware)) {
+		worker.normal_safe_throughput = accepted.safe_throughput;
+		worker.normal_active_power_w = accepted.active_power_w;
+		worker.normal_normalized_edp = accepted.normalized_edp;
+		worker.normal_profile_version = accepted.profile_version;
+		return true;
+	}
+	auto candidate = FindHardwareCandidate(query, worker.normal_hardware);
+	if (!candidate.valid) {
+		return false;
+	}
+	if (PlannerSameHardware(worker.normal_hardware, query.reference_hardware)) {
+		auto ordinal = worker.worker_ordinal;
+		if (ordinal + 1 >= query.reference_model.service_rates.size()) {
+			return false;
+		}
+		worker.normal_safe_throughput =
+		    MaxValue<double>(0, query.reference_model.service_rates[ordinal + 1] -
+		                            query.reference_model.service_rates[ordinal]);
+	} else {
+		worker.normal_safe_throughput = candidate.throughput;
+	}
+	worker.normal_active_power_w = candidate.active_power_w;
+	worker.normal_normalized_edp = candidate.normalized_edp;
+	worker.normal_profile_version = candidate.profile_version;
+	return worker.normal_safe_throughput >= 0;
+}
+
+static bool RebuildQueryAllocationsFromNormalHardware(
+    QuerySLAEnergyEpochPlan &plan, const QuerySLAEnergyPlannerInput &input,
+    const vector<QuerySLAEnergyQueryAllocation> &accepted, HardwareReconciliationScore &score, string &error) {
+	vector<QuerySLAEnergyQueryAllocation> allocations(input.queries.size());
+	vector<vector<bool>> seen(input.queries.size());
+	vector<long double> reconstructed_service(input.queries.size(), 0);
+	vector<long double> reconstructed_power(input.queries.size(), 0);
+	vector<bool> all_workers_at_preferred_pair(input.queries.size(), true);
+	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+		if (query_index >= accepted.size()) {
+			error = "accepted SLA-energy allocation does not match the query count";
+			return false;
+		}
+		auto &allocation = allocations[query_index];
+		const auto &target = accepted[query_index];
+		allocation.mandatory_target_sla_cost = target.mandatory_target_sla_cost;
+		allocation.mandatory_target_optional_risk = target.mandatory_target_optional_risk;
+		allocation.mandatory_preferred_service_rate = target.mandatory_preferred_service_rate;
+		allocation.mandatory_reference_safe_throughput = target.mandatory_reference_safe_throughput;
+		allocation.mandatory_preferred_normalized_edp = target.mandatory_preferred_normalized_edp;
+		allocation.mandatory_profile_version = target.mandatory_profile_version;
+		seen[query_index].resize(target.workers.size(), false);
+		auto evaluation = QuerySLAEvaluateServiceRate(input.queries[query_index].sla_input, 0, 0);
+		if (evaluation.valid) {
+			allocation.predicted_sla_cost = evaluation.mandatory_cost;
+			allocation.predicted_optional_risk = evaluation.optional_risk;
+		}
+	}
+	for (auto &worker : plan.workers) {
+		if (worker.query_index >= input.queries.size() || worker.query_index >= accepted.size()) {
+			error = "placed worker has an invalid query index";
+			return false;
+		}
+		auto query_index = worker.query_index;
+		if (worker.worker_ordinal >= accepted[query_index].workers.size()) {
+			error = PlannerValidationDetail(query_index, input, "placed worker has an invalid ordinal");
+			return false;
+		}
+		const auto &expected = accepted[query_index].workers[worker.worker_ordinal];
+		if (seen[query_index][worker.worker_ordinal]) {
+			error = PlannerValidationDetail(query_index, input, "placed worker ordinal appears more than once");
+			return false;
+		}
+		if (worker.mandatory != expected.mandatory || worker.optional != expected.optional ||
+		    !(worker.preferred_hardware == expected.hardware) ||
+		    worker.preferred_safe_throughput != expected.safe_throughput ||
+		    worker.profile_version != expected.profile_version ||
+		    worker.optional_stage != expected.optional_stage) {
+			error = PlannerValidationDetail(query_index, input, "placed worker no longer matches its accepted token");
+			return false;
+		}
+		if (!ResolveNormalWorkerEstimate(worker, input.queries[query_index], expected)) {
+			error = PlannerValidationDetail(query_index, input, "shared-domain hardware pair has no usable profile");
+			return false;
+		}
+		seen[query_index][worker.worker_ordinal] = true;
+		auto &allocation = allocations[query_index];
+		QuerySLAEnergyWorkerAssignment assignment = expected;
+		assignment.hardware = worker.normal_hardware;
+		assignment.safe_throughput = worker.normal_safe_throughput;
+		assignment.active_power_w = worker.normal_active_power_w;
+		assignment.normalized_edp = worker.normal_normalized_edp;
+		assignment.profile_version = worker.normal_profile_version;
+		allocation.workers.push_back(assignment);
+		reconstructed_service[query_index] += static_cast<long double>(worker.normal_safe_throughput);
+		reconstructed_power[query_index] += static_cast<long double>(worker.normal_active_power_w);
+		all_workers_at_preferred_pair[query_index] =
+		    all_workers_at_preferred_pair[query_index] &&
+		    PlannerSameHardware(worker.normal_hardware, worker.preferred_hardware);
+		allocation.mandatory_workers += worker.mandatory ? 1 : 0;
+		allocation.optional_workers += worker.optional ? 1 : 0;
+		if (!PlannerIsLifecycleEvent(input.queries[query_index].reference_model.event_kind)) {
+			if (!(worker.normal_active_power_w > 0) || !(worker.normal_normalized_edp > 0)) {
+				score.energy_valid = false;
+			} else {
+				score.normalized_edp += worker.normal_normalized_edp;
+			}
+		}
+	}
+	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
+		auto &allocation = allocations[query_index];
+		const auto &target = accepted[query_index];
+		if (allocation.mandatory_workers != target.mandatory_workers ||
+		    allocation.optional_workers != target.optional_workers ||
+		    std::find(seen[query_index].begin(), seen[query_index].end(), false) != seen[query_index].end()) {
+			error = PlannerValidationDetail(query_index, input, "placed worker set differs from the accepted allocation");
+			return false;
+		}
+		std::sort(allocation.workers.begin(), allocation.workers.end(),
+		          [](const QuerySLAEnergyWorkerAssignment &left, const QuerySLAEnergyWorkerAssignment &right) {
+			          return left.worker_ordinal < right.worker_ordinal;
+		          });
+		if (all_workers_at_preferred_pair[query_index]) {
+			allocation.aggregate_service_rate = target.aggregate_service_rate;
+			allocation.aggregate_active_power_w = target.aggregate_active_power_w;
+		} else {
+			allocation.aggregate_service_rate = static_cast<double>(reconstructed_service[query_index]);
+			allocation.aggregate_active_power_w = static_cast<double>(reconstructed_power[query_index]);
+		}
+		auto evaluation = QuerySLAEvaluateServiceRate(input.queries[query_index].sla_input,
+		                                             allocation.aggregate_service_rate, allocation.workers.size());
+		if (!evaluation.valid) {
+			error = PlannerValidationDetail(query_index, input, "shared-domain service cannot be evaluated");
+			return false;
+		}
+		allocation.predicted_sla_cost = evaluation.mandatory_cost;
+		allocation.predicted_optional_risk = evaluation.optional_risk;
+		allocation.predicted_epoch_energy_j =
+		    PlannerPredictedEpochEnergy(input.queries[query_index].sla_input, allocation.aggregate_service_rate,
+		                                allocation.aggregate_active_power_w);
+		auto worker_count = allocation.workers.size();
+		auto reference_cost = target.predicted_sla_cost;
+		auto reference_risk = target.predicted_optional_risk;
+		if (worker_count < input.queries[query_index].reference_model.mandatory_cost.size() &&
+		    worker_count < input.queries[query_index].reference_model.optional_risk.size()) {
+			reference_cost = input.queries[query_index].reference_model.mandatory_cost[worker_count];
+			reference_risk = input.queries[query_index].reference_model.optional_risk[worker_count];
+		} else if (worker_count > 0) {
+			std::ostringstream message;
+			message << "reference model does not cover fixed worker count " << worker_count
+			        << " with demand cap " << input.queries[query_index].reference_model.demand_cap;
+			error = PlannerValidationDetail(query_index, input, message.str());
+			return false;
+		}
+		auto cost_tolerance = 1e-9 * MaxValue<double>(1.0, std::abs(reference_cost));
+		auto risk_tolerance = 1e-9 * MaxValue<double>(1.0, std::abs(reference_risk));
+		score.sla_cost_violation +=
+		    MaxValue<double>(0, allocation.predicted_sla_cost - reference_cost - cost_tolerance);
+		score.fragility_violation +=
+		    MaxValue<double>(0, allocation.predicted_optional_risk - reference_risk - risk_tolerance);
+	}
+	plan.queries = std::move(allocations);
+	score.valid = true;
+	return true;
+}
+
+static int CompareReconciliationMetric(double left, double right) {
+	auto tolerance = 1e-12 * MaxValue<double>(1.0, MaxValue<double>(std::abs(left), std::abs(right)));
+	if (left < right - tolerance) {
+		return -1;
+	}
+	if (left > right + tolerance) {
+		return 1;
+	}
+	return 0;
+}
+
+static bool ReconciliationScorePreferred(const HardwareReconciliationScore &candidate,
+	                                     const HardwareReconciliationScore &current) {
+	if (!candidate.valid) {
+		return false;
+	}
+	if (!current.valid) {
+		return true;
+	}
+	auto comparison = CompareReconciliationMetric(candidate.sla_cost_violation, current.sla_cost_violation);
+	if (comparison != 0) {
+		return comparison < 0;
+	}
+	comparison = CompareReconciliationMetric(candidate.fragility_violation, current.fragility_violation);
+	if (comparison != 0) {
+		return comparison < 0;
+	}
+	if (candidate.energy_valid != current.energy_valid) {
+		return candidate.energy_valid;
+	}
+	if (!candidate.energy_valid) {
+		return false;
+	}
+	comparison = CompareReconciliationMetric(candidate.normalized_edp, current.normalized_edp);
+	if (comparison != 0) {
+		return comparison < 0;
+	}
+	return candidate.frequency_sum_khz < current.frequency_sum_khz;
+}
+
+static void SetReferenceDomainHardware(vector<QuerySLAEnergyPlacedWorker> &workers,
+	                                   const QuerySLAEnergyPlannerInput &input,
+	                                   const vector<QueryHardwareWorkerTopology> &topology) {
+	std::unordered_map<idx_t, QueryHardwareWorkerTopology> worker_topology;
+	std::map<CoreKey, uint32_t> core_targets;
+	std::map<int, uint32_t> socket_targets;
+	for (const auto &entry : topology) {
+		worker_topology[entry.worker_id] = entry;
+	}
+	for (const auto &worker : workers) {
+		auto topology_entry = worker_topology.find(worker.worker_id);
+		if (topology_entry == worker_topology.end() || worker.query_index >= input.queries.size()) {
+			continue;
+		}
+		CoreKey core(topology_entry->second.socket_id, topology_entry->second.physical_core_id);
+		const auto &reference = input.queries[worker.query_index].reference_hardware;
+		core_targets[core] = MaxValue<uint32_t>(core_targets[core], reference.core_frequency_khz);
+		socket_targets[core.socket_id] =
+		    MaxValue<uint32_t>(socket_targets[core.socket_id], reference.uncore_frequency_khz);
+	}
+	for (auto &worker : workers) {
+		auto topology_entry = worker_topology.find(worker.worker_id);
+		if (topology_entry == worker_topology.end()) {
+			continue;
+		}
+		CoreKey core(topology_entry->second.socket_id, topology_entry->second.physical_core_id);
+		worker.normal_hardware = PlannerHardware(core_targets[core], socket_targets[core.socket_id]);
+		worker.execution_hardware = worker.normal_hardware;
+	}
+}
+
+static uint64_t ReconciliationFrequencySum(
+    const vector<QuerySLAEnergyPlacedWorker> &workers,
+    const std::unordered_map<idx_t, QueryHardwareWorkerTopology> &worker_topology) {
+	std::map<CoreKey, uint32_t> cores;
+	std::map<int, uint32_t> sockets;
+	for (const auto &worker : workers) {
+		auto topology = worker_topology.find(worker.worker_id);
+		if (topology == worker_topology.end()) {
+			continue;
+		}
+		CoreKey core(topology->second.socket_id, topology->second.physical_core_id);
+		cores[core] = worker.normal_hardware.core_frequency_khz;
+		sockets[core.socket_id] = worker.normal_hardware.uncore_frequency_khz;
+	}
+	uint64_t result = 0;
+	for (const auto &entry : cores) {
+		result += entry.second;
+	}
+	for (const auto &entry : sockets) {
+		result += entry.second;
+	}
+	return result;
+}
+
+static bool ReconcileHardwareDomains(QuerySLAEnergyEpochPlan &plan, const QuerySLAEnergyPlannerInput &input,
+	                                 string &error) {
+	auto accepted = plan.queries;
+	auto preferred_domain_plan = plan;
+	ResolveActualHardware(preferred_domain_plan.workers, input.topology);
+	std::unordered_map<idx_t, QueryHardwareWorkerTopology> worker_topology;
+	std::map<CoreKey, vector<idx_t>> core_workers;
+	std::map<int, vector<idx_t>> socket_workers;
+	std::map<CoreKey, std::set<uint32_t>> core_candidates;
+	std::map<int, std::set<uint32_t>> socket_candidates;
+	for (const auto &entry : input.topology) {
+		worker_topology[entry.worker_id] = entry;
+	}
+	for (idx_t worker_index = 0; worker_index < plan.workers.size(); worker_index++) {
+		const auto &worker = plan.workers[worker_index];
+		auto topology = worker_topology.find(worker.worker_id);
+		if (topology == worker_topology.end() || worker.query_index >= input.queries.size()) {
+			error = "placed worker is missing pinned topology or query state";
+			return false;
+		}
+		CoreKey core(topology->second.socket_id, topology->second.physical_core_id);
+		core_workers[core].push_back(worker_index);
+		socket_workers[core.socket_id].push_back(worker_index);
+		core_candidates[core].insert(worker.preferred_hardware.core_frequency_khz);
+		core_candidates[core].insert(input.queries[worker.query_index].reference_hardware.core_frequency_khz);
+		socket_candidates[core.socket_id].insert(worker.preferred_hardware.uncore_frequency_khz);
+		socket_candidates[core.socket_id].insert(input.queries[worker.query_index].reference_hardware.uncore_frequency_khz);
+	}
+	SetReferenceDomainHardware(plan.workers, input, input.topology);
+	HardwareReconciliationScore current_score;
+	current_score.energy_valid = true;
+	if (!RebuildQueryAllocationsFromNormalHardware(plan, input, accepted, current_score, error)) {
+		return false;
+	}
+	current_score.frequency_sum_khz = ReconciliationFrequencySum(plan.workers, worker_topology);
+	HardwareReconciliationScore preferred_domain_score;
+	preferred_domain_score.energy_valid = true;
+	string preferred_domain_error;
+	if (RebuildQueryAllocationsFromNormalHardware(preferred_domain_plan, input, accepted, preferred_domain_score,
+	                                              preferred_domain_error)) {
+		preferred_domain_score.frequency_sum_khz =
+		    ReconciliationFrequencySum(preferred_domain_plan.workers, worker_topology);
+		if (ReconciliationScorePreferred(preferred_domain_score, current_score)) {
+			plan = std::move(preferred_domain_plan);
+			current_score = preferred_domain_score;
+		}
+	}
+
+	idx_t candidate_count = 0;
+	for (const auto &entry : core_candidates) {
+		candidate_count += entry.second.size();
+	}
+	for (const auto &entry : socket_candidates) {
+		candidate_count += entry.second.size();
+	}
+	auto max_iterations = MaxValue<idx_t>(1, 4 * candidate_count);
+	for (idx_t iteration = 0; iteration < max_iterations; iteration++) {
+		QuerySLAEnergyEpochPlan best_plan;
+		HardwareReconciliationScore best_score;
+		bool found = false;
+		for (const auto &entry : core_candidates) {
+			for (auto frequency_khz : entry.second) {
+				auto candidate = plan;
+				bool changed = false;
+				for (auto worker_index : core_workers[entry.first]) {
+					auto &worker = candidate.workers[worker_index];
+					changed = changed || worker.normal_hardware.core_frequency_khz != frequency_khz;
+					worker.normal_hardware.core_frequency_khz = frequency_khz;
+					worker.execution_hardware = worker.normal_hardware;
+				}
+				if (!changed) {
+					continue;
+				}
+				HardwareReconciliationScore candidate_score;
+				candidate_score.energy_valid = true;
+				string candidate_error;
+				if (!RebuildQueryAllocationsFromNormalHardware(candidate, input, accepted, candidate_score,
+				                                               candidate_error)) {
+					continue;
+				}
+				candidate_score.frequency_sum_khz =
+				    ReconciliationFrequencySum(candidate.workers, worker_topology);
+				if (ReconciliationScorePreferred(candidate_score, best_score)) {
+					best_plan = std::move(candidate);
+					best_score = candidate_score;
+					found = true;
+				}
+			}
+		}
+		for (const auto &entry : socket_candidates) {
+			for (auto frequency_khz : entry.second) {
+				auto candidate = plan;
+				bool changed = false;
+				for (auto worker_index : socket_workers[entry.first]) {
+					auto &worker = candidate.workers[worker_index];
+					changed = changed || worker.normal_hardware.uncore_frequency_khz != frequency_khz;
+					worker.normal_hardware.uncore_frequency_khz = frequency_khz;
+					worker.execution_hardware = worker.normal_hardware;
+				}
+				if (!changed) {
+					continue;
+				}
+				HardwareReconciliationScore candidate_score;
+				candidate_score.energy_valid = true;
+				string candidate_error;
+				if (!RebuildQueryAllocationsFromNormalHardware(candidate, input, accepted, candidate_score,
+				                                               candidate_error)) {
+					continue;
+				}
+				candidate_score.frequency_sum_khz =
+				    ReconciliationFrequencySum(candidate.workers, worker_topology);
+				if (ReconciliationScorePreferred(candidate_score, best_score)) {
+					best_plan = std::move(candidate);
+					best_score = candidate_score;
+					found = true;
+				}
+			}
+		}
+		if (!found || !ReconciliationScorePreferred(best_score, current_score)) {
+			break;
+		}
+		plan = std::move(best_plan);
+		current_score = best_score;
+	}
+	if (CompareReconciliationMetric(current_score.sla_cost_violation, 0) > 0 ||
+	    CompareReconciliationMetric(current_score.fragility_violation, 0) > 0) {
+		std::ostringstream message;
+		message << std::setprecision(17)
+		        << "shared-domain reconciliation cannot preserve the accepted SLA plan: cost_violation="
+		        << current_score.sla_cost_violation
+		        << " fragility_violation=" << current_score.fragility_violation;
+		error = message.str();
+		return false;
+	}
 	return true;
 }
 
@@ -824,7 +1250,7 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 		result.error = "SLA-energy planner could not place mandatory workers";
 		return result;
 	}
-	result.diagnostics.domain_frequency_inflations = CountDomainFrequencyInflations(result.workers);
+	result.diagnostics.worker_frequency_adjustments = CountWorkerFrequencyAdjustments(result.workers);
 	result.diagnostics.mandatory_workers = result.workers.size();
 	string validation_error;
 	if (!RebuildQueryAllocationsFromPreferences(result, input, validation_error)) {
@@ -1060,7 +1486,36 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 		    logical_token.query_index, QuerySLAEnergyOptionalStage::REFERENCE_FALLBACK, slot->socket_id,
 		    reference_hardware, {reference_hardware});
 		if (!token.valid) {
-			result.error = "SLA-energy planner could not model a fixed optional reference fallback";
+			const auto &query = input.queries[logical_token.query_index];
+			const auto &allocation = result.queries[logical_token.query_index];
+			std::ostringstream message;
+			message << std::setprecision(17)
+			        << "SLA-energy planner could not model a fixed optional reference fallback:"
+			        << " query_index=" << logical_token.query_index
+			        << " db_query_id=" << query.sla_input.metadata.db_query_id
+			        << " pipeline_id=" << query.sla_input.work.pipeline_id
+			        << " event_kind=" << static_cast<uint32_t>(query.reference_model.event_kind)
+			        << " logical_worker_ordinal=" << logical_token.worker_ordinal
+			        << " logical_gain=" << logical_token.gain
+			        << " mandatory_target=" << input.logical_allocation.mandatory[logical_token.query_index]
+			        << " optional_target=" << input.logical_allocation.optional[logical_token.query_index]
+			        << " mandatory_placed=" << allocation.mandatory_workers
+			        << " optional_placed=" << allocation.optional_workers
+			        << " allocation_workers=" << allocation.workers.size()
+			        << " demand_cap=" << query.reference_model.demand_cap
+			        << " service_rate_count=" << query.reference_model.service_rates.size()
+			        << " optional_risk_count=" << query.reference_model.optional_risk.size()
+			        << " aggregate_service_rate=" << allocation.aggregate_service_rate
+			        << " predicted_optional_risk=" << allocation.predicted_optional_risk
+			        << " reference_core_khz=" << reference_hardware.core_frequency_khz
+			        << " reference_uncore_khz=" << reference_hardware.uncore_frequency_khz;
+			auto ordinal = allocation.workers.size();
+			if (ordinal + 1 < query.reference_model.service_rates.size()) {
+				message << " reference_increment="
+				        << query.reference_model.service_rates[ordinal + 1] -
+				               query.reference_model.service_rates[ordinal];
+			}
+			result.error = message.str();
 			return result;
 		}
 		CommitOptionalToken(result.queries[token.query_index], input.queries[token.query_index], token);
@@ -1075,13 +1530,12 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 		}
 	}
 
-	ResolveActualHardware(result.workers, input.topology);
-	result.diagnostics.domain_frequency_inflations = CountDomainFrequencyInflations(result.workers);
 	validation_error.clear();
-	if (!RebuildQueryAllocationsFromPreferences(result, input, validation_error)) {
-		result.error = "SLA-energy planner could not validate final hardware preferences: " + validation_error;
+	if (!ReconcileHardwareDomains(result, input, validation_error)) {
+		result.error = "SLA-energy planner could not reconcile shared hardware domains: " + validation_error;
 		return result;
 	}
+	result.diagnostics.worker_frequency_adjustments = CountWorkerFrequencyAdjustments(result.workers);
 	for (idx_t query_index = 0; query_index < input.queries.size(); query_index++) {
 		auto &allocation = result.queries[query_index];
 		auto simulation = allocation;

@@ -13,15 +13,19 @@
 #include "duckdb/main/database.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <limits>
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <time.h>
 #include <tuple>
 
 #ifdef __linux__
@@ -55,6 +59,33 @@ static constexpr uint64_t IA32_PERF_CTL = 0x199;
 static constexpr uint64_t MSR_UNCORE_RATIO_LIMIT = 0x620;
 static constexpr uint32_t SUPPORTED_INTEL_FAMILY = 6;
 static constexpr uint32_t SUPPORTED_INTEL_MODEL = 79;
+
+static uint64_t HardwareTimestampNs() {
+	return NumericCast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	        .count());
+}
+
+static uint64_t HardwareThreadCPUNs() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+	struct timespec value;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0) {
+		return NumericCast<uint64_t>(value.tv_sec) * 1000000000ULL + NumericCast<uint64_t>(value.tv_nsec);
+	}
+#endif
+	return 0;
+}
+
+static uint64_t HardwareDurationNs(uint64_t end_ns, uint64_t start_ns) {
+	return end_ns >= start_ns ? end_ns - start_ns : 0;
+}
+
+static void UpdateAtomicMaximum(std::atomic<uint64_t> &target, uint64_t value) {
+	auto current = target.load(std::memory_order_relaxed);
+	while (current < value &&
+	       !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+	}
+}
 
 static double LookupCalibratedPower(const QueryHardwarePowerModelSnapshot &model, int socket_id,
 	                                uint32_t core_frequency_khz, uint32_t uncore_frequency_khz) {
@@ -149,13 +180,38 @@ static uint64_t SetUncoreRatio(uint64_t value, uint32_t target_khz) {
 } // namespace
 
 struct QueryHardwareManagerState {
+	static constexpr idx_t MAX_TRANSITION_TRACE_ROWS = 250000;
+
 	explicit QueryHardwareManagerState(DatabaseInstance &db_p) : db(db_p) {
-		core_levels_khz = {1200000, 1500000, 1800000, 2200000, 2600000, 3000000};
+		core_levels_khz = {1200000, 1500000, 1800000, 2200000, 2600000, 3000000, 3500000};
 		uncore_levels_khz = {1200000, 1800000, 2200000, 2800000};
 	}
 
 	~QueryHardwareManagerState() {
 		DeactivateLocked();
+	}
+
+	QueryRequestHardwareConfiguration AppliedConfigurationForWorkerLocked(idx_t worker_id) const {
+		auto worker = workers.find(worker_id);
+		if (worker == workers.end()) {
+			return QueryRequestHardwareConfiguration();
+		}
+		QueryRequestHardwareConfiguration result;
+		auto core = current_core_khz.find(worker->second.core);
+		auto uncore = current_uncore_khz.find(worker->second.core.socket_id);
+		result.core_frequency_khz = core == current_core_khz.end() ? Reference().core_frequency_khz : core->second;
+		result.uncore_frequency_khz =
+		    uncore == current_uncore_khz.end() ? Reference().uncore_frequency_khz : uncore->second;
+		return result;
+	}
+
+	void AppendTransitionTrace(QueryHardwareTransitionSnapshot trace) {
+		lock_guard<mutex> guard(transition_trace_lock);
+		if (transition_trace.size() >= MAX_TRANSITION_TRACE_ROWS) {
+			transition_trace.pop_front();
+			transition_trace_dropped_count++;
+		}
+		transition_trace.push_back(std::move(trace));
 	}
 
 	WorkerTopology BuildWorkerTopology(idx_t worker_id, int logical_cpu) {
@@ -195,8 +251,10 @@ struct QueryHardwareManagerState {
 	}
 
 	void UnregisterWorker(idx_t worker_id) {
+		lock_guard<mutex> publish_guard(target_plan_lock);
 		lock_guard<mutex> guard(lock);
 		workers.erase(worker_id);
+		worker_contexts.erase(worker_id);
 		RebuildTopologyDomainsLocked();
 	}
 
@@ -314,10 +372,10 @@ struct QueryHardwareManagerState {
 
 	void LoadPowerModelLocked() {
 		power_model = QueryHardwarePowerModelSnapshot();
-		power_model.minimum_core_frequency_khz = core_levels_khz.front();
-		power_model.minimum_uncore_frequency_khz = uncore_levels_khz.front();
 		auto path = db.config.options.query_sla_energy_power_model_path;
 		if (path.empty()) {
+			power_model.minimum_core_frequency_khz = core_levels_khz.front();
+			power_model.minimum_uncore_frequency_khz = uncore_levels_khz.front();
 			return;
 		}
 		std::ifstream input(path.c_str());
@@ -326,6 +384,9 @@ struct QueryHardwareManagerState {
 		}
 		using PowerKey = std::tuple<int, uint32_t, uint32_t>;
 		std::map<PowerKey, std::pair<double, idx_t>> aggregates;
+		std::set<uint32_t> calibrated_core_levels;
+		std::set<uint32_t> calibrated_uncore_levels;
+		std::set<int> calibrated_sockets;
 		string line;
 		while (std::getline(input, line)) {
 			if (line.empty() || line[0] == '#') {
@@ -352,6 +413,9 @@ struct QueryHardwareManagerState {
 				auto &aggregate = aggregates[PowerKey(socket_id, core_khz, uncore_khz)];
 				aggregate.first += base_power_w;
 				aggregate.second++;
+				calibrated_core_levels.insert(core_khz);
+				calibrated_uncore_levels.insert(uncore_khz);
+				calibrated_sockets.insert(socket_id);
 			} catch (...) {
 				continue;
 			}
@@ -368,6 +432,19 @@ struct QueryHardwareManagerState {
 		if (!power_model.valid) {
 			throw InvalidInputException("SLA-energy power model %s contains no usable calibration rows", path);
 		}
+		core_levels_khz.assign(calibrated_core_levels.begin(), calibrated_core_levels.end());
+		uncore_levels_khz.assign(calibrated_uncore_levels.begin(), calibrated_uncore_levels.end());
+		power_model.minimum_core_frequency_khz = core_levels_khz.front();
+		power_model.minimum_uncore_frequency_khz = uncore_levels_khz.front();
+		auto reference_core_khz = core_levels_khz.back();
+		auto reference_uncore_khz = uncore_levels_khz.back();
+		for (auto socket_id : calibrated_sockets) {
+			if (LookupCalibratedPower(power_model, socket_id, reference_core_khz, reference_uncore_khz) <= 0) {
+				throw InvalidInputException(
+				    "SLA-energy power model %s has no reference calibration for socket %d at %u/%u kHz",
+				    path, socket_id, reference_core_khz, reference_uncore_khz);
+			}
+		}
 	}
 
 	void RestoreHardwareLocked() {
@@ -380,8 +457,9 @@ struct QueryHardwareManagerState {
 				continue;
 			}
 			try {
-				WriteMSR(fd->second, IA32_PERF_CTL, entry.second);
-				msr_write_count++;
+					WriteMSR(fd->second, IA32_PERF_CTL, entry.second);
+					msr_write_count++;
+					core_msr_write_count++;
 				if (ReadMSR(fd->second, IA32_PERF_CTL) == entry.second) {
 					restoration_verified_count++;
 				} else {
@@ -404,8 +482,9 @@ struct QueryHardwareManagerState {
 				continue;
 			}
 			try {
-				WriteMSR(fd->second, MSR_UNCORE_RATIO_LIMIT, entry.second);
-				msr_write_count++;
+					WriteMSR(fd->second, MSR_UNCORE_RATIO_LIMIT, entry.second);
+					msr_write_count++;
+					uncore_msr_write_count++;
 				if (ReadMSR(fd->second, MSR_UNCORE_RATIO_LIMIT) == entry.second) {
 					restoration_verified_count++;
 				} else {
@@ -445,6 +524,7 @@ struct QueryHardwareManagerState {
 		uncore_representative_cpu.clear();
 		current_core_khz.clear();
 		current_uncore_khz.clear();
+		worker_contexts.clear();
 		power_model = QueryHardwarePowerModelSnapshot();
 		active = false;
 		hardware_control_enabled = false;
@@ -458,6 +538,8 @@ struct QueryHardwareManagerState {
 	}
 
 	void ApplyCoreLocked(const CoreDomainKey &domain, uint32_t target_khz) {
+		auto wall_start_ns = HardwareTimestampNs();
+		auto cpu_start_ns = HardwareThreadCPUNs();
 		if (hardware_control_enabled) {
 #ifdef __linux__
 			auto cpus = core_cpus.find(domain);
@@ -471,6 +553,7 @@ struct QueryHardwareManagerState {
 				auto requested = SetCoreRatio(current, target_khz);
 				WriteMSR(fd, IA32_PERF_CTL, requested);
 				msr_write_count++;
+				core_msr_write_count++;
 				auto verified = ReadMSR(fd, IA32_PERF_CTL);
 				if (CoreRatioToKHz(verified) != target_khz) {
 					verification_failure_count++;
@@ -480,9 +563,18 @@ struct QueryHardwareManagerState {
 #endif
 		}
 		current_core_khz[domain] = target_khz;
+		core_transition_count.fetch_add(1, std::memory_order_relaxed);
+		auto wall_ns = HardwareDurationNs(HardwareTimestampNs(), wall_start_ns);
+		auto cpu_end_ns = HardwareThreadCPUNs();
+		auto cpu_ns = cpu_start_ns == 0 || cpu_end_ns == 0 ? 0 : HardwareDurationNs(cpu_end_ns, cpu_start_ns);
+		hardware_apply_wall_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+		hardware_apply_thread_cpu_ns.fetch_add(cpu_ns, std::memory_order_relaxed);
+		UpdateAtomicMaximum(hardware_apply_max_wall_ns, wall_ns);
 	}
 
 	void ApplyUncoreLocked(int socket_id, uint32_t target_khz) {
+		auto wall_start_ns = HardwareTimestampNs();
+		auto cpu_start_ns = HardwareThreadCPUNs();
 		if (hardware_control_enabled) {
 #ifdef __linux__
 			auto representative = uncore_representative_cpu.find(socket_id);
@@ -495,6 +587,7 @@ struct QueryHardwareManagerState {
 			auto requested = SetUncoreRatio(current, target_khz);
 			WriteMSR(fd, MSR_UNCORE_RATIO_LIMIT, requested);
 			msr_write_count++;
+			uncore_msr_write_count++;
 			auto verified = ReadMSR(fd, MSR_UNCORE_RATIO_LIMIT);
 			if (UncoreRatioToKHz(verified) != target_khz || NumericCast<uint32_t>((verified >> 8) & 0x7fU) * 100000U != target_khz) {
 				verification_failure_count++;
@@ -503,6 +596,13 @@ struct QueryHardwareManagerState {
 #endif
 		}
 		current_uncore_khz[socket_id] = target_khz;
+		uncore_transition_count.fetch_add(1, std::memory_order_relaxed);
+		auto wall_ns = HardwareDurationNs(HardwareTimestampNs(), wall_start_ns);
+		auto cpu_end_ns = HardwareThreadCPUNs();
+		auto cpu_ns = cpu_start_ns == 0 || cpu_end_ns == 0 ? 0 : HardwareDurationNs(cpu_end_ns, cpu_start_ns);
+		hardware_apply_wall_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+		hardware_apply_thread_cpu_ns.fetch_add(cpu_ns, std::memory_order_relaxed);
+		UpdateAtomicMaximum(hardware_apply_max_wall_ns, wall_ns);
 	}
 
 	void PublishTargetsSerial(std::shared_ptr<const QueryHardwareTargetPlan> plan) {
@@ -510,7 +610,10 @@ struct QueryHardwareManagerState {
 			return;
 		}
 		std::atomic_store_explicit(&published_plan, plan, std::memory_order_release);
-		lock_guard<mutex> guard(lock);
+		auto lock_wait_start_ns = HardwareTimestampNs();
+		unique_lock<mutex> guard(lock);
+		manager_lock_wait_ns.fetch_add(HardwareDurationNs(HardwareTimestampNs(), lock_wait_start_ns),
+		                               std::memory_order_relaxed);
 		if (!active) {
 			return;
 		}
@@ -549,21 +652,126 @@ struct QueryHardwareManagerState {
 	}
 
 	void PublishTargets(std::shared_ptr<const QueryHardwareTargetPlan> plan) {
-		lock_guard<mutex> publish_guard(target_plan_lock);
+		publish_call_count.fetch_add(1, std::memory_order_relaxed);
+		auto lock_wait_start_ns = HardwareTimestampNs();
+		unique_lock<mutex> publish_guard(target_plan_lock);
+		target_plan_lock_wait_ns.fetch_add(HardwareDurationNs(HardwareTimestampNs(), lock_wait_start_ns),
+		                                  std::memory_order_relaxed);
 		PublishTargetsSerial(std::move(plan));
 	}
 
 	void UpdateWorkerTarget(idx_t worker_id, const QueryRequestHardwareConfiguration &hardware, bool assigned,
-	                        uint64_t generation) {
-		lock_guard<mutex> publish_guard(target_plan_lock);
+	                        uint64_t generation, const QueryHardwareTransitionContext &context) {
+		auto update_start_ns = HardwareTimestampNs();
+		auto update_cpu_start_ns = HardwareThreadCPUNs();
+		worker_target_update_count.fetch_add(1, std::memory_order_relaxed);
+		auto lock_wait_start_ns = HardwareTimestampNs();
+		unique_lock<mutex> publish_guard(target_plan_lock);
+		auto target_lock_wait = HardwareDurationNs(HardwareTimestampNs(), lock_wait_start_ns);
+		target_plan_lock_wait_ns.fetch_add(target_lock_wait, std::memory_order_relaxed);
 		auto current = std::atomic_load_explicit(&published_plan, std::memory_order_acquire);
+		QueryHardwareWorkerTarget previous_target;
+		bool previous_target_found = false;
 		if (current) {
 			for (const auto &target : current->workers) {
-				if (target.worker_id == worker_id && target.assigned == assigned &&
-				    (!assigned || target.hardware == hardware)) {
-					return;
+				if (target.worker_id == worker_id) {
+					previous_target = target;
+					previous_target_found = true;
+					break;
 				}
 			}
+		}
+		QueryHardwareTransitionContext previous_context;
+		auto context_entry = worker_contexts.find(worker_id);
+		if (context_entry != worker_contexts.end()) {
+			previous_context = context_entry->second;
+		}
+		auto trace_context = assigned ? context : previous_context;
+		auto trace_enabled = context.trace_enabled || previous_context.trace_enabled;
+		auto owner_same = !assigned ||
+		                  (previous_context.db_query_id != 0 && previous_context.db_query_id == context.db_query_id &&
+		                   previous_context.pipeline_generation == context.pipeline_generation &&
+		                   previous_context.mandatory == context.mandatory &&
+		                   previous_context.optional == context.optional);
+		auto target_same = previous_target_found && previous_target.assigned == assigned && owner_same &&
+		                   (!assigned || previous_target.hardware == hardware);
+		auto lease_handoff = target_same && assigned && previous_context.lease_generation != 0 &&
+		                     previous_context.lease_generation != context.lease_generation;
+
+		QueryHardwareTransitionSnapshot trace;
+		if (trace_enabled) {
+			trace.timestamp_ns = update_start_ns;
+			trace.plan_generation = generation;
+			trace.db_query_id = trace_context.db_query_id;
+			trace.request_id = trace_context.request_id;
+			trace.pipeline_generation = trace_context.pipeline_generation;
+			trace.lease_generation = trace_context.lease_generation;
+			trace.pipeline_id = trace_context.pipeline_id;
+			trace.worker_id = worker_id;
+			trace.mandatory = trace_context.mandatory;
+			trace.optional = trace_context.optional;
+			trace.previous_assigned = previous_target_found && previous_target.assigned;
+			trace.assigned = assigned;
+			trace.previous_hardware =
+			    previous_target_found ? previous_target.hardware : QueryRequestHardwareConfiguration();
+			trace.requested_hardware = assigned ? hardware : Minimum();
+			auto manager_wait_start_ns = HardwareTimestampNs();
+			unique_lock<mutex> manager_guard(lock);
+			manager_lock_wait_ns.fetch_add(HardwareDurationNs(HardwareTimestampNs(), manager_wait_start_ns),
+			                               std::memory_order_relaxed);
+			auto topology = workers.find(worker_id);
+			if (topology != workers.end()) {
+				trace.logical_cpu = topology->second.logical_cpu;
+				trace.socket_id = topology->second.core.socket_id;
+				trace.physical_core_id = topology->second.core.core_id;
+			}
+			trace.applied_before = AppliedConfigurationForWorkerLocked(worker_id);
+			trace.msr_write_delta = msr_write_count;
+		}
+
+		if (target_same) {
+			worker_target_noop_count.fetch_add(1, std::memory_order_relaxed);
+			if (lease_handoff) {
+				worker_lease_handoff_count.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (assigned) {
+				worker_contexts[worker_id] = context;
+			} else {
+				worker_contexts.erase(worker_id);
+			}
+			publish_guard.unlock();
+			auto update_wall_ns = HardwareDurationNs(HardwareTimestampNs(), update_start_ns);
+			auto update_cpu_end_ns = HardwareThreadCPUNs();
+			auto update_cpu_ns = update_cpu_start_ns == 0 || update_cpu_end_ns == 0
+			                         ? 0
+			                         : HardwareDurationNs(update_cpu_end_ns, update_cpu_start_ns);
+			target_update_wall_ns.fetch_add(update_wall_ns, std::memory_order_relaxed);
+			target_update_thread_cpu_ns.fetch_add(update_cpu_ns, std::memory_order_relaxed);
+			UpdateAtomicMaximum(target_update_max_wall_ns, update_wall_ns);
+			if (trace_enabled) {
+				trace.action = lease_handoff ? "lease_handoff" : "noop";
+				trace.applied_after = trace.applied_before;
+				trace.msr_write_delta = 0;
+				trace.target_plan_lock_wait_ns = target_lock_wait;
+				trace.update_wall_ns = update_wall_ns;
+				trace.update_thread_cpu_ns = update_cpu_ns;
+				AppendTransitionTrace(std::move(trace));
+			}
+			return;
+		}
+
+		auto previous_assigned = previous_target_found && previous_target.assigned;
+		if (!previous_assigned && assigned) {
+			worker_assignment_count.fetch_add(1, std::memory_order_relaxed);
+			trace.action = "assign";
+		} else if (previous_assigned && !assigned) {
+			worker_release_count.fetch_add(1, std::memory_order_relaxed);
+			trace.action = "release";
+		} else if (previous_assigned && assigned) {
+			worker_retarget_count.fetch_add(1, std::memory_order_relaxed);
+			trace.action = "retarget";
+		} else {
+			trace.action = "initialize_idle";
 		}
 		auto next = std::make_shared<QueryHardwareTargetPlan>();
 		if (current) {
@@ -587,7 +795,39 @@ struct QueryHardwareManagerState {
 			target.assigned = assigned;
 			next->workers.push_back(target);
 		}
+		if (assigned) {
+			worker_contexts[worker_id] = context;
+		} else {
+			worker_contexts.erase(worker_id);
+		}
 		PublishTargetsSerial(std::move(next));
+		if (trace_enabled) {
+			auto manager_wait_start_ns = HardwareTimestampNs();
+			unique_lock<mutex> manager_guard(lock);
+			manager_lock_wait_ns.fetch_add(HardwareDurationNs(HardwareTimestampNs(), manager_wait_start_ns),
+			                               std::memory_order_relaxed);
+			trace.applied_after = AppliedConfigurationForWorkerLocked(worker_id);
+			trace.msr_write_delta = msr_write_count - trace.msr_write_delta;
+			trace.core_changed =
+			    trace.applied_before.core_frequency_khz != trace.applied_after.core_frequency_khz;
+			trace.uncore_changed =
+			    trace.applied_before.uncore_frequency_khz != trace.applied_after.uncore_frequency_khz;
+		}
+		publish_guard.unlock();
+		auto update_wall_ns = HardwareDurationNs(HardwareTimestampNs(), update_start_ns);
+		auto update_cpu_end_ns = HardwareThreadCPUNs();
+		auto update_cpu_ns = update_cpu_start_ns == 0 || update_cpu_end_ns == 0
+		                         ? 0
+		                         : HardwareDurationNs(update_cpu_end_ns, update_cpu_start_ns);
+		target_update_wall_ns.fetch_add(update_wall_ns, std::memory_order_relaxed);
+		target_update_thread_cpu_ns.fetch_add(update_cpu_ns, std::memory_order_relaxed);
+		UpdateAtomicMaximum(target_update_max_wall_ns, update_wall_ns);
+		if (trace_enabled) {
+			trace.target_plan_lock_wait_ns = target_lock_wait;
+			trace.update_wall_ns = update_wall_ns;
+			trace.update_thread_cpu_ns = update_cpu_ns;
+			AppendTransitionTrace(std::move(trace));
+		}
 	}
 
 	bool IsWorkerAtConfiguration(idx_t worker_id, const QueryRequestHardwareConfiguration &hardware) const {
@@ -614,13 +854,7 @@ struct QueryHardwareManagerState {
 			if (entry.second.logical_cpu != logical_cpu) {
 				continue;
 			}
-			QueryRequestHardwareConfiguration result;
-			auto core = current_core_khz.find(entry.second.core);
-			auto uncore = current_uncore_khz.find(entry.second.core.socket_id);
-			result.core_frequency_khz = core == current_core_khz.end() ? Reference().core_frequency_khz : core->second;
-			result.uncore_frequency_khz =
-			    uncore == current_uncore_khz.end() ? Reference().uncore_frequency_khz : uncore->second;
-			return result;
+			return AppliedConfigurationForWorkerLocked(entry.first);
 		}
 		return QueryRequestHardwareConfiguration();
 	}
@@ -692,9 +926,32 @@ struct QueryHardwareManagerState {
 	std::map<int, int> uncore_representative_cpu;
 	std::map<CoreDomainKey, uint32_t> current_core_khz;
 	std::map<int, uint32_t> current_uncore_khz;
+	std::unordered_map<idx_t, QueryHardwareTransitionContext> worker_contexts;
 	std::shared_ptr<const QueryHardwareTargetPlan> published_plan;
 	uint64_t applied_generation = 0;
 	uint64_t msr_write_count = 0;
+	uint64_t core_msr_write_count = 0;
+	uint64_t uncore_msr_write_count = 0;
+	std::atomic<uint64_t> publish_call_count {0};
+	std::atomic<uint64_t> worker_target_update_count {0};
+	std::atomic<uint64_t> worker_target_noop_count {0};
+	std::atomic<uint64_t> worker_assignment_count {0};
+	std::atomic<uint64_t> worker_release_count {0};
+	std::atomic<uint64_t> worker_retarget_count {0};
+	std::atomic<uint64_t> worker_lease_handoff_count {0};
+	std::atomic<uint64_t> core_transition_count {0};
+	std::atomic<uint64_t> uncore_transition_count {0};
+	std::atomic<uint64_t> target_plan_lock_wait_ns {0};
+	std::atomic<uint64_t> manager_lock_wait_ns {0};
+	std::atomic<uint64_t> target_update_wall_ns {0};
+	std::atomic<uint64_t> target_update_thread_cpu_ns {0};
+	std::atomic<uint64_t> target_update_max_wall_ns {0};
+	std::atomic<uint64_t> hardware_apply_wall_ns {0};
+	std::atomic<uint64_t> hardware_apply_thread_cpu_ns {0};
+	std::atomic<uint64_t> hardware_apply_max_wall_ns {0};
+	mutable mutex transition_trace_lock;
+	std::deque<QueryHardwareTransitionSnapshot> transition_trace;
+	uint64_t transition_trace_dropped_count = 0;
 	uint64_t verification_failure_count = 0;
 	uint64_t restoration_attempt_count = 0;
 	uint64_t restoration_verified_count = 0;
@@ -733,8 +990,9 @@ void QueryHardwareManager::PublishTargets(std::shared_ptr<const QueryHardwareTar
 }
 
 void QueryHardwareManager::UpdateWorkerTarget(idx_t worker_id, const QueryRequestHardwareConfiguration &hardware,
-	                                          bool assigned, uint64_t generation) {
-	state->UpdateWorkerTarget(worker_id, hardware, assigned, generation);
+	                                          bool assigned, uint64_t generation,
+	                                          const QueryHardwareTransitionContext &context) {
+	state->UpdateWorkerTarget(worker_id, hardware, assigned, generation, context);
 }
 
 bool QueryHardwareManager::IsWorkerAtConfiguration(idx_t worker_id,
@@ -830,6 +1088,29 @@ QueryHardwareManagerSnapshot QueryHardwareManager::GetSnapshot() const {
 	result.physical_core_domains = state->core_cpus.size();
 	result.socket_domains = state->socket_cpus.size();
 	result.msr_write_count = state->msr_write_count;
+	result.core_msr_write_count = state->core_msr_write_count;
+	result.uncore_msr_write_count = state->uncore_msr_write_count;
+	result.publish_call_count = state->publish_call_count.load(std::memory_order_relaxed);
+	result.worker_target_update_count = state->worker_target_update_count.load(std::memory_order_relaxed);
+	result.worker_target_noop_count = state->worker_target_noop_count.load(std::memory_order_relaxed);
+	result.worker_assignment_count = state->worker_assignment_count.load(std::memory_order_relaxed);
+	result.worker_release_count = state->worker_release_count.load(std::memory_order_relaxed);
+	result.worker_retarget_count = state->worker_retarget_count.load(std::memory_order_relaxed);
+	result.worker_lease_handoff_count = state->worker_lease_handoff_count.load(std::memory_order_relaxed);
+	result.core_transition_count = state->core_transition_count.load(std::memory_order_relaxed);
+	result.uncore_transition_count = state->uncore_transition_count.load(std::memory_order_relaxed);
+	result.target_plan_lock_wait_ns = state->target_plan_lock_wait_ns.load(std::memory_order_relaxed);
+	result.manager_lock_wait_ns = state->manager_lock_wait_ns.load(std::memory_order_relaxed);
+	result.target_update_wall_ns = state->target_update_wall_ns.load(std::memory_order_relaxed);
+	result.target_update_thread_cpu_ns = state->target_update_thread_cpu_ns.load(std::memory_order_relaxed);
+	result.target_update_max_wall_ns = state->target_update_max_wall_ns.load(std::memory_order_relaxed);
+	result.hardware_apply_wall_ns = state->hardware_apply_wall_ns.load(std::memory_order_relaxed);
+	result.hardware_apply_thread_cpu_ns = state->hardware_apply_thread_cpu_ns.load(std::memory_order_relaxed);
+	result.hardware_apply_max_wall_ns = state->hardware_apply_max_wall_ns.load(std::memory_order_relaxed);
+	{
+		lock_guard<mutex> trace_guard(state->transition_trace_lock);
+		result.transition_trace_dropped_count = state->transition_trace_dropped_count;
+	}
 	result.verification_failure_count = state->verification_failure_count;
 	result.restoration_attempt_count = state->restoration_attempt_count;
 	result.restoration_verified_count = state->restoration_verified_count;
@@ -838,6 +1119,16 @@ QueryHardwareManagerSnapshot QueryHardwareManager::GetSnapshot() const {
 	result.status = state->status;
 	result.restoration_status = state->restoration_status;
 	return result;
+}
+
+vector<QueryHardwareTransitionSnapshot> QueryHardwareManager::GetTransitionTrace() const {
+	lock_guard<mutex> guard(state->transition_trace_lock);
+	return vector<QueryHardwareTransitionSnapshot>(state->transition_trace.begin(), state->transition_trace.end());
+}
+
+uint64_t QueryHardwareManager::TransitionTraceDroppedCount() const {
+	lock_guard<mutex> guard(state->transition_trace_lock);
+	return state->transition_trace_dropped_count;
 }
 
 } // namespace duckdb

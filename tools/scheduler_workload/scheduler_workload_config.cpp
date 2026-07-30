@@ -125,11 +125,16 @@ static void ValidateConfig(WorkloadConfig &config) {
 	if (config.admission_cap == 0) {
 		throw InvalidInputException("--admission-cap must be positive");
 	}
+	if (config.sla_epoch_ms == 0) {
+		throw InvalidInputException("--sla-epoch-ms must be positive");
+	}
 	if (config.repetitions == 0) {
 		throw InvalidInputException("--repetitions must be positive");
 	}
-	if (config.sla_tag <= 0 || config.sla_penalty_per_s < 0 || config.max_driver_lag_ms < 0) {
-		throw InvalidInputException("SLA tag must be positive; penalty and driver-lag limit must be non-negative");
+	if (config.sla_tag <= 0 || config.sla_penalty_per_s < 0 || config.max_driver_lag_ms < 0 ||
+	    config.no_progress_diagnostic_s < 0) {
+		throw InvalidInputException(
+		    "SLA tag must be positive; penalty, driver-lag limit, and diagnostic interval must be non-negative");
 	}
 	if (config.command == WorkloadCommand::CALIBRATE || config.command == WorkloadCommand::TRAIN_PROFILES ||
 	    config.command == WorkloadCommand::RUN) {
@@ -182,6 +187,10 @@ static void ValidateConfig(WorkloadConfig &config) {
 			throw InvalidInputException("--energy-attribution-period-ms must be positive");
 		}
 	}
+	if ((config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled) &&
+	    config.pin_threads == "off") {
+		throw InvalidInputException("SLA-energy and energy attribution require --pin-threads on or auto");
+	}
 }
 
 } // namespace
@@ -229,12 +238,16 @@ Schedule options:
 Run options:
   --schedule PATH             Saved schedule CSV.
 	  --scheduler default|stride|sla|sla_energy
+	  --pin-threads auto|on|off  Worker pinning mode (default: auto; attribution forces on).
   --profile-input PATH        Optional scheduler profile snapshot.
   --profile-output PATH       Export updated profile state after training/run.
   --output-dir PATH           Run timeline and summary directory.
   --submitter-threads N       Fixed native submission pool size (default: 2).
-  --completion-threads N      Fixed event/completion pool size (default: 2).
-  --max-driver-lag-ms X       p99 arrival, DB submission, and admission-resume gate (default: 10).
+	  --completion-threads N      Fixed event/completion pool size (default: 2).
+	  --max-driver-lag-ms X       p99 arrival, DB submission, and admission-resume gate (default: 10).
+	  --no-progress-diagnostic-s X
+	                              Print live scheduler/request state after X seconds without completion (default: 0).
+	  --sla-epoch-ms N           SLA scheduler epoch duration in milliseconds (default: 200).
 	  --scheduler-trace-queries Q2,Q9,...
 	                              Enable debug epoch tracing only for these templates.
 	  --sla-residual-policy work_conserving|park
@@ -250,6 +263,10 @@ Run options:
 	                              Enable periodic RAPL attribution independently of policy (default: off).
 	  --energy-attribution-period-ms N
 	                              Periodic RAPL attribution interval (default: 100).
+	  --energy-attribution-model legacy|process_shadow|process
+	                              Select direct, shadow, or authoritative process attribution.
+	  --energy-process-required on|off
+	                              Fail if the embedded eBPF/PMU backend is unavailable (default: off).
 	  --energy-attribution-export on|off
 	                              Export aggregate attribution diagnostics (default: on).
 	  --energy-attribution-debug-export on|off
@@ -346,6 +363,11 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.profile_snapshot_out = value;
 		} else if (name == "scheduler") {
 			config.scheduler_policy = ParseScheduler(value);
+		} else if (name == "pin-threads") {
+			config.pin_threads = StringUtil::Lower(value);
+			if (config.pin_threads != "auto" && config.pin_threads != "on" && config.pin_threads != "off") {
+				throw InvalidInputException("--pin-threads must be one of: auto, on, off");
+			}
 		} else if (name == "threads") {
 			config.threads = ParseUint(value, name);
 		} else if (name == "submitter-threads") {
@@ -366,8 +388,12 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.sla_tag = ParseDouble(value, name);
 		} else if (name == "sla-penalty-per-s") {
 			config.sla_penalty_per_s = ParseDouble(value, name);
-		} else if (name == "max-driver-lag-ms") {
+			} else if (name == "max-driver-lag-ms") {
 			config.max_driver_lag_ms = ParseDouble(value, name);
+		} else if (name == "no-progress-diagnostic-s") {
+			config.no_progress_diagnostic_s = ParseDouble(value, name);
+		} else if (name == "sla-epoch-ms") {
+			config.sla_epoch_ms = ParseUint(value, name);
 		} else if (name == "sla-residual-policy") {
 			auto policy = StringUtil::Lower(value);
 			if (policy == "work_conserving") {
@@ -389,6 +415,16 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.energy_attribution_enabled = ParseBool(value, name);
 		} else if (name == "energy-attribution-period-ms") {
 			config.energy_attribution_period_ms = ParseUint(value, name);
+		} else if (name == "energy-attribution-model") {
+			config.energy_attribution_model = StringUtil::Lower(value);
+			if (config.energy_attribution_model != "legacy" &&
+			    config.energy_attribution_model != "process_shadow" &&
+			    config.energy_attribution_model != "process") {
+				throw InvalidInputException(
+				    "--energy-attribution-model must be one of: legacy, process_shadow, process");
+			}
+		} else if (name == "energy-process-required") {
+			config.energy_process_required = ParseBool(value, name);
 		} else if (name == "energy-attribution-export") {
 			config.energy_attribution_export = ParseBool(value, name);
 		} else if (name == "energy-attribution-debug-export") {

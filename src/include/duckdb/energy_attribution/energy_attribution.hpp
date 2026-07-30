@@ -25,6 +25,9 @@ public:
 };
 
 struct EnergyPerfSnapshot {
+	uint64_t task_clock_ns = 0;
+	uint64_t task_clock_time_enabled = 0;
+	uint64_t task_clock_time_running = 0;
 	uint64_t cycles = 0;
 	uint64_t instructions = 0;
 	uint64_t ref_cycles = 0;
@@ -32,8 +35,13 @@ struct EnergyPerfSnapshot {
 	uint64_t cache_misses = 0;
 	uint64_t llc_misses = 0;
 	uint64_t offcore_responses = 0;
-	uint64_t time_enabled = 0;
-	uint64_t time_running = 0;
+	uint64_t cycles_time_enabled = 0;
+	uint64_t cycles_time_running = 0;
+	uint64_t ref_cycles_time_enabled = 0;
+	uint64_t ref_cycles_time_running = 0;
+	bool task_clock_valid = false;
+	bool cycles_valid = false;
+	bool ref_cycles_valid = false;
 	bool valid = false;
 	bool scaled = false;
 	string status;
@@ -62,7 +70,8 @@ enum class EnergySystemCategory : uint8_t {
 	NONE,
 	SLA_SCHEDULER,
 	STRIDE_SCHEDULER,
-	ENERGY_SAMPLER
+	ENERGY_SAMPLER,
+	DUCKDB_UNINSTRUMENTED
 };
 
 struct EnergySegmentRecord {
@@ -95,6 +104,7 @@ struct EnergySegmentRecord {
 	uint64_t work_units = 0;
 	uint64_t tuples = 0;
 	uint64_t chunks = 0;
+	uint64_t task_clock_ns = 0;
 	double core_freq_hz = 0;
 	double uncore_freq_hz = 0;
 	uint32_t target_core_frequency_khz = 0;

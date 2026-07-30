@@ -28,21 +28,46 @@ struct QuerySLAWorkerSelection {
 	QueryRequestHardwareConfiguration hardware;
 	QuerySchedulerPolicy policy = QuerySchedulerPolicy::DEFAULT;
 	uint64_t plan_generation = 0;
+	uint64_t lease_generation = 0;
 	uint64_t db_query_id = 0;
+	uint64_t request_id = 0;
 	uint64_t pipeline_generation = 0;
+	idx_t pipeline_id = 0;
+	idx_t worker_ordinal = DConstants::INVALID_INDEX;
+	idx_t class_ordinal = DConstants::INVALID_INDEX;
 	bool assigned = false;
 	bool mandatory = false;
 	bool optional = false;
 	bool exploration = false;
+	bool debug_trace_enabled = false;
 };
 
 struct QuerySLASchedulerSnapshot {
+	uint64_t snapshot_timestamp_ns = 0;
+	uint64_t epoch_run_count = 0;
 	uint64_t epoch_generation = 0;
+	uint64_t next_epoch_ns = 0;
+	bool epoch_leader_active = false;
+	bool epoch_sentinel_active = false;
 	uint64_t db_query_id = 0;
 	uint64_t request_id = 0;
+	uint64_t deadline_ns = 0;
+	double deadline_slack_ms = 0;
 	idx_t pipeline_id = 0;
 	uint64_t pipeline_generation = 0;
 	string event_kind;
+	bool event_present = false;
+	bool event_finished = false;
+	bool event_work_snapshot_valid = false;
+	idx_t scheduled_tasks = 0;
+	idx_t finished_tasks = 0;
+	idx_t blocked_tasks = 0;
+	idx_t remaining_tasks = 0;
+	bool parallelism_valid = false;
+	idx_t preferred_parallelism = 0;
+	idx_t event_remaining_work_units = 0;
+	bool producer_present = false;
+	idx_t producer_queued_tasks = 0;
 	bool model_valid = false;
 	string model_error;
 	idx_t demand_cap = 0;
@@ -52,7 +77,14 @@ struct QuerySLASchedulerSnapshot {
 	idx_t mandatory_workers = 0;
 	idx_t optional_workers = 0;
 	idx_t residual_workers = 0;
+	idx_t planned_workers = 0;
 	idx_t assigned_workers = 0;
+	idx_t mandatory_gain_count = 0;
+	idx_t optional_gain_count = 0;
+	double mandatory_cost_zero_workers = 0;
+	double mandatory_cost_one_worker = 0;
+	double first_mandatory_gain = 0;
+	double first_optional_gain = 0;
 	double next_mandatory_gain = 0;
 	double next_optional_gain = 0;
 };
@@ -128,7 +160,7 @@ struct QuerySLASchedulerEpochSnapshot {
 	idx_t energy_epochs_without_optional_only_socket = 0;
 	idx_t energy_profile_fallback_count = 0;
 	idx_t energy_immature_pair_rejections = 0;
-	idx_t energy_domain_frequency_inflations = 0;
+	idx_t energy_worker_frequency_adjustments = 0;
 	double energy_mandatory_target_sla_cost = 0;
 	double energy_mandatory_target_optional_risk = 0;
 	double energy_mandatory_reference_safe_throughput = 0;
@@ -174,11 +206,15 @@ struct QuerySLAEnergyWorkerEpochSnapshot {
 	QueryRequestHardwareConfiguration applied_hardware;
 	double preferred_safe_throughput = 0;
 	double preferred_normalized_edp = 0;
+	double normal_safe_throughput = 0;
+	double normal_active_power_w = 0;
+	double normal_normalized_edp = 0;
 	double optional_fragility_before = 0;
 	double optional_fragility_target = 0;
 	double optional_fragility_after = 0;
 	double optional_gain = 0;
 	uint64_t profile_version = 0;
+	uint64_t normal_profile_version = 0;
 	idx_t worker_ordinal = DConstants::INVALID_INDEX;
 };
 
@@ -212,6 +248,8 @@ public:
 	                                   QuerySLAWorkerSelection *selection = nullptr);
 	QuerySLAContinuationResult CheckTaskContinuation(idx_t worker_id, const QuerySLAWorkerSelection &previous,
 	                                                 QuerySLAWorkerSelection &current);
+	void ReleaseTaskAssignment(idx_t worker_id, const QuerySLAWorkerSelection &previous);
+	bool GetWorkerHardwareReservation(idx_t worker_id, QuerySLAWorkerSelection &reservation);
 	void RequestInitialEpoch();
 	bool TryAcquireEpochSentinel(uint64_t &deadline_ns);
 	void ReleaseEpochSentinel();

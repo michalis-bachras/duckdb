@@ -676,9 +676,15 @@ void Pipeline::RecordProfilerStart(idx_t task_count, idx_t source_max_threads,
 			return;
 		}
 		auto &store = DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore();
+		auto planned_work_units = SourceInputChunksEquiv(source_input_volume);
 		auto continuation = store.ResolvePipelineContinuation(metadata.template_id, metadata.scale_factor, identity,
-		                                                       SourceInputChunksEquiv(source_input_volume));
+		                                                       planned_work_units);
 		auto throughput = store.ResolvePipelineThroughput(metadata.template_id, metadata.scale_factor, identity);
+		if (!throughput.valid) {
+			// Data-dependent execution modes can expose a source-work class that was absent during training.
+			// Bootstrap from conservative continuation history until the first worker publishes a live rate.
+			throughput = DerivePipelineThroughputFromContinuation(continuation, planned_work_units);
+		}
 		auto lifecycle_tail =
 		    store.ResolvePipelineLifecycleTail(metadata.template_id, metadata.scale_factor, identity);
 		lock_guard<mutex> guard(source_work_lock);

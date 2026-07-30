@@ -599,6 +599,41 @@ Value EnergyAttributionEnableSetting::GetSetting(const ClientContext &context) {
 	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.enabled);
 }
 
+void EnergyAttributionModelSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto model = StringUtil::Lower(input.ToString());
+	if (model != "legacy" && model != "process_shadow" && model != "process") {
+		throw ParserException("energy_attribution_model must be 'legacy', 'process_shadow', or 'process'");
+	}
+	ClientConfig::GetConfig(context).energy_attribution.attribution_model = model;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionModelSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.attribution_model =
+	    ClientConfig().energy_attribution.attribution_model;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionModelSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).energy_attribution.attribution_model);
+}
+
+void EnergyAttributionProcessRequiredSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.DefaultCastAs(LogicalType::BOOLEAN);
+	ClientConfig::GetConfig(context).energy_attribution.process_attribution_required = BooleanValue::Get(value);
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+void EnergyAttributionProcessRequiredSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).energy_attribution.process_attribution_required =
+	    ClientConfig().energy_attribution.process_attribution_required;
+	EnergyAttributionManager::ConfigureDatabaseRuntime(context);
+}
+
+Value EnergyAttributionProcessRequiredSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).energy_attribution.process_attribution_required);
+}
+
 void EnergyAttributionOutputDirSetting::SetLocal(ClientContext &context, const Value &input) {
 	ClientConfig::GetConfig(context).energy_attribution.output_dir = input.ToString();
 	EnergyAttributionManager::ConfigureDatabaseRuntime(context);

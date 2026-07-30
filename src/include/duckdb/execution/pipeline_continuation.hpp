@@ -43,7 +43,8 @@ enum class PipelineThroughputEstimateLevel : uint8_t {
 	SOURCE_SINK,
 	SOURCE,
 	GLOBAL_COMPATIBLE,
-	SCALE_FACTOR
+	SCALE_FACTOR,
+	CONTINUATION_FALLBACK
 };
 
 const char *PipelineThroughputEstimateLevelToString(PipelineThroughputEstimateLevel level);
@@ -96,5 +97,8 @@ struct PipelineContinuationEstimate {
 	double p50 = 0;
 	double p90 = 0;
 };
+
+PipelineThroughputEstimate
+DerivePipelineThroughputFromContinuation(const PipelineContinuationEstimate &continuation, idx_t planned_work_units);
 
 } // namespace duckdb

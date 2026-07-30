@@ -21,11 +21,15 @@ struct QuerySLAEnergyPlacedWorker {
 	double preferred_safe_throughput = 0;
 	double preferred_active_power_w = 0;
 	double preferred_normalized_edp = 0;
+	double normal_safe_throughput = 0;
+	double normal_active_power_w = 0;
+	double normal_normalized_edp = 0;
 	double optional_fragility_before = 0;
 	double optional_fragility_target = 0;
 	double optional_fragility_after = 0;
 	double optional_gain = 0;
 	uint64_t profile_version = 0;
+	uint64_t normal_profile_version = 0;
 	idx_t worker_ordinal = DConstants::INVALID_INDEX;
 	QuerySLAEnergyOptionalStage optional_stage = QuerySLAEnergyOptionalStage::NONE;
 	bool mandatory = false;
@@ -46,7 +50,7 @@ struct QuerySLAEnergyPlannerDiagnostics {
 	bool optional_only_socket_available = false;
 	idx_t profile_fallback_count = 0;
 	idx_t immature_pair_rejections = 0;
-	idx_t domain_frequency_inflations = 0;
+	idx_t worker_frequency_adjustments = 0;
 };
 
 struct QuerySLAEnergyPlannerInput {

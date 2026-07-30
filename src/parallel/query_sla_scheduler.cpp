@@ -21,7 +21,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <ctime>
@@ -219,10 +221,10 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 	}
 
 	result.energy_policy = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
+	result.claimable =
+	    (!result.model.mandatory_gain.empty() && result.model.mandatory_gain[0] > 0) ||
+	    (!result.model.optional_gain.empty() && result.model.optional_gain[0] > 0);
 	if (!result.energy_policy) {
-		result.claimable =
-		    (!result.model.mandatory_gain.empty() && result.model.mandatory_gain[0] > 0) ||
-		    (!result.model.optional_gain.empty() && result.model.optional_gain[0] > 0);
 		return result;
 	}
 
@@ -294,7 +296,6 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 		worker_count++;
 		optional_risk = assignment.optional_fragility_after;
 	}
-	result.claimable = !result.dynamic_mandatory_workers.empty() || !result.dynamic_optional_workers.empty();
 	return result;
 }
 
@@ -306,13 +307,20 @@ struct QuerySLASchedulerState {
 
 	struct WorkerAssignment {
 		uint64_t db_query_id = 0;
+		uint64_t request_id = 0;
 		uint64_t pipeline_generation = 0;
+		idx_t pipeline_id = 0;
 		QueryRequestHardwareConfiguration normal_hardware;
 		QueryRequestHardwareConfiguration execution_hardware;
 		uint64_t plan_generation = 0;
+		uint64_t lease_generation = 0;
+		idx_t worker_ordinal = DConstants::INVALID_INDEX;
+		idx_t class_ordinal = DConstants::INVALID_INDEX;
 		bool mandatory = false;
 		bool optional = false;
 		bool exploration = false;
+		bool debug_trace_enabled = false;
+		bool hardware_transition_hold = false;
 	};
 
 	struct QueryState {
@@ -326,19 +334,29 @@ struct QuerySLASchedulerState {
 		idx_t optional_workers = 0;
 		idx_t residual_workers = 0;
 		idx_t assigned_workers = 0;
+		idx_t assigned_mandatory_workers = 0;
+		idx_t assigned_optional_workers = 0;
+		idx_t assigned_residual_workers = 0;
 		vector<QuerySLAEnergyWorkerAssignment> energy_workers;
 		vector<QuerySLAEnergyWorkerAssignment> dynamic_mandatory_workers;
 		vector<QuerySLAEnergyWorkerAssignment> dynamic_optional_workers;
 		bool energy_limited_plan = false;
 		bool residual_dispatch_enabled = true;
-		bool topology_plan_published = false;
 		uint64_t dispatch_version = 0;
 		bool debug_trace_enabled = false;
 	};
 
 	mutable mutex lock;
+	std::condition_variable hardware_plan_cv;
+	bool hardware_plan_publication_in_progress = false;
 	std::unordered_map<uint64_t, QueryState> queries;
+	//! Active task leases. Entries exist only while the corresponding worker owns a task.
 	vector<WorkerAssignment> worker_assignments;
+	//! Topology-aware SLA-energy preferences. Hints never reserve a worker or count as an active task lease.
+	vector<WorkerAssignment> worker_hints;
+	//! Hardware reservations survive tasks and successor pipelines until scheduling or final query teardown replaces them.
+	vector<WorkerAssignment> worker_hardware_reservations;
+	uint64_t next_lease_generation = 0;
 	std::priority_queue<QuerySLADispatchEntry> primary_mandatory;
 	std::priority_queue<QuerySLADispatchEntry> primary_optional;
 	std::priority_queue<QuerySLADispatchEntry> dynamic_mandatory;
@@ -349,7 +367,6 @@ struct QuerySLASchedulerState {
 	atomic<bool> epoch_sentinel {false};
 	atomic<uint64_t> epoch_generation {0};
 	atomic<uint64_t> epoch_run_count {0};
-	atomic<bool> retry_epoch {false};
 	atomic<uint64_t> debug_trace_query_count {0};
 	mutable mutex epoch_trace_lock;
 	std::deque<QuerySLASchedulerEpochSnapshot> epoch_trace;
@@ -365,6 +382,112 @@ struct QuerySLASchedulerState {
 
 static idx_t PlannedWorkers(const QuerySLASchedulerState::QueryState &query) {
 	return query.mandatory_workers + query.optional_workers + query.residual_workers;
+}
+
+static void ReleaseAssignedWorker(QuerySLASchedulerState::QueryState &query,
+	                              const QuerySLASchedulerState::WorkerAssignment &assignment) {
+	if (query.assigned_workers > 0) {
+		query.assigned_workers--;
+	}
+	if (assignment.mandatory) {
+		if (query.assigned_mandatory_workers > 0) {
+			query.assigned_mandatory_workers--;
+		}
+	} else if (assignment.optional) {
+		if (query.assigned_optional_workers > 0) {
+			query.assigned_optional_workers--;
+		}
+	} else if (query.assigned_residual_workers > 0) {
+		query.assigned_residual_workers--;
+	}
+}
+
+static idx_t NextClassOrdinal(const QuerySLASchedulerState &state,
+	                          const QuerySLASchedulerState::QueryState &query, bool mandatory, bool optional) {
+	idx_t class_ordinal = 0;
+	while (true) {
+		bool occupied = false;
+		for (const auto &assignment : state.worker_assignments) {
+			if (assignment.db_query_id != query.metadata.db_query_id ||
+			    assignment.pipeline_generation != query.pipeline_generation ||
+			    assignment.mandatory != mandatory || assignment.optional != optional ||
+			    assignment.class_ordinal != class_ordinal) {
+				continue;
+			}
+			occupied = true;
+			break;
+		}
+		if (!occupied) {
+			return class_ordinal;
+		}
+		class_ordinal++;
+	}
+}
+
+static bool AssignmentClassIsPlanned(const QuerySLASchedulerState::QueryState &query,
+	                                 const QuerySLASchedulerState::WorkerAssignment &assignment) {
+	if (assignment.mandatory) {
+		return assignment.class_ordinal < query.mandatory_workers;
+	}
+	if (assignment.optional) {
+		return assignment.class_ordinal < query.optional_workers;
+	}
+	return assignment.class_ordinal < query.residual_workers;
+}
+
+static bool SameAssignmentClass(const QuerySLASchedulerState::WorkerAssignment &left,
+	                            const QuerySLASchedulerState::WorkerAssignment &right) {
+	return !left.hardware_transition_hold && !right.hardware_transition_hold && left.db_query_id != 0 &&
+	       left.db_query_id == right.db_query_id &&
+	       left.pipeline_generation == right.pipeline_generation && left.class_ordinal == right.class_ordinal &&
+	       left.mandatory == right.mandatory && left.optional == right.optional;
+}
+
+static void HoldHardwareReservationsForQuery(vector<QuerySLASchedulerState::WorkerAssignment> &records,
+	                                         uint64_t db_query_id) {
+	for (auto &record : records) {
+		if (record.db_query_id == db_query_id) {
+			record.hardware_transition_hold = true;
+		}
+	}
+}
+
+static void InstallHardwareReservation(QuerySLASchedulerState &state, idx_t worker_id,
+	                                   const QuerySLASchedulerState::WorkerAssignment &assignment) {
+	if (worker_id >= state.worker_hardware_reservations.size()) {
+		state.worker_hardware_reservations.resize(worker_id + 1);
+	}
+	for (idx_t other_worker = 0; other_worker < state.worker_hardware_reservations.size(); other_worker++) {
+		if (other_worker != worker_id &&
+		    SameAssignmentClass(state.worker_hardware_reservations[other_worker], assignment)) {
+			state.worker_hardware_reservations[other_worker] =
+			    QuerySLASchedulerState::WorkerAssignment();
+		}
+	}
+	state.worker_hardware_reservations[worker_id] = assignment;
+}
+
+static std::shared_ptr<QueryHardwareTargetPlan>
+BuildHardwareTargetPlan(const QuerySLASchedulerState &state, QueryHardwareManager &hardware_manager,
+	                    uint64_t generation) {
+	auto result = std::make_shared<QueryHardwareTargetPlan>();
+	result->generation = generation;
+	result->workers.reserve(state.worker_hardware_reservations.size());
+	for (idx_t worker_id = 0; worker_id < state.worker_hardware_reservations.size(); worker_id++) {
+		const auto &reservation = state.worker_hardware_reservations[worker_id];
+		QueryHardwareWorkerTarget target;
+		target.worker_id = worker_id;
+		target.assigned = reservation.db_query_id != 0;
+		if (target.assigned) {
+			target.hardware = reservation.execution_hardware.IsValid() ? reservation.execution_hardware
+			                                                        : reservation.normal_hardware;
+			if (!target.hardware.IsValid()) {
+				target.hardware = hardware_manager.ReferenceConfiguration();
+			}
+		}
+		result->workers.push_back(std::move(target));
+	}
+	return result;
 }
 
 static QuerySLAEnergyWorkerAssignment EnergyAssignmentAt(const QuerySLASchedulerState::QueryState &query,
@@ -388,26 +511,6 @@ static QuerySLAEnergyWorkerAssignment EnergyAssignmentAt(const QuerySLAScheduler
 	return QuerySLAEnergyWorkerAssignment();
 }
 
-static const QuerySLAEnergyWorkerAssignment *
-DynamicMandatoryAssignmentAt(const QuerySLASchedulerState::QueryState &query, idx_t worker_index) {
-	for (const auto &assignment : query.dynamic_mandatory_workers) {
-		if (assignment.worker_ordinal == worker_index) {
-			return &assignment;
-		}
-	}
-	return nullptr;
-}
-
-static const QuerySLAEnergyWorkerAssignment *
-DynamicOptionalAssignmentAt(const QuerySLASchedulerState::QueryState &query, idx_t worker_index) {
-	for (const auto &assignment : query.dynamic_optional_workers) {
-		if (assignment.worker_ordinal == worker_index) {
-			return &assignment;
-		}
-	}
-	return nullptr;
-}
-
 static void SetWorkerSelection(const QuerySLASchedulerState::WorkerAssignment &assignment,
 	                           QuerySchedulerPolicy policy, QuerySLAWorkerSelection *selection) {
 	if (!selection) {
@@ -417,12 +520,62 @@ static void SetWorkerSelection(const QuerySLASchedulerState::WorkerAssignment &a
 	                                                           : assignment.normal_hardware;
 	selection->policy = policy;
 	selection->plan_generation = assignment.plan_generation;
+	selection->lease_generation = assignment.lease_generation;
 	selection->db_query_id = assignment.db_query_id;
+	selection->request_id = assignment.request_id;
 	selection->pipeline_generation = assignment.pipeline_generation;
+	selection->pipeline_id = assignment.pipeline_id;
+	selection->worker_ordinal = assignment.worker_ordinal;
+	selection->class_ordinal = assignment.class_ordinal;
 	selection->assigned = assignment.db_query_id != 0;
 	selection->mandatory = assignment.mandatory;
 	selection->optional = assignment.optional;
 	selection->exploration = assignment.exploration;
+	selection->debug_trace_enabled = assignment.debug_trace_enabled;
+}
+
+static void ClearWorkerRecordsForQuery(vector<QuerySLASchedulerState::WorkerAssignment> &records,
+	                                   uint64_t db_query_id) {
+	for (auto &record : records) {
+		if (record.db_query_id == db_query_id) {
+			record = QuerySLASchedulerState::WorkerAssignment();
+		}
+	}
+}
+
+static QuerySLASchedulerState::WorkerAssignment
+ResolveEnergyLease(const QuerySLASchedulerState &state, const QuerySLASchedulerState::QueryState &query,
+	               idx_t worker_id, idx_t worker_ordinal, idx_t class_ordinal, bool mandatory,
+	               uint64_t plan_generation, uint64_t lease_generation) {
+	QuerySLASchedulerState::WorkerAssignment result;
+	result.db_query_id = query.metadata.db_query_id;
+	result.request_id = query.metadata.request_id;
+	result.pipeline_generation = query.pipeline_generation;
+	result.pipeline_id = query.model.pipeline_id;
+	result.plan_generation = plan_generation;
+	result.lease_generation = lease_generation;
+	result.worker_ordinal = worker_ordinal;
+	result.class_ordinal = class_ordinal;
+	result.mandatory = mandatory;
+	result.optional = !mandatory;
+	result.debug_trace_enabled = query.debug_trace_enabled;
+
+	if (worker_id < state.worker_hints.size()) {
+		const auto &hint = state.worker_hints[worker_id];
+		if (hint.db_query_id == result.db_query_id && hint.pipeline_generation == result.pipeline_generation &&
+		    hint.class_ordinal == class_ordinal && hint.mandatory == mandatory) {
+			result.normal_hardware = hint.normal_hardware;
+			result.execution_hardware = hint.execution_hardware;
+			result.exploration = hint.exploration;
+			return result;
+		}
+	}
+
+	auto selected = EnergyAssignmentAt(query, worker_ordinal, mandatory);
+	result.normal_hardware = selected.hardware;
+	result.execution_hardware = selected.hardware;
+	result.exploration = selected.exploration;
+	return result;
 }
 
 static void RefreshDispatchEntries(QuerySLASchedulerState &state, QuerySLASchedulerState::QueryState &query) {
@@ -433,54 +586,32 @@ static void RefreshDispatchEntries(QuerySLASchedulerState &state, QuerySLASchedu
 	auto planned = MinValue<idx_t>(PlannedWorkers(query), query.model.demand_cap);
 	if (query.assigned_workers < planned) {
 		auto workers = query.assigned_workers;
-		if (workers < query.mandatory_workers) {
+		if (query.assigned_mandatory_workers < query.mandatory_workers) {
 			auto gain = workers < query.model.mandatory_gain.size() ? query.model.mandatory_gain[workers] : 0;
 			state.primary_mandatory.emplace(gain, query.metadata.db_query_id, query.dispatch_version, workers);
-		} else {
+		} else if (query.assigned_optional_workers < query.optional_workers) {
 			auto gain = workers < query.model.optional_gain.size() ? query.model.optional_gain[workers] : 0;
-			if (query.energy_limited_plan) {
-				auto assignment = EnergyAssignmentAt(query, workers, false);
-				if (!assignment.valid || !assignment.optional || !assignment.hardware.IsValid()) {
-					gain = 0;
-				}
-			}
 			if (gain > 0) {
 				state.primary_optional.emplace(gain, query.metadata.db_query_id, query.dispatch_version, workers);
 			}
 		}
 	}
-	if (query.energy_limited_plan) {
-		auto dynamic = DynamicMandatoryAssignmentAt(query, planned);
-		auto mandatory_gain =
-		    planned < query.model.mandatory_gain.size() ? query.model.mandatory_gain[planned] : 0;
-		if (query.assigned_workers >= planned && planned < query.model.demand_cap && dynamic &&
-		    dynamic->valid && mandatory_gain > 0) {
-			state.dynamic_mandatory.emplace(mandatory_gain, query.metadata.db_query_id,
-			                                query.dispatch_version, planned);
-		} else {
-			auto optional = DynamicOptionalAssignmentAt(query, planned);
-			auto optional_gain =
-			    planned < query.model.optional_gain.size() ? query.model.optional_gain[planned] : 0;
-			if (query.assigned_workers >= planned && planned < query.model.demand_cap && optional &&
-			    optional->valid && optional_gain > 0) {
-				state.dynamic_optional.emplace(optional_gain, query.metadata.db_query_id,
-				                               query.dispatch_version, planned);
-			}
-		}
-		return;
-	}
 	if (planned >= query.model.demand_cap) {
 		return;
 	}
-	if (planned < query.model.mandatory_gain.size() && query.model.mandatory_gain[planned] > 0) {
+	auto primary_filled = query.assigned_mandatory_workers >= query.mandatory_workers &&
+	                      query.assigned_optional_workers >= query.optional_workers &&
+	                      query.assigned_residual_workers >= query.residual_workers &&
+	                      query.assigned_workers == planned;
+	if (primary_filled && planned < query.model.mandatory_gain.size() && query.model.mandatory_gain[planned] > 0) {
 		state.dynamic_mandatory.emplace(query.model.mandatory_gain[planned], query.metadata.db_query_id,
 		                                query.dispatch_version, planned);
 	}
-	if (planned < query.model.optional_gain.size() && query.model.optional_gain[planned] > 0) {
+	if (primary_filled && planned < query.model.optional_gain.size() && query.model.optional_gain[planned] > 0) {
 		state.dynamic_optional.emplace(query.model.optional_gain[planned], query.metadata.db_query_id,
 		                               query.dispatch_version, planned);
 	}
-	if (query.residual_dispatch_enabled && planned < query.model.mandatory_gain.size() &&
+	if (primary_filled && query.residual_dispatch_enabled && planned < query.model.mandatory_gain.size() &&
 	    planned < query.model.optional_gain.size()) {
 		state.dynamic_residual.emplace(query.model.mandatory_gain[planned], query.model.optional_gain[planned],
 		                               query.metadata.db_query_id, query.dispatch_version, planned);
@@ -541,20 +672,26 @@ void QuerySLAScheduler::RegisterQuery(const QueryRequestMetadata &metadata, Prod
 }
 
 void QuerySLAScheduler::UnregisterQuery(uint64_t db_query_id) {
-	lock_guard<mutex> guard(state->lock);
-	auto entry = state->queries.find(db_query_id);
-	if (entry == state->queries.end()) {
-		return;
-	}
-	for (auto &assignment : state->worker_assignments) {
-		if (assignment.db_query_id == db_query_id) {
-			assignment = QuerySLASchedulerState::WorkerAssignment();
+	bool wake_workers = false;
+	{
+		unique_lock<mutex> guard(state->lock);
+		state->hardware_plan_cv.wait(guard, [&]() { return !state->hardware_plan_publication_in_progress; });
+		auto entry = state->queries.find(db_query_id);
+		if (entry == state->queries.end()) {
+			return;
 		}
+		ClearWorkerRecordsForQuery(state->worker_assignments, db_query_id);
+		ClearWorkerRecordsForQuery(state->worker_hints, db_query_id);
+		ClearWorkerRecordsForQuery(state->worker_hardware_reservations, db_query_id);
+		if (entry->second.debug_trace_enabled) {
+			state->debug_trace_query_count--;
+		}
+		state->queries.erase(entry);
+		wake_workers = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
 	}
-	if (entry->second.debug_trace_enabled) {
-		state->debug_trace_query_count--;
+	if (wake_workers) {
+		db.GetScheduler().Signal(NumericCast<idx_t>(db.GetScheduler().NumberOfThreads()));
 	}
-	state->queries.erase(entry);
 }
 
 void QuerySLAScheduler::OnEventScheduled(uint64_t db_query_id, shared_ptr<Event> event,
@@ -564,15 +701,22 @@ void QuerySLAScheduler::OnEventScheduled(uint64_t db_query_id, shared_ptr<Event>
 	}
 	QueryCapture capture;
 	{
-		lock_guard<mutex> guard(state->lock);
+		unique_lock<mutex> guard(state->lock);
+		state->hardware_plan_cv.wait(guard, [&]() { return !state->hardware_plan_publication_in_progress; });
 		auto entry = state->queries.find(db_query_id);
 		if (entry == state->queries.end()) {
 			throw InternalException("SLA scheduler received an event for an unregistered query");
 		}
 		auto &query = entry->second;
+		ClearWorkerRecordsForQuery(state->worker_assignments, db_query_id);
+		ClearWorkerRecordsForQuery(state->worker_hints, db_query_id);
+		HoldHardwareReservationsForQuery(state->worker_hardware_reservations, db_query_id);
 		query.event = event;
 		query.pipeline_generation++;
 		query.assigned_workers = 0;
+		query.assigned_mandatory_workers = 0;
+		query.assigned_optional_workers = 0;
+		query.assigned_residual_workers = 0;
 		query.remaining_suffix_stages = MaxValue<idx_t>(idx_t(1), remaining_suffix_stages);
 		capture.metadata = query.metadata;
 		capture.producer = query.producer;
@@ -586,7 +730,8 @@ void QuerySLAScheduler::OnEventScheduled(uint64_t db_query_id, shared_ptr<Event>
 	                                            EpochMs() * 1000000ULL);
 	bool signal_worker = false;
 	{
-		lock_guard<mutex> guard(state->lock);
+		unique_lock<mutex> guard(state->lock);
+		state->hardware_plan_cv.wait(guard, [&]() { return !state->hardware_plan_publication_in_progress; });
 		auto entry = state->queries.find(db_query_id);
 		if (entry == state->queries.end() || entry->second.pipeline_generation != capture.generation ||
 		    entry->second.event.get() != event.get()) {
@@ -598,17 +743,21 @@ void QuerySLAScheduler::OnEventScheduled(uint64_t db_query_id, shared_ptr<Event>
 		query.optional_workers = 0;
 		query.residual_workers = 0;
 		query.assigned_workers = 0;
-			query.energy_workers.clear();
-			query.dynamic_mandatory_workers = std::move(activated.dynamic_mandatory_workers);
-			query.dynamic_optional_workers = std::move(activated.dynamic_optional_workers);
+		query.assigned_mandatory_workers = 0;
+		query.assigned_optional_workers = 0;
+		query.assigned_residual_workers = 0;
+		query.energy_workers.clear();
+		query.dynamic_mandatory_workers = std::move(activated.dynamic_mandatory_workers);
+		query.dynamic_optional_workers = std::move(activated.dynamic_optional_workers);
 		query.energy_limited_plan = activated.energy_policy;
 		query.residual_dispatch_enabled =
 		    !query.energy_limited_plan && db.config.options.query_sla_residual_workers_enabled;
-		query.topology_plan_published = false;
 		RefreshDispatchEntries(*state, query);
 		signal_worker = activated.claimable;
 	}
-	if (signal_worker) {
+	if (db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY) {
+		db.GetScheduler().Signal(NumericCast<idx_t>(db.GetScheduler().NumberOfThreads()));
+	} else if (signal_worker) {
 		db.GetScheduler().Signal(1);
 	}
 }
@@ -617,24 +766,32 @@ void QuerySLAScheduler::OnEventFinished(uint64_t db_query_id, Event &event) {
 	if (!Enabled()) {
 		return;
 	}
-	lock_guard<mutex> guard(state->lock);
-	auto entry = state->queries.find(db_query_id);
-	if (entry == state->queries.end() || entry->second.event.get() != &event) {
-		return;
+	{
+		unique_lock<mutex> guard(state->lock);
+		state->hardware_plan_cv.wait(guard, [&]() { return !state->hardware_plan_publication_in_progress; });
+		auto entry = state->queries.find(db_query_id);
+		if (entry == state->queries.end() || entry->second.event.get() != &event) {
+			return;
+		}
+		entry->second.event.reset();
+		entry->second.model = QuerySLAModel();
+		entry->second.mandatory_workers = 0;
+		entry->second.optional_workers = 0;
+		entry->second.residual_workers = 0;
+		entry->second.assigned_workers = 0;
+		entry->second.assigned_mandatory_workers = 0;
+		entry->second.assigned_optional_workers = 0;
+		entry->second.assigned_residual_workers = 0;
+		entry->second.energy_workers.clear();
+		entry->second.dynamic_mandatory_workers.clear();
+		entry->second.dynamic_optional_workers.clear();
+		entry->second.energy_limited_plan = false;
+		entry->second.pipeline_generation++;
+		ClearWorkerRecordsForQuery(state->worker_assignments, db_query_id);
+		ClearWorkerRecordsForQuery(state->worker_hints, db_query_id);
+		HoldHardwareReservationsForQuery(state->worker_hardware_reservations, db_query_id);
+		RefreshDispatchEntries(*state, entry->second);
 	}
-	entry->second.event.reset();
-	entry->second.model = QuerySLAModel();
-	entry->second.mandatory_workers = 0;
-	entry->second.optional_workers = 0;
-	entry->second.residual_workers = 0;
-	entry->second.assigned_workers = 0;
-	entry->second.energy_workers.clear();
-	entry->second.dynamic_mandatory_workers.clear();
-	entry->second.dynamic_optional_workers.clear();
-	entry->second.energy_limited_plan = false;
-	entry->second.topology_plan_published = false;
-	entry->second.pipeline_generation++;
-	RefreshDispatchEntries(*state, entry->second);
 }
 
 void QuerySLAScheduler::RequestInitialEpoch() {
@@ -674,10 +831,22 @@ void QuerySLAScheduler::ReleaseEpochSentinel() {
 }
 
 void QuerySLAScheduler::RegisterWorker(idx_t worker_id, int logical_cpu) {
+	{
+		lock_guard<mutex> guard(state->lock);
+		if (worker_id >= state->worker_hardware_reservations.size()) {
+			state->worker_hardware_reservations.resize(worker_id + 1);
+		}
+	}
 	state->hardware_manager->RegisterWorker(worker_id, logical_cpu);
 }
 
 void QuerySLAScheduler::UnregisterWorker(idx_t worker_id) {
+	{
+		lock_guard<mutex> guard(state->lock);
+		if (worker_id < state->worker_hardware_reservations.size()) {
+			state->worker_hardware_reservations[worker_id] = QuerySLASchedulerState::WorkerAssignment();
+		}
+	}
 	state->hardware_manager->UnregisterWorker(worker_id);
 }
 
@@ -714,21 +883,13 @@ void QuerySLAScheduler::MaybeRunEpoch() {
 		state->epoch_leader.store(false);
 		throw;
 	}
-	if (state->retry_epoch.exchange(false)) {
-		state->next_epoch_ns.store(now_ns + 1000000ULL);
-	} else {
-		state->next_epoch_ns.store(now_ns + EpochMs() * 1000000ULL);
-	}
+	state->next_epoch_ns.store(now_ns + EpochMs() * 1000000ULL);
 	state->epoch_run_count++;
 	state->epoch_leader.store(false);
 	if (wake_count == DConstants::INVALID_INDEX || wake_count == 0) {
 		return;
 	}
-	if (db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY) {
-		db.GetScheduler().Signal(NumericCast<idx_t>(db.GetScheduler().NumberOfThreads()));
-	} else {
-		db.GetScheduler().Signal(MinValue<idx_t>(wake_count, NumericCast<idx_t>(db.GetScheduler().NumberOfThreads())));
-	}
+	db.GetScheduler().Signal(MinValue<idx_t>(wake_count, NumericCast<idx_t>(db.GetScheduler().NumberOfThreads())));
 }
 
 idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
@@ -876,16 +1037,22 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 				break;
 			}
 		}
-		if (!stable_profile_snapshot) {
-			state->retry_epoch.store(true);
-			return DConstants::INVALID_INDEX;
+		if (!stable_profile_snapshot || !energy_epoch_plan.valid) {
+			// Hardware profiling and placement are secondary to the logical SLA allocation. Retry with only the
+			// calibrated reference pair so an unstable or unusable hardware profile cannot veto runnable work.
+			for (auto &query : planner_input.queries) {
+				query.hardware_profiles.clear();
+			}
+			planner_input.exploration_enabled = false;
+			energy_epoch_plan = PlanQuerySLAEnergyEpoch(planner_input);
 		}
 		if (!energy_epoch_plan.valid) {
-			throw InvalidInputException("SLA-energy epoch planning failed: %s", energy_epoch_plan.error);
+			throw InternalException("SLA-energy reference placement failed after logical allocation: %s",
+			                        energy_epoch_plan.error);
 		}
+		mandatory = logical_allocation.mandatory;
+		optional = logical_allocation.optional;
 		for (idx_t i = 0; i < energy_epoch_plan.queries.size(); i++) {
-			mandatory[i] = energy_epoch_plan.queries[i].mandatory_workers;
-			optional[i] = energy_epoch_plan.queries[i].optional_workers;
 			energy_workers[i] = energy_epoch_plan.queries[i].workers;
 			dynamic_mandatory_workers[i] = energy_epoch_plan.queries[i].dynamic_mandatory_workers;
 			dynamic_optional_workers[i] = energy_epoch_plan.queries[i].dynamic_optional_workers;
@@ -957,28 +1124,19 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			trace_inputs.push_back(std::move(input));
 		}
 	}
-	std::shared_ptr<QueryHardwareTargetPlan> hardware_plan;
-	if (energy_policy) {
-		hardware_plan = std::make_shared<QueryHardwareTargetPlan>();
-		hardware_plan->generation = published_generation;
-		for (const auto &topology : energy_topology) {
-			QueryHardwareWorkerTarget target;
-			target.worker_id = topology.worker_id;
-			hardware_plan->workers.push_back(target);
-		}
-	}
 	const auto publish_wait_start_ns = collect_diagnostics ? SLATimestampNs() : 0;
 	unique_lock<mutex> guard(state->lock);
 	const auto publish_lock_acquired_ns = collect_diagnostics ? SLATimestampNs() : 0;
 	const auto publish_lock_wait_ns = SLADurationNs(publish_lock_acquired_ns, publish_wait_start_ns);
 	if (energy_policy) {
-		for (auto &assignment : state->worker_assignments) {
-			assignment = QuerySLASchedulerState::WorkerAssignment();
+		state->worker_hints.clear();
+		for (const auto &topology : energy_topology) {
+			if (topology.worker_id >= state->worker_hints.size()) {
+				state->worker_hints.resize(topology.worker_id + 1);
+			}
 		}
-		for (auto &entry : state->queries) {
-			entry.second.assigned_workers = 0;
-			entry.second.topology_plan_published = false;
-		}
+	} else {
+		state->worker_hints.clear();
 	}
 	for (idx_t i = 0; i < captures.size(); i++) {
 		auto entry = state->queries.find(captures[i].metadata.db_query_id);
@@ -995,7 +1153,6 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		entry->second.energy_limited_plan = energy_policy;
 		entry->second.residual_dispatch_enabled =
 		    !energy_policy && db.config.options.query_sla_residual_workers_enabled;
-		entry->second.topology_plan_published = energy_policy;
 		if (trace_input_indexes[i] != DConstants::INVALID_INDEX) {
 			auto &trace_input = trace_inputs[trace_input_indexes[i]];
 			trace_input.published = true;
@@ -1012,29 +1169,28 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			    query_entry->second.pipeline_generation != captures[placed.query_index].generation) {
 				continue;
 			}
-			if (placed.worker_id >= state->worker_assignments.size()) {
-				state->worker_assignments.resize(placed.worker_id + 1);
+			if (placed.worker_id >= state->worker_hints.size()) {
+				state->worker_hints.resize(placed.worker_id + 1);
 			}
-			auto &assignment = state->worker_assignments[placed.worker_id];
-			assignment.db_query_id = query_entry->second.metadata.db_query_id;
-			assignment.pipeline_generation = query_entry->second.pipeline_generation;
-			assignment.normal_hardware = placed.normal_hardware;
-			assignment.execution_hardware = placed.execution_hardware;
-			assignment.plan_generation = published_generation;
-			assignment.mandatory = placed.mandatory;
-			assignment.optional = placed.optional;
-			assignment.exploration = placed.exploration;
-			query_entry->second.assigned_workers++;
-			for (auto &target : hardware_plan->workers) {
-				if (target.worker_id != placed.worker_id) {
-					continue;
-				}
-				target.hardware = assignment.execution_hardware.IsValid()
-				                      ? assignment.execution_hardware
-				                      : state->hardware_manager->ReferenceConfiguration();
-				target.assigned = true;
-				break;
-			}
+			auto &hint = state->worker_hints[placed.worker_id];
+			hint.db_query_id = query_entry->second.metadata.db_query_id;
+			hint.request_id = query_entry->second.metadata.request_id;
+			hint.pipeline_generation = query_entry->second.pipeline_generation;
+			hint.pipeline_id = query_entry->second.model.pipeline_id;
+			hint.normal_hardware = placed.normal_hardware;
+			hint.execution_hardware = placed.execution_hardware;
+			hint.plan_generation = published_generation;
+			hint.worker_ordinal = placed.worker_ordinal;
+			hint.class_ordinal =
+			    placed.mandatory
+			        ? placed.worker_ordinal
+			        : placed.worker_ordinal >= mandatory[placed.query_index]
+			              ? placed.worker_ordinal - mandatory[placed.query_index]
+			              : DConstants::INVALID_INDEX;
+			hint.mandatory = placed.mandatory;
+			hint.optional = placed.optional;
+			hint.exploration = placed.exploration;
+			hint.debug_trace_enabled = query_entry->second.debug_trace_enabled;
 		}
 		if (!db.config.options.query_sla_energy_exploration_enabled) {
 			state->epochs_without_optional_only_socket = 0;
@@ -1048,6 +1204,56 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		state->exploration_forced_uncore_probe_epochs += energy_epoch_plan.diagnostics.forced_uncore_probes;
 		state->exploration_optional_uncore_probe_epochs +=
 		    energy_epoch_plan.diagnostics.uncore_probes - energy_epoch_plan.diagnostics.forced_uncore_probes;
+		for (idx_t worker_id = 0; worker_id < state->worker_assignments.size(); worker_id++) {
+			auto &assignment = state->worker_assignments[worker_id];
+			if (assignment.db_query_id == 0) {
+				continue;
+			}
+			auto query_entry = state->queries.find(assignment.db_query_id);
+			if (query_entry == state->queries.end() ||
+			    query_entry->second.pipeline_generation != assignment.pipeline_generation ||
+			    !query_entry->second.event || !query_entry->second.model.valid) {
+				continue;
+			}
+			auto worker_ordinal = assignment.mandatory
+			                          ? assignment.class_ordinal
+			                          : query_entry->second.mandatory_workers + assignment.class_ordinal;
+			auto refreshed = ResolveEnergyLease(*state, query_entry->second, worker_id, worker_ordinal,
+			                                    assignment.class_ordinal, assignment.mandatory,
+			                                    published_generation, assignment.lease_generation);
+			if (!refreshed.execution_hardware.IsValid()) {
+				refreshed.normal_hardware = state->hardware_manager->ReferenceConfiguration();
+				refreshed.execution_hardware = refreshed.normal_hardware;
+			}
+			assignment = std::move(refreshed);
+		}
+		auto reservation_count = MaxValue<idx_t>(state->worker_assignments.size(), state->worker_hints.size());
+		state->worker_hardware_reservations.assign(reservation_count,
+		                                           QuerySLASchedulerState::WorkerAssignment());
+		for (idx_t worker_id = 0; worker_id < state->worker_assignments.size(); worker_id++) {
+			const auto &assignment = state->worker_assignments[worker_id];
+			if (assignment.db_query_id != 0) {
+				InstallHardwareReservation(*state, worker_id, assignment);
+			}
+		}
+		for (idx_t worker_id = 0; worker_id < state->worker_hints.size(); worker_id++) {
+			const auto &hint = state->worker_hints[worker_id];
+			if (hint.db_query_id == 0 ||
+			    (worker_id < state->worker_assignments.size() &&
+			     state->worker_assignments[worker_id].db_query_id != 0)) {
+				continue;
+			}
+			bool class_reserved = false;
+			for (const auto &reservation : state->worker_hardware_reservations) {
+				if (SameAssignmentClass(reservation, hint)) {
+					class_reserved = true;
+					break;
+				}
+			}
+			if (!class_reserved) {
+				InstallHardwareReservation(*state, worker_id, hint);
+			}
+		}
 		for (idx_t i = 0; i < captures.size(); i++) {
 			if (trace_input_indexes[i] == DConstants::INVALID_INDEX) {
 				continue;
@@ -1076,14 +1282,32 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 	const auto thread_cpu_complete_ns = collect_diagnostics ? SLAThreadCpuNs() : 0;
 	const auto publish_lock_hold_ns =
 	    collect_diagnostics ? SLADurationNs(publish_complete_ns, publish_lock_acquired_ns) : 0;
+	auto hardware_target_plan =
+	    energy_policy ? BuildHardwareTargetPlan(*state, *state->hardware_manager, published_generation) : nullptr;
+	state->hardware_plan_publication_in_progress = hardware_target_plan != nullptr;
 	guard.unlock();
-	const auto hardware_apply_start_ns = collect_diagnostics && hardware_plan ? SLATimestampNs() : 0;
-	if (hardware_plan) {
-		state->hardware_manager->PublishTargets(std::move(hardware_plan));
+	const auto hardware_apply_start_ns = collect_diagnostics && hardware_target_plan ? SLATimestampNs() : 0;
+	try {
+		if (hardware_target_plan) {
+			state->hardware_manager->PublishTargets(std::move(hardware_target_plan));
+		}
+	} catch (...) {
+		{
+			lock_guard<mutex> publication_guard(state->lock);
+			state->hardware_plan_publication_in_progress = false;
+		}
+		state->hardware_plan_cv.notify_all();
+		throw;
 	}
-	const auto hardware_apply_ns = hardware_apply_start_ns > 0
-	                                   ? SLADurationNs(SLATimestampNs(), hardware_apply_start_ns)
-	                                   : 0;
+	if (energy_policy) {
+		{
+			lock_guard<mutex> publication_guard(state->lock);
+			state->hardware_plan_publication_in_progress = false;
+		}
+		state->hardware_plan_cv.notify_all();
+	}
+	const auto hardware_apply_ns =
+	    hardware_apply_start_ns == 0 ? 0 : SLADurationNs(SLATimestampNs(), hardware_apply_start_ns);
 
 	if (!collect_diagnostics || trace_inputs.empty()) {
 		return published_worker_count;
@@ -1132,11 +1356,15 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			row.applied_hardware = state->hardware_manager->GetAppliedConfigurationForCPU(row.logical_cpu);
 			row.preferred_safe_throughput = worker.preferred_safe_throughput;
 			row.preferred_normalized_edp = worker.preferred_normalized_edp;
+			row.normal_safe_throughput = worker.normal_safe_throughput;
+			row.normal_active_power_w = worker.normal_active_power_w;
+			row.normal_normalized_edp = worker.normal_normalized_edp;
 			row.optional_fragility_before = worker.optional_fragility_before;
 			row.optional_fragility_target = worker.optional_fragility_target;
 			row.optional_fragility_after = worker.optional_fragility_after;
 			row.optional_gain = worker.optional_gain;
 			row.profile_version = worker.profile_version;
+			row.normal_profile_version = worker.normal_profile_version;
 			row.worker_ordinal = worker.worker_ordinal;
 			energy_worker_trace_rows.push_back(std::move(row));
 		}
@@ -1221,7 +1449,7 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			    exploration_diagnostics.epochs_without_optional_only_socket;
 			trace.energy_profile_fallback_count = diagnostics.profile_fallback_count;
 			trace.energy_immature_pair_rejections = diagnostics.immature_pair_rejections;
-			trace.energy_domain_frequency_inflations = diagnostics.domain_frequency_inflations;
+			trace.energy_worker_frequency_adjustments = diagnostics.worker_frequency_adjustments;
 			trace.energy_mandatory_target_sla_cost = input.mandatory_target_sla_cost;
 			trace.energy_mandatory_target_optional_risk = input.mandatory_target_optional_risk;
 			trace.energy_mandatory_reference_safe_throughput = input.mandatory_reference_safe_throughput;
@@ -1299,11 +1527,8 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 	}
 	auto policy = db.GetQuerySchedulerPolicy();
 	MaybeRunEpoch();
-	QueryHardwareWorkerDomainContext dynamic_hardware_context;
-	if (policy == QuerySchedulerPolicy::SLA_ENERGY) {
-		dynamic_hardware_context = state->hardware_manager->GetDomainContextExcludingWorker(worker_id);
-	}
-	lock_guard<mutex> guard(state->lock);
+	unique_lock<mutex> guard(state->lock);
+	state->hardware_plan_cv.wait(guard, [&]() { return !state->hardware_plan_publication_in_progress; });
 	if (state->queries.empty()) {
 		return QuerySLADequeueResult::NOT_ACTIVE;
 	}
@@ -1314,38 +1539,39 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 	if (assignment.db_query_id != 0) {
 		auto entry = state->queries.find(assignment.db_query_id);
 		if (entry != state->queries.end() && entry->second.pipeline_generation == assignment.pipeline_generation &&
-		    entry->second.event && entry->second.model.valid) {
-			auto planned = PlannedWorkers(entry->second);
-			if (entry->second.assigned_workers <= planned && entry->second.producer &&
-			    db.GetScheduler().GetTaskFromProducer(*entry->second.producer, task)) {
-				SetWorkerSelection(assignment, policy, selection);
-				return QuerySLADequeueResult::TASK_FOUND;
-			}
-		}
-		if (entry != state->queries.end() && entry->second.pipeline_generation == assignment.pipeline_generation &&
 		    entry->second.assigned_workers > 0) {
-			entry->second.assigned_workers--;
+			ReleaseAssignedWorker(entry->second, assignment);
 			RefreshDispatchEntries(*state, entry->second);
 		}
 		assignment = QuerySLASchedulerState::WorkerAssignment();
 	}
 	auto assign_worker = [&](QuerySLASchedulerState::QueryState &query, bool dispatched_mandatory,
-	                         bool force_reference_hardware = false) {
-		auto worker_index = query.assigned_workers > 0 ? query.assigned_workers - 1 : 0;
-		auto selected = EnergyAssignmentAt(query, worker_index, dispatched_mandatory);
-		if (query.energy_limited_plan && (force_reference_hardware || !selected.hardware.IsValid())) {
-			selected.hardware = state->hardware_manager->ReferenceConfiguration();
-			selected.mandatory = dispatched_mandatory;
-			selected.optional = !dispatched_mandatory;
+	                         bool dispatched_optional, idx_t worker_ordinal, idx_t class_ordinal) {
+		auto lease_generation = ++state->next_lease_generation;
+		if (query.energy_limited_plan) {
+			assignment = ResolveEnergyLease(*state, query, worker_id, worker_ordinal, class_ordinal, dispatched_mandatory,
+			                                state->epoch_generation.load(), lease_generation);
+			if (!assignment.execution_hardware.IsValid()) {
+				assignment.normal_hardware = state->hardware_manager->ReferenceConfiguration();
+				assignment.execution_hardware = assignment.normal_hardware;
+			}
+		} else {
+			assignment = QuerySLASchedulerState::WorkerAssignment();
+			assignment.db_query_id = query.metadata.db_query_id;
+			assignment.request_id = query.metadata.request_id;
+			assignment.pipeline_generation = query.pipeline_generation;
+			assignment.pipeline_id = query.model.pipeline_id;
+			assignment.plan_generation = state->epoch_generation.load();
+			assignment.lease_generation = lease_generation;
+			assignment.worker_ordinal = worker_ordinal;
+			assignment.class_ordinal = class_ordinal;
+			assignment.mandatory = dispatched_mandatory;
+			assignment.optional = dispatched_optional;
+			assignment.debug_trace_enabled = query.debug_trace_enabled;
 		}
-		assignment.db_query_id = query.metadata.db_query_id;
-		assignment.pipeline_generation = query.pipeline_generation;
-		assignment.normal_hardware = selected.hardware;
-		assignment.execution_hardware = selected.hardware;
-		assignment.plan_generation = state->epoch_generation.load();
-		assignment.mandatory = selected.mandatory;
-		assignment.optional = selected.optional;
-		assignment.exploration = selected.exploration;
+		if (query.energy_limited_plan) {
+			InstallHardwareReservation(*state, worker_id, assignment);
+		}
 		SetWorkerSelection(assignment, policy, selection);
 	};
 
@@ -1365,42 +1591,30 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 				continue;
 			}
 			if (primary) {
-				if (query.assigned_workers >= planned || mandatory != (query.assigned_workers < query.mandatory_workers)) {
+				auto class_underfilled = mandatory
+				                             ? query.assigned_mandatory_workers < query.mandatory_workers
+				                             : query.assigned_mandatory_workers >= query.mandatory_workers &&
+				                                   query.assigned_optional_workers < query.optional_workers;
+				if (query.assigned_workers >= planned || !class_underfilled) {
 					continue;
-				}
-				if (query.energy_limited_plan && !mandatory) {
-					auto optional = EnergyAssignmentAt(query, query.assigned_workers, false);
-					if (!optional.valid || !optional.hardware.IsValid() || optional.optional_gain <= 0) {
-						continue;
-					}
 				}
 			} else {
-				if (query.assigned_workers < planned || planned >= query.model.demand_cap) {
+				auto primary_filled = query.assigned_mandatory_workers >= query.mandatory_workers &&
+				                      query.assigned_optional_workers >= query.optional_workers &&
+				                      query.assigned_residual_workers >= query.residual_workers;
+				if (!primary_filled || query.assigned_workers != planned || planned >= query.model.demand_cap) {
 					continue;
 				}
-				if (mandatory && query.energy_limited_plan) {
-					auto dynamic = DynamicMandatoryAssignmentAt(query, planned);
-					if (!dynamic || !dynamic->valid || planned >= query.model.mandatory_gain.size() ||
-					    query.model.mandatory_gain[planned] <= 0) {
-						continue;
-					}
-				} else if (query.energy_limited_plan) {
-					auto dynamic = DynamicOptionalAssignmentAt(query, planned);
-					if (!dynamic || !dynamic->valid || !dynamic->hardware.IsValid() ||
-					    planned >= query.model.optional_gain.size() || query.model.optional_gain[planned] <= 0) {
-						continue;
-					}
-				} else {
-					auto &gains = mandatory ? query.model.mandatory_gain : query.model.optional_gain;
-					if (planned >= gains.size() || gains[planned] <= 0) {
-						continue;
-					}
+				auto &gains = mandatory ? query.model.mandatory_gain : query.model.optional_gain;
+				if (planned >= gains.size() || gains[planned] <= 0) {
+					continue;
 				}
 			}
 			if (!query.producer || !db.GetScheduler().GetTaskFromProducer(*query.producer, task)) {
 				unavailable.push_back(candidate);
 				continue;
 			}
+			auto worker_ordinal = query.assigned_workers;
 			if (!primary) {
 				if (mandatory) {
 					query.mandatory_workers++;
@@ -1408,12 +1622,14 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 					query.optional_workers++;
 				}
 			}
+			auto class_ordinal = NextClassOrdinal(*state, query, mandatory, !mandatory);
 			query.assigned_workers++;
-			auto force_reference_hardware =
-			    !primary && !mandatory && query.energy_limited_plan &&
-			    (!dynamic_hardware_context.core_active_without_worker ||
-			     !dynamic_hardware_context.socket_active_without_worker);
-			assign_worker(query, mandatory, force_reference_hardware);
+			if (mandatory) {
+				query.assigned_mandatory_workers++;
+			} else {
+				query.assigned_optional_workers++;
+			}
+			assign_worker(query, mandatory, !mandatory, worker_ordinal, class_ordinal);
 			RefreshDispatchEntries(*state, query);
 			for (auto &skipped : unavailable) {
 				heap.push(std::move(skipped));
@@ -1436,9 +1652,13 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 			}
 			auto &query = entry->second;
 			auto planned = MinValue<idx_t>(PlannedWorkers(query), query.model.demand_cap);
+			auto primary_filled = query.assigned_mandatory_workers >= query.mandatory_workers &&
+			                      query.assigned_optional_workers >= query.optional_workers &&
+			                      query.assigned_residual_workers >= query.residual_workers;
 			if (candidate.version != query.dispatch_version || !query.event || !query.model.valid ||
-			    query.assigned_workers < planned || planned >= query.model.demand_cap || candidate.workers != planned ||
-			    planned >= query.model.mandatory_gain.size() || planned >= query.model.optional_gain.size()) {
+			    !primary_filled || query.assigned_workers != planned || planned >= query.model.demand_cap ||
+			    candidate.workers != planned || planned >= query.model.mandatory_gain.size() ||
+			    planned >= query.model.optional_gain.size()) {
 				continue;
 			}
 			if (!query.producer || !db.GetScheduler().GetTaskFromProducer(*query.producer, task)) {
@@ -1446,8 +1666,11 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 				continue;
 			}
 			query.residual_workers++;
+			auto worker_ordinal = query.assigned_workers;
+			auto class_ordinal = NextClassOrdinal(*state, query, false, false);
 			query.assigned_workers++;
-			assign_worker(query, false);
+			query.assigned_residual_workers++;
+			assign_worker(query, false, false, worker_ordinal, class_ordinal);
 			RefreshDispatchEntries(*state, query);
 			for (auto &skipped : unavailable) {
 				state->dynamic_residual.push(std::move(skipped));
@@ -1480,38 +1703,143 @@ QuerySLAContinuationResult QuerySLAScheduler::CheckTaskContinuation(idx_t worker
 		return QuerySLAContinuationResult::YIELD;
 	}
 	MaybeRunEpoch();
-	lock_guard<mutex> guard(state->lock);
+	unique_lock<mutex> guard(state->lock);
+	state->hardware_plan_cv.wait(guard, [&]() { return !state->hardware_plan_publication_in_progress; });
 	if (worker_id >= state->worker_assignments.size()) {
 		return QuerySLAContinuationResult::YIELD;
 	}
 	const auto &assignment = state->worker_assignments[worker_id];
 	if (assignment.db_query_id == 0 || assignment.db_query_id != previous.db_query_id ||
-	    assignment.pipeline_generation != previous.pipeline_generation) {
+	    assignment.pipeline_generation != previous.pipeline_generation ||
+	    assignment.lease_generation != previous.lease_generation) {
 		return QuerySLAContinuationResult::YIELD;
 	}
 	auto entry = state->queries.find(assignment.db_query_id);
 	if (entry == state->queries.end() || entry->second.pipeline_generation != assignment.pipeline_generation ||
-	    !entry->second.event || !entry->second.model.valid ||
-	    entry->second.assigned_workers > PlannedWorkers(entry->second)) {
+	    !entry->second.event || !entry->second.model.valid) {
+		return QuerySLAContinuationResult::YIELD;
+	}
+	auto lease_in_plan = assignment.mandatory
+	                         ? assignment.class_ordinal < entry->second.mandatory_workers
+	                         : assignment.optional
+	                               ? assignment.class_ordinal < entry->second.optional_workers
+	                               : assignment.class_ordinal < entry->second.residual_workers;
+	if (entry->second.assigned_workers > PlannedWorkers(entry->second) || !lease_in_plan) {
 		return QuerySLAContinuationResult::YIELD;
 	}
 	SetWorkerSelection(assignment, policy, &current);
 	return QuerySLAContinuationResult::CONTINUE;
 }
 
+void QuerySLAScheduler::ReleaseTaskAssignment(idx_t worker_id, const QuerySLAWorkerSelection &previous) {
+	if (!previous.assigned || !IsQuerySLAPolicy(previous.policy)) {
+		return;
+	}
+	bool wake_worker = false;
+	{
+		lock_guard<mutex> guard(state->lock);
+		if (worker_id >= state->worker_assignments.size()) {
+			return;
+		}
+		auto &assignment = state->worker_assignments[worker_id];
+		if (assignment.db_query_id != previous.db_query_id ||
+		    assignment.pipeline_generation != previous.pipeline_generation ||
+		    assignment.lease_generation != previous.lease_generation) {
+			return;
+		}
+		auto entry = state->queries.find(assignment.db_query_id);
+		if (entry != state->queries.end() &&
+		    entry->second.pipeline_generation == assignment.pipeline_generation) {
+			auto &query = entry->second;
+			ReleaseAssignedWorker(query, assignment);
+			RefreshDispatchEntries(*state, query);
+			auto planned = MinValue<idx_t>(PlannedWorkers(query), query.model.demand_cap);
+			wake_worker = query.event && query.model.valid && query.assigned_workers < planned;
+		}
+		assignment = QuerySLASchedulerState::WorkerAssignment();
+	}
+	if (wake_worker) {
+		db.GetScheduler().Signal(1);
+	}
+}
+
+bool QuerySLAScheduler::GetWorkerHardwareReservation(idx_t worker_id, QuerySLAWorkerSelection &reservation) {
+	reservation = QuerySLAWorkerSelection();
+	if (!Enabled() || db.GetQuerySchedulerPolicy() != QuerySchedulerPolicy::SLA_ENERGY) {
+		return false;
+	}
+	unique_lock<mutex> guard(state->lock);
+	state->hardware_plan_cv.wait(guard, [&]() { return !state->hardware_plan_publication_in_progress; });
+	if (worker_id >= state->worker_hardware_reservations.size()) {
+		return false;
+	}
+	auto &current = state->worker_hardware_reservations[worker_id];
+	if (current.db_query_id == 0) {
+		return false;
+	}
+	auto query = state->queries.find(current.db_query_id);
+	if (query == state->queries.end()) {
+		current = QuerySLASchedulerState::WorkerAssignment();
+		return false;
+	}
+	if (!current.hardware_transition_hold &&
+	    (query->second.pipeline_generation != current.pipeline_generation || !query->second.event ||
+	     !query->second.model.valid || !AssignmentClassIsPlanned(query->second, current))) {
+		current = QuerySLASchedulerState::WorkerAssignment();
+		return false;
+	}
+	SetWorkerSelection(current, QuerySchedulerPolicy::SLA_ENERGY, &reservation);
+	return reservation.assigned;
+}
+
 vector<QuerySLASchedulerSnapshot> QuerySLAScheduler::GetSnapshot() const {
 	lock_guard<mutex> guard(state->lock);
 	vector<QuerySLASchedulerSnapshot> result;
 	result.reserve(state->queries.size());
+	auto snapshot_timestamp_ns = SLATimestampNs();
+	auto epoch_run_count = state->epoch_run_count.load();
+	auto epoch_generation = state->epoch_generation.load();
+	auto next_epoch_ns = state->next_epoch_ns.load();
+	auto epoch_leader_active = state->epoch_leader.load();
+	auto epoch_sentinel_active = state->epoch_sentinel.load();
 	for (const auto &entry : state->queries) {
 		const auto &query = entry.second;
 		QuerySLASchedulerSnapshot snapshot;
-		snapshot.epoch_generation = state->epoch_generation.load();
+		snapshot.snapshot_timestamp_ns = snapshot_timestamp_ns;
+		snapshot.epoch_run_count = epoch_run_count;
+		snapshot.epoch_generation = epoch_generation;
+		snapshot.next_epoch_ns = next_epoch_ns;
+		snapshot.epoch_leader_active = epoch_leader_active;
+		snapshot.epoch_sentinel_active = epoch_sentinel_active;
 		snapshot.db_query_id = query.metadata.db_query_id;
 		snapshot.request_id = query.metadata.request_id;
+		snapshot.deadline_ns = query.metadata.deadline_ns;
+		snapshot.deadline_slack_ms =
+		    (static_cast<double>(query.metadata.deadline_ns) - static_cast<double>(snapshot_timestamp_ns)) / 1000000.0;
 		snapshot.pipeline_id = query.model.pipeline_id;
 		snapshot.pipeline_generation = query.pipeline_generation;
 		snapshot.event_kind = SLAEventKindName(query.model.event_kind);
+		snapshot.event_present = query.event != nullptr;
+		if (query.event) {
+			snapshot.event_finished = query.event->IsFinished();
+			snapshot.scheduled_tasks = query.event->GetTotalTasks();
+			snapshot.finished_tasks = MinValue<idx_t>(query.event->GetFinishedTasks(), snapshot.scheduled_tasks);
+			snapshot.blocked_tasks =
+			    MinValue<idx_t>(query.event->GetBlockedTasks(), snapshot.scheduled_tasks - snapshot.finished_tasks);
+			snapshot.remaining_tasks = snapshot.scheduled_tasks - snapshot.finished_tasks;
+			PipelineWorkSnapshot work;
+			snapshot.event_work_snapshot_valid = query.event->GetPipelineWorkSnapshot(work);
+			if (snapshot.event_work_snapshot_valid) {
+				snapshot.pipeline_id = work.pipeline_id;
+				snapshot.parallelism_valid = work.parallelism_valid;
+				snapshot.preferred_parallelism = work.preferred_parallelism;
+				snapshot.event_remaining_work_units = work.remaining_chunks_equiv;
+			}
+		}
+		snapshot.producer_present = query.producer != nullptr;
+		if (query.producer) {
+			snapshot.producer_queued_tasks = db.GetScheduler().GetTaskCountForProducer(*query.producer);
+		}
 		snapshot.model_valid = query.model.valid;
 		snapshot.model_error = query.model.error;
 		snapshot.demand_cap = query.model.demand_cap;
@@ -1521,7 +1849,22 @@ vector<QuerySLASchedulerSnapshot> QuerySLAScheduler::GetSnapshot() const {
 		snapshot.mandatory_workers = query.mandatory_workers;
 		snapshot.optional_workers = query.optional_workers;
 		snapshot.residual_workers = query.residual_workers;
+		snapshot.planned_workers = PlannedWorkers(query);
 		snapshot.assigned_workers = query.assigned_workers;
+		snapshot.mandatory_gain_count = query.model.mandatory_gain.size();
+		snapshot.optional_gain_count = query.model.optional_gain.size();
+		if (!query.model.mandatory_cost.empty()) {
+			snapshot.mandatory_cost_zero_workers = query.model.mandatory_cost[0];
+		}
+		if (query.model.mandatory_cost.size() > 1) {
+			snapshot.mandatory_cost_one_worker = query.model.mandatory_cost[1];
+		}
+		if (!query.model.mandatory_gain.empty()) {
+			snapshot.first_mandatory_gain = query.model.mandatory_gain[0];
+		}
+		if (!query.model.optional_gain.empty()) {
+			snapshot.first_optional_gain = query.model.optional_gain[0];
+		}
 		if (query.assigned_workers < query.model.mandatory_gain.size()) {
 			snapshot.next_mandatory_gain = query.model.mandatory_gain[query.assigned_workers];
 			snapshot.next_optional_gain = query.model.optional_gain[query.assigned_workers];

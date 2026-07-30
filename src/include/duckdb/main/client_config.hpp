@@ -58,11 +58,13 @@ struct EnergyAttributionSettings {
 	bool migration_check_enabled = true;
 	bool profile_update_enabled = true;
 	bool periodic_enabled = false;
+	bool process_attribution_required = false;
 	uint64_t period_ms = 100;
 	string output_dir;
 	string base_power_path;
 	string counter_profile = "generic";
 	string fail_policy = "warn";
+	string attribution_model = "legacy";
 };
 
 struct ClientConfig {

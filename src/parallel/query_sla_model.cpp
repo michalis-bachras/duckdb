@@ -140,9 +140,19 @@ double QuerySLACurrentPipelineFinishNs(const PipelineWorkSnapshot &work, QueryAc
 	if (!work.continuation_estimate.valid || work.continuation_estimate.p90 <= 0) {
 		return 0;
 	}
-	auto continuation_ns = work.continuation_estimate.kind == ContinuationEstimateKind::NS_PER_WORK_UNIT
-	                           ? remaining_after_epoch * work.continuation_estimate.p90
-	                           : work.continuation_estimate.p90;
+	double continuation_ns;
+	if (work.continuation_estimate.kind == ContinuationEstimateKind::NS_PER_WORK_UNIT) {
+		continuation_ns = remaining_after_epoch * work.continuation_estimate.p90;
+	} else if (work.continuation_estimate.kind == ContinuationEstimateKind::RAW_LATENCY_NS) {
+		// A raw fallback represents the whole pipeline duration. Scale it by live progress so that assigning a
+		// worker still produces a meaningful marginal gain when the pipeline cannot finish within this epoch.
+		auto remaining_fraction = work.total_chunks_equiv > 0
+		                              ? remaining_after_epoch / static_cast<double>(work.total_chunks_equiv)
+		                              : 1.0;
+		continuation_ns = remaining_fraction * work.continuation_estimate.p90;
+	} else {
+		return 0;
+	}
 	return static_cast<double>(now_ns) + static_cast<double>(epoch_ns) + continuation_ns + lifecycle_tail_ns;
 }
 

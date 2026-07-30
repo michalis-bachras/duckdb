@@ -31,7 +31,8 @@ static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
 static constexpr double HARDWARE_POWER_EWMA_ALPHA = 0.7;
 static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
 static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
-static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 5;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 6;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION_LEGACY_CHARGED_POWER = 5;
 static const char *PROFILE_SNAPSHOT_MAGIC = "DUCKDB_QUERY_REQUEST_PROFILE";
 
 class ProfileSnapshotWriter {
@@ -600,9 +601,11 @@ struct PipelineHardwareProfileAggregate {
 	uint64_t version = 0;
 	BoundedSamples throughput;
 	BoundedSamples active_power_w;
+	BoundedSamples base_power_w;
 	BoundedSamples charged_power_w;
 	double throughput_ewma = 0;
 	double active_power_ewma = 0;
+	double base_power_ewma = 0;
 	double charged_power_ewma = 0;
 	idx_t rejected_unstable_samples = 0;
 
@@ -616,9 +619,10 @@ struct PipelineHardwareProfileAggregate {
 		                        : THROUGHPUT_EWMA_ALPHA * value + (1.0 - THROUGHPUT_EWMA_ALPHA) * throughput_ewma;
 	}
 
-	void AddPower(double active_value, double charged_value) {
-		if (!std::isfinite(active_value) || active_value < 0 || !std::isfinite(charged_value) ||
-		    charged_value < active_value) {
+	void AddPower(double active_value, double base_value, double charged_value) {
+		if (!std::isfinite(active_value) || active_value < 0 || !std::isfinite(base_value) || base_value < 0 ||
+		    !std::isfinite(charged_value) || charged_value < active_value ||
+		    std::abs(charged_value - active_value - base_value) > 1e-9 * MaxValue<double>(1.0, charged_value)) {
 			return;
 		}
 		auto first_active = active_power_w.Count() == 0;
@@ -626,6 +630,11 @@ struct PipelineHardwareProfileAggregate {
 		active_power_ewma = first_active ? active_value
 		                                 : HARDWARE_POWER_EWMA_ALPHA * active_value +
 		                                       (1.0 - HARDWARE_POWER_EWMA_ALPHA) * active_power_ewma;
+		auto first_base = base_power_w.Count() == 0;
+		base_power_w.Add(base_value);
+		base_power_ewma = first_base ? base_value
+		                             : HARDWARE_POWER_EWMA_ALPHA * base_value +
+		                                   (1.0 - HARDWARE_POWER_EWMA_ALPHA) * base_power_ewma;
 		auto first = charged_power_w.Count() == 0;
 		charged_power_w.Add(charged_value);
 		charged_power_ewma = first ? charged_value
@@ -927,14 +936,17 @@ static void WritePipelineHardwareProfile(ProfileSnapshotWriter &writer,
 	writer.Write<uint64_t>(profile.version);
 	WriteBoundedSamples(writer, profile.throughput);
 	WriteBoundedSamples(writer, profile.active_power_w);
+	WriteBoundedSamples(writer, profile.base_power_w);
 	WriteBoundedSamples(writer, profile.charged_power_w);
 	writer.Write<double>(profile.throughput_ewma);
 	writer.Write<double>(profile.active_power_ewma);
+	writer.Write<double>(profile.base_power_ewma);
 	writer.Write<double>(profile.charged_power_ewma);
 	writer.Write<uint64_t>(profile.rejected_unstable_samples);
 }
 
-static PipelineHardwareProfileAggregate ReadPipelineHardwareProfile(ProfileSnapshotReader &reader) {
+static PipelineHardwareProfileAggregate ReadPipelineHardwareProfile(ProfileSnapshotReader &reader,
+                                                                    uint32_t snapshot_version) {
 	PipelineHardwareProfileAggregate result;
 	result.key.pipeline.template_id = reader.Read<uint64_t>();
 	result.key.pipeline.scale_factor = reader.Read<uint64_t>();
@@ -948,10 +960,23 @@ static PipelineHardwareProfileAggregate ReadPipelineHardwareProfile(ProfileSnaps
 	result.version = reader.Read<uint64_t>();
 	result.throughput = ReadBoundedSamples(reader);
 	result.active_power_w = ReadBoundedSamples(reader);
-	result.charged_power_w = ReadBoundedSamples(reader);
+	if (snapshot_version >= PROFILE_SNAPSHOT_VERSION) {
+		result.base_power_w = ReadBoundedSamples(reader);
+		result.charged_power_w = ReadBoundedSamples(reader);
+	} else {
+		// Version 5 charged power used pre-process-attribution base semantics. Keep
+		// throughput and active power, but do not mix the old base allocation with
+		// process-first profiles.
+		(void)ReadBoundedSamples(reader);
+	}
 	result.throughput_ewma = reader.Read<double>();
 	result.active_power_ewma = reader.Read<double>();
-	result.charged_power_ewma = reader.Read<double>();
+	if (snapshot_version >= PROFILE_SNAPSHOT_VERSION) {
+		result.base_power_ewma = reader.Read<double>();
+		result.charged_power_ewma = reader.Read<double>();
+	} else {
+		(void)reader.Read<double>();
+	}
 	result.rejected_unstable_samples = reader.Read<uint64_t>();
 	if ((!result.throughput.values.empty() &&
 	     (!std::isfinite(result.throughput_ewma) || result.throughput_ewma <= 0)) ||
@@ -962,6 +987,11 @@ static PipelineHardwareProfileAggregate ReadPipelineHardwareProfile(ProfileSnaps
 	     (!std::isfinite(result.active_power_ewma) || result.active_power_ewma < 0)) ||
 	    (result.active_power_w.values.empty() && result.active_power_ewma != 0)) {
 		throw SerializationException("Invalid hardware active-power EWMA in query profile snapshot");
+	}
+	if ((!result.base_power_w.values.empty() &&
+	     (!std::isfinite(result.base_power_ewma) || result.base_power_ewma < 0)) ||
+	    (result.base_power_w.values.empty() && result.base_power_ewma != 0)) {
+		throw SerializationException("Invalid hardware base-power EWMA in query profile snapshot");
 	}
 	if ((!result.charged_power_w.values.empty() &&
 	     (!std::isfinite(result.charged_power_ewma) || result.charged_power_ewma < 0)) ||
@@ -1072,7 +1102,7 @@ static void WriteSnapshotState(ProfileSnapshotWriter &writer, const ProfileSnaps
 	WriteContinuation(writer, snapshot.global_finish_tail_profile);
 }
 
-static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader) {
+static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader, uint32_t snapshot_version) {
 	ProfileSnapshotState result;
 	auto query_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "query profile");
 	for (idx_t i = 0; i < query_count; i++) {
@@ -1191,7 +1221,7 @@ static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader) {
 	}
 	auto hardware_profile_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "pipeline hardware profile");
 	for (idx_t i = 0; i < hardware_profile_count; i++) {
-		auto profile = ReadPipelineHardwareProfile(reader);
+		auto profile = ReadPipelineHardwareProfile(reader, snapshot_version);
 		auto key = profile.key;
 		if (!result.pipeline_hardware_profiles.emplace(key, std::move(profile)).second) {
 			throw SerializationException("Duplicate pipeline hardware profile in query profile snapshot");
@@ -2012,6 +2042,7 @@ static QueryRequestPipelineHardwareProfileEstimate BuildPipelineHardwareProfileE
 	result.hardware = profile.key.hardware;
 	result.throughput_sample_count = profile.throughput.Count();
 	result.power_sample_count = profile.active_power_w.Count();
+	result.base_power_sample_count = profile.base_power_w.Count();
 	result.rejected_unstable_samples = profile.rejected_unstable_samples;
 	result.mean_work_units_per_s = profile.throughput.Mean();
 	result.ewma_work_units_per_s = profile.throughput_ewma;
@@ -2021,6 +2052,8 @@ static QueryRequestPipelineHardwareProfileEstimate BuildPipelineHardwareProfileE
 	}
 	result.mean_active_power_w = profile.active_power_w.Mean();
 	result.ewma_active_power_w = profile.active_power_ewma;
+	result.mean_base_power_w = profile.base_power_w.Mean();
+	result.ewma_base_power_w = profile.base_power_ewma;
 	result.mean_charged_power_w = profile.charged_power_w.Mean();
 	result.ewma_charged_power_w = profile.charged_power_ewma;
 	if (result.mean_active_power_w > 0) {
@@ -2080,8 +2113,9 @@ void QueryRequestProfileStore::RecordPipelineHardwareEnergy(
 	}
 	auto charged_energy_j = attributed_active_energy_j + attributed_base_energy_j;
 	auto active_power_w = attributed_active_energy_j * 1000000000.0 / static_cast<double>(duration_ns);
+	auto base_power_w = attributed_base_energy_j * 1000000000.0 / static_cast<double>(duration_ns);
 	auto charged_power_w = charged_energy_j * 1000000000.0 / static_cast<double>(duration_ns);
-	profile.AddPower(active_power_w, charged_power_w);
+	profile.AddPower(active_power_w, base_power_w, charged_power_w);
 	profile.version++;
 	state->pipeline_hardware_profile_generation.fetch_add(1);
 }
@@ -2616,7 +2650,9 @@ void QueryRequestProfileStore::ImportSnapshot(FileSystem &fs, const string &path
 	if (reader.ReadString() != PROFILE_SNAPSHOT_MAGIC) {
 		throw SerializationException("Invalid query profile snapshot magic");
 	}
-	if (reader.Read<uint32_t>() != PROFILE_SNAPSHOT_VERSION) {
+	auto snapshot_version = reader.Read<uint32_t>();
+	if (snapshot_version != PROFILE_SNAPSHOT_VERSION &&
+	    snapshot_version != PROFILE_SNAPSHOT_VERSION_LEGACY_CHARGED_POWER) {
 		throw SerializationException("Unsupported query profile snapshot version");
 	}
 	if (reader.ReadString() != DuckDB::SourceID()) {
@@ -2631,7 +2667,7 @@ void QueryRequestProfileStore::ImportSnapshot(FileSystem &fs, const string &path
 	if (reader.Read<double>() != HARDWARE_POWER_EWMA_ALPHA) {
 		throw SerializationException("Query profile snapshot uses a different hardware power EWMA alpha");
 	}
-	auto snapshot = ReadSnapshotState(reader);
+	auto snapshot = ReadSnapshotState(reader, snapshot_version);
 	if (!reader.Finished()) {
 		throw SerializationException("Trailing data in query profile snapshot");
 	}

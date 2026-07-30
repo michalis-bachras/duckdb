@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -88,6 +89,9 @@ static void ConfigureEnergyAttribution(Connection &root, const WorkloadConfig &c
 	ExecuteSetting(root, "SET energy_attribution_profile_update_enable=true");
 	ExecuteSetting(root, "SET energy_attribution_period_ms=" +
 	                         std::to_string(config.energy_attribution_period_ms));
+	ExecuteSetting(root, "SET energy_attribution_model=" + QuoteSQLString(config.energy_attribution_model));
+	ExecuteSetting(root, string("SET energy_attribution_process_required=") +
+	                         (config.energy_process_required ? "true" : "false"));
 	ExecuteSetting(root, "SET energy_attribution_periodic_enable=true");
 	// Enable last so the runtime starts once with its complete immutable configuration.
 	ExecuteSetting(root, "SET energy_attribution_enable=true");
@@ -113,9 +117,12 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
 	ExecuteSetting(root, string("SET query_sla_residual_policy=") +
 	                         QuoteSQLString(config.sla_residual_workers_enabled ? "work_conserving" : "park"));
-	if (policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled) {
-		ExecuteSetting(root, "SET pin_threads='on'");
+	if (IsQuerySLAPolicy(policy)) {
+		ExecuteSetting(root, "SET query_sla_scheduler_epoch_ms=" + std::to_string(config.sla_epoch_ms));
 	}
+	auto pin_threads =
+	    policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled ? "on" : config.pin_threads;
+	ExecuteSetting(root, "SET pin_threads=" + QuoteSQLString(pin_threads));
 	if (policy == QuerySchedulerPolicy::SLA_ENERGY) {
 		ExecuteSetting(root, string("SET query_sla_energy_hardware_control_enable=") +
 		                         (config.sla_energy_hardware_control ? "true" : "false"));
@@ -225,6 +232,87 @@ struct RequestState {
 	bool done = false;
 	RequestResult result;
 };
+
+static bool HasSubmittedIncompleteRequest(vector<unique_ptr<RequestState>> &requests) {
+	for (auto &request : requests) {
+		lock_guard<mutex> guard(request->lock);
+		if (request->submission_done && !request->done) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void PrintNoProgressDiagnostics(DuckDB &db, vector<unique_ptr<RequestState>> &requests, idx_t done_count,
+	                                   idx_t current_waiters, idx_t notification_high_water, double stalled_s) {
+	auto &task_scheduler = db.instance->GetScheduler();
+	auto &sla_scheduler = db.instance->GetQuerySLAScheduler();
+	auto snapshots = sla_scheduler.GetSnapshot();
+	std::cerr << "scheduler_watchdog_summary"
+	          << " stalled_s=" << stalled_s << " done=" << done_count << '/' << requests.size()
+	          << " global_queued_tasks=" << task_scheduler.GetNumberOfTasks()
+	          << " producer_count=" << task_scheduler.GetProducerCount()
+	          << " active_queries=" << snapshots.size() << " epoch_run_count=" << sla_scheduler.EpochRunCount()
+	          << " admission_waiters=" << current_waiters
+	          << " notification_high_water=" << notification_high_water << '\n';
+	for (const auto &snapshot : snapshots) {
+		std::cerr << "scheduler_watchdog_query"
+		          << " db_query_id=" << snapshot.db_query_id << " request_id=" << snapshot.request_id
+		          << " pipeline_id=" << snapshot.pipeline_id
+		          << " pipeline_generation=" << snapshot.pipeline_generation << " event_kind=" << snapshot.event_kind
+		          << " event_present=" << snapshot.event_present << " event_finished=" << snapshot.event_finished
+		          << " event_work_valid=" << snapshot.event_work_snapshot_valid
+		          << " scheduled_tasks=" << snapshot.scheduled_tasks << " finished_tasks=" << snapshot.finished_tasks
+		          << " blocked_tasks=" << snapshot.blocked_tasks << " remaining_tasks=" << snapshot.remaining_tasks
+		          << " parallelism_valid=" << snapshot.parallelism_valid
+		          << " preferred_parallelism=" << snapshot.preferred_parallelism
+		          << " event_remaining_work=" << snapshot.event_remaining_work_units
+		          << " producer_present=" << snapshot.producer_present
+		          << " producer_queued_tasks=" << snapshot.producer_queued_tasks
+		          << " model_valid=" << snapshot.model_valid << " model_error=" << snapshot.model_error
+		          << " demand_cap=" << snapshot.demand_cap
+		          << " model_remaining_work=" << snapshot.remaining_work_units
+		          << " mandatory_workers=" << snapshot.mandatory_workers
+		          << " optional_workers=" << snapshot.optional_workers
+		          << " residual_workers=" << snapshot.residual_workers
+		          << " planned_workers=" << snapshot.planned_workers
+		          << " assigned_workers=" << snapshot.assigned_workers
+		          << " mandatory_gain_count=" << snapshot.mandatory_gain_count
+		          << " optional_gain_count=" << snapshot.optional_gain_count
+		          << " cost_0=" << snapshot.mandatory_cost_zero_workers
+		          << " cost_1=" << snapshot.mandatory_cost_one_worker
+		          << " first_mandatory_gain=" << snapshot.first_mandatory_gain
+		          << " first_optional_gain=" << snapshot.first_optional_gain
+		          << " next_mandatory_gain=" << snapshot.next_mandatory_gain
+		          << " next_optional_gain=" << snapshot.next_optional_gain
+		          << " deadline_slack_ms=" << snapshot.deadline_slack_ms
+		          << " epoch_generation=" << snapshot.epoch_generation
+		          << " next_epoch_ns=" << snapshot.next_epoch_ns
+		          << " epoch_leader=" << snapshot.epoch_leader_active
+		          << " epoch_sentinel=" << snapshot.epoch_sentinel_active << '\n';
+	}
+	for (idx_t request_idx = 0; request_idx < requests.size(); request_idx++) {
+		auto &request = *requests[request_idx];
+		lock_guard<mutex> guard(request.lock);
+		if (request.done || (!request.submission_done && request.result.submit_begin_ns == 0)) {
+			continue;
+		}
+		std::cerr << "scheduler_watchdog_request"
+		          << " token=" << request_idx << " request_id=" << request.schedule.request_id
+		          << " template_id=" << request.schedule.template_id << " scale_factor=" << request.schedule.scale_factor
+		          << " submission_done=" << request.submission_done
+		          << " admission_queued=" << request.admission_queued << " pending_present=" << (request.pending != nullptr)
+		          << " finalizing=" << request.finalizing << " done=" << request.done
+		          << " submit_begin_ns=" << request.result.submit_begin_ns
+		          << " submit_end_ns=" << request.result.submit_end_ns
+		          << " admitted_ns=" << request.result.admitted_ns
+		          << " execution_started_ns=" << request.result.execution_started_ns
+		          << " execution_ready_ns=" << request.result.execution_ready_ns
+		          << " result_ready_ns=" << request.result.result_ready_ns
+		          << " admission_released_ns=" << request.result.admission_released_ns << '\n';
+	}
+	std::cerr.flush();
+}
 
 static double Percentile(vector<double> values, double quantile) {
 	if (values.empty()) {
@@ -572,11 +660,44 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 		submissions.Close();
 	});
 
+	std::atomic<bool> watchdog_stop(false);
+	std::thread watchdog;
+	if (config.no_progress_diagnostic_s > 0) {
+		watchdog = std::thread([&]() {
+			auto last_done = done_count.load();
+			while (!watchdog_stop.load()) {
+				std::unique_lock<std::mutex> guard(done_lock);
+				auto progress = done_cv.wait_for(
+				    guard, std::chrono::duration<double>(config.no_progress_diagnostic_s),
+				    [&]() { return watchdog_stop.load() || done_count.load() != last_done; });
+				if (watchdog_stop.load()) {
+					break;
+				}
+				if (progress) {
+					last_done = done_count.load();
+					continue;
+				}
+				auto observed_done = done_count.load();
+				guard.unlock();
+				if (!HasSubmittedIncompleteRequest(requests)) {
+					continue;
+				}
+				PrintNoProgressDiagnostics(db, requests, observed_done, current_waiters.load(),
+				                           notification_queue->HighWaterMark(), config.no_progress_diagnostic_s);
+			}
+		});
+	}
+
 	{
 		std::unique_lock<std::mutex> guard(done_lock);
 		while (done_count.load() < requests.size()) {
 			done_cv.wait(guard);
 		}
+	}
+	watchdog_stop.store(true);
+	done_cv.notify_all();
+	if (watchdog.joinable()) {
+		watchdog.join();
 	}
 	arrivals.join();
 	for (auto &thread : submitters) {
@@ -607,11 +728,14 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 		               "export pipeline hardware profiles");
 		ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_energy_hardware()",
 		               config.output_dir + "/query_sla_energy_hardware.csv", "export SLA-energy hardware state");
-		if (!config.scheduler_trace_templates.empty()) {
-			ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_energy_worker_epochs()",
-			               config.output_dir + "/query_sla_energy_worker_epochs.csv",
-			               "export SLA-energy worker trace");
-		}
+			if (!config.scheduler_trace_templates.empty()) {
+				ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_energy_worker_epochs()",
+				               config.output_dir + "/query_sla_energy_worker_epochs.csv",
+				               "export SLA-energy worker trace");
+				ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_energy_hardware_transitions()",
+				               config.output_dir + "/query_sla_energy_hardware_transitions.csv",
+				               "export SLA-energy hardware transition trace");
+			}
 	}
 	ExportProfiles(db, config);
 	if (config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {

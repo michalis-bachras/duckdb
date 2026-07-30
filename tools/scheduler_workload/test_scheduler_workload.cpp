@@ -70,19 +70,28 @@ int main() {
 		const char *arguments[] = {
 		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
 		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla_energy",
-		    "--energy-power-model", "/tmp/power.csv", "--energy-hardware-control", "off",
-		    "--energy-exploration", "on", "--energy-exploration-seed", "17",
-		    "--sla-residual-policy", "park",
-		    "--energy-attribution-period-ms", "50",
-		    "--energy-attribution-export", "off", "--energy-attribution-debug-export", "on"};
+			    "--pin-threads", "on",
+			    "--energy-power-model", "/tmp/power.csv", "--energy-hardware-control", "off",
+			    "--energy-exploration", "on", "--energy-exploration-seed", "17",
+			    "--sla-residual-policy", "park",
+			    "--no-progress-diagnostic-s", "15",
+			    "--sla-epoch-ms", "50",
+			    "--energy-attribution-period-ms", "50",
+			    "--energy-attribution-model", "process_shadow", "--energy-process-required", "on",
+			    "--energy-attribution-export", "off", "--energy-attribution-debug-export", "on"};
 		auto parsed = ParseConfig(sizeof(arguments) / sizeof(arguments[0]), const_cast<char **>(arguments));
 		Require(parsed.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY, "SLA-energy scheduler parsing");
+		Require(parsed.pin_threads == "on", "worker pinning mode parsing");
 		Require(!parsed.sla_energy_hardware_control, "dry-run hardware mode parsing");
 		Require(parsed.sla_energy_exploration, "exploration mode parsing");
 		Require(parsed.sla_energy_exploration_seed == 17, "exploration seed parsing");
-		Require(!parsed.sla_residual_workers_enabled, "parked residual-worker policy parsing");
+			Require(!parsed.sla_residual_workers_enabled, "parked residual-worker policy parsing");
+			Require(parsed.no_progress_diagnostic_s == 15, "no-progress diagnostic interval parsing");
+		Require(parsed.sla_epoch_ms == 50, "SLA epoch duration parsing");
 		Require(!parsed.energy_attribution_enabled, "attribution is explicit and defaults off");
 		Require(parsed.energy_attribution_period_ms == 50, "attribution period parsing");
+		Require(parsed.energy_attribution_model == "process_shadow", "process attribution model parsing");
+		Require(parsed.energy_process_required, "required process collector parsing");
 		Require(!parsed.energy_attribution_export, "attribution export parsing");
 		Require(parsed.energy_attribution_debug_export, "attribution debug export parsing");
 
@@ -124,6 +133,59 @@ int main() {
 			rejected_removed_lambda = true;
 		}
 		Require(rejected_removed_lambda, "removed energy-lambda option is rejected");
+
+		const char *zero_epoch_arguments[] = {
+		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
+		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla",
+		    "--sla-epoch-ms", "0"};
+		bool rejected_zero_epoch = false;
+		try {
+			ParseConfig(sizeof(zero_epoch_arguments) / sizeof(zero_epoch_arguments[0]),
+			            const_cast<char **>(zero_epoch_arguments));
+		} catch (InvalidInputException &) {
+			rejected_zero_epoch = true;
+		}
+		Require(rejected_zero_epoch, "zero SLA epoch duration is rejected");
+
+		const char *invalid_attribution_model_arguments[] = {
+		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
+		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla",
+		    "--energy-attribution-model", "unknown"};
+		bool rejected_invalid_attribution_model = false;
+		try {
+			ParseConfig(sizeof(invalid_attribution_model_arguments) / sizeof(invalid_attribution_model_arguments[0]),
+			            const_cast<char **>(invalid_attribution_model_arguments));
+		} catch (InvalidInputException &) {
+			rejected_invalid_attribution_model = true;
+		}
+		Require(rejected_invalid_attribution_model, "unknown process attribution model is rejected");
+
+		const char *invalid_pin_threads_arguments[] = {
+		    "scheduler_workload", "run",         "--database",   "10=/tmp/sf10.duckdb",
+		    "--queries-dir",      "/tmp/queries", "--schedule",   "/tmp/schedule.csv",
+		    "--output-dir",       "/tmp/output",  "--pin-threads", "sometimes"};
+		bool rejected_invalid_pin_threads = false;
+		try {
+			ParseConfig(sizeof(invalid_pin_threads_arguments) / sizeof(invalid_pin_threads_arguments[0]),
+			            const_cast<char **>(invalid_pin_threads_arguments));
+		} catch (InvalidInputException &) {
+			rejected_invalid_pin_threads = true;
+		}
+		Require(rejected_invalid_pin_threads, "unknown worker pinning mode is rejected");
+
+		const char *unpinned_attribution_arguments[] = {
+		    "scheduler_workload", "run",           "--database",          "10=/tmp/sf10.duckdb",
+		    "--queries-dir",      "/tmp/queries",  "--schedule",          "/tmp/schedule.csv",
+		    "--output-dir",       "/tmp/output",   "--pin-threads",       "off",
+		    "--energy-power-model", "/tmp/power.csv", "--energy-attribution", "on"};
+		bool rejected_unpinned_attribution = false;
+		try {
+			ParseConfig(sizeof(unpinned_attribution_arguments) / sizeof(unpinned_attribution_arguments[0]),
+			            const_cast<char **>(unpinned_attribution_arguments));
+		} catch (InvalidInputException &) {
+			rejected_unpinned_attribution = true;
+		}
+		Require(rejected_unpinned_attribution, "energy attribution rejects explicitly unpinned workers");
 		std::cout << "scheduler_workload tests passed\n";
 		return 0;
 	} catch (std::exception &ex) {

@@ -137,11 +137,13 @@ For a fair energy baseline, run the identical schedule and profile snapshot with
 
 The SLA-family schedulers park capacity after positive mandatory and optional gains are exhausted. The SLA-only scheduler can opt into zero-gain residual workers up to pipeline demand caps with `--sla-residual-policy work_conserving` for controlled ablations; SLA-energy always parks residual capacity. Epoch traces expose `residual_workers` separately from positive-gain `optional_workers`.
 
+The scheduler epoch defaults to 200 ms. Use `--sla-epoch-ms N` for controlled responsiveness and overhead experiments; the value must be positive and applies only to SLA-family policies.
+
 The driver exports `query_sla_energy_hardware.csv` before shutdown and `query_sla_energy_hardware_restoration.csv` after explicitly deactivating the energy policy. The latter reports exact MSR restoration attempts, successful readback verifications, and failures. A real hardware-controlled run is invalid if any restoration write or readback fails. Both upshifts and downshifts are applied synchronously and verified. Exploration diagnostics report core-probe epochs, optional-only socket-probe epochs, forced socket-probe epochs, and the current optional-only-socket miss count.
 
 `--energy-hardware-control off` is a dry-run mode for unit and scheduler validation. It publishes and verifies logical targets without opening MSRs. Combining SLA-energy dry-run targets with `--energy-attribution on` is rejected because the logical target would not identify the physical frequency used by an attributed segment.
 
-SLA-energy runs additionally export `query_request_pipeline_hardware_profiles.csv` and `query_sla_energy_hardware.csv`. With targeted scheduler tracing enabled, they also export `query_sla_energy_worker_epochs.csv`; the epoch trace separates model/allocation time from `hardware_apply_ns`.
+SLA-energy runs additionally export `query_request_pipeline_hardware_profiles.csv` and `query_sla_energy_hardware.csv`. The hardware summary separates worker-target calls, no-op updates, assignments, releases, retargets, core/uncore transitions, lock waiting, and synchronous hardware-application time. With targeted scheduler tracing enabled, runs also export `query_sla_energy_worker_epochs.csv` and the bounded debug-only `query_sla_energy_hardware_transitions.csv`. The transition trace links worker reservations to requested and applied frequency pairs and records the write and latency cost of each change. Reconciled hardware targets are published once per epoch, while a genuine between-epoch reassignment can update only the affected worker. Completing a task releases its scheduler lease without releasing its persistent hardware reservation. A pipeline completion places that reservation in a transition hold so its immediate successor can reuse the hardware pair; final query teardown, an epoch replacement, parking, or policy exit releases it. The epoch `hardware_apply_ns` column reports synchronous plan-publication time.
 
 ## Common Environment
 
@@ -157,6 +159,13 @@ Every measured policy uses:
 Only `scheduler_policy` changes between runs.
 
 The OS-frequency statement applies to the `default`, `stride`, and pure `sla` comparison. `sla_energy` deliberately uses direct MSR control and must be reported as a separate hardware-aware experiment.
+
+Use `--pin-threads auto|on|off` to control policy-neutral worker pinning. Energy attribution and SLA-energy promote
+`auto` to `on` and reject an explicit `off`. To measure total process-attribution overhead, replay the same schedule
+under DEFAULT twice with `--pin-threads on`: once with `--energy-attribution off`, and once with
+`--energy-attribution on --energy-attribution-model process --energy-process-required on`. Keep debug export disabled
+for both measured runs. This two-arm comparison holds scheduler policy and worker topology fixed while measuring the
+complete process-attribution mechanism.
 
 ## Event-Driven Execution
 
