@@ -280,6 +280,7 @@ QuerySLAModel BuildQuerySLAModel(const QuerySLAModelInput &input) {
 		return model;
 	}
 	if (!input.suffix.valid || input.suffix.bucket_count == 0) {
+		model.valid = false;
 		model.error = "active data pipeline has no trained downstream-suffix histogram";
 		return model;
 	}
@@ -336,7 +337,8 @@ QuerySLAAllocation AllocateQuerySLAWorkers(const vector<QuerySLAModel> &models, 
 		result.mandatory[top.query_index]++;
 		worker_budget--;
 		auto next = result.mandatory[top.query_index];
-		if (next < models[top.query_index].demand_cap) {
+		if (next < models[top.query_index].demand_cap &&
+		    next < models[top.query_index].mandatory_gain.size()) {
 			mandatory_heap.emplace(models[top.query_index].mandatory_gain[next], top.query_index, next);
 		}
 	}
@@ -344,7 +346,7 @@ QuerySLAAllocation AllocateQuerySLAWorkers(const vector<QuerySLAModel> &models, 
 	std::priority_queue<EpochHeapEntry> optional_heap;
 	for (idx_t i = 0; i < models.size(); i++) {
 		auto workers = result.mandatory[i];
-		if (models[i].valid && workers < models[i].demand_cap) {
+		if (models[i].valid && workers < models[i].demand_cap && workers < models[i].optional_gain.size()) {
 			optional_heap.emplace(models[i].optional_gain[workers], i, workers);
 		}
 	}
@@ -363,7 +365,8 @@ QuerySLAAllocation AllocateQuerySLAWorkers(const vector<QuerySLAModel> &models, 
 		result.optional[top.query_index]++;
 		worker_budget--;
 		auto workers = result.mandatory[top.query_index] + result.optional[top.query_index];
-		if (workers < models[top.query_index].demand_cap) {
+		if (workers < models[top.query_index].demand_cap &&
+		    workers < models[top.query_index].optional_gain.size()) {
 			optional_heap.emplace(models[top.query_index].optional_gain[workers], top.query_index, workers);
 		}
 	}

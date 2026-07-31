@@ -7,6 +7,7 @@
 
 #include "duckdb/energy_attribution/energy_attribution.hpp"
 #include "duckdb/energy_attribution/process_activity.hpp"
+#include "energy_attribution_base_power.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_config.hpp"
@@ -54,20 +55,17 @@ namespace duckdb {
 
 namespace {
 
+using energy_attribution::BasePowerEntry;
+using energy_attribution::LoadBasePowerCSVCached;
+using energy_attribution::LookupBasePower;
+
 static const char *DEFAULT_OUTPUT_DIR = "energy_attribution_output";
 static const uint64_t NSEC_PER_SEC = 1000000000ULL;
-static const idx_t DEFAULT_THREAD_SEGMENT_BUFFER_CAPACITY = 1024;
 static const uint64_t DEFAULT_THREAD_SEGMENT_ID_BLOCK_SIZE = 1024;
 
 struct PerfCounters {
 	uint64_t task_clock_ns = 0;
 	uint64_t cycles = 0;
-	uint64_t instructions = 0;
-	uint64_t ref_cycles = 0;
-	uint64_t cache_refs = 0;
-	uint64_t cache_misses = 0;
-	uint64_t llc_misses = 0;
-	uint64_t offcore_responses = 0;
 	bool valid = false;
 	bool scaled = false;
 	string status;
@@ -89,14 +87,6 @@ struct RaplSnapshot {
 	bool valid = false;
 };
 
-struct BasePowerEntry {
-	int socket_id = -1;
-	double core_freq_hz = 0;
-	double uncore_freq_hz = 0;
-	int smt_state = 0;
-	double base_power_w = 0;
-};
-
 struct AttributedSegment {
 	EnergySegmentRecord record;
 	uint64_t window_id = 0;
@@ -104,16 +94,12 @@ struct AttributedSegment {
 	uint64_t slice_end_ns = 0;
 	double frequency_ratio = 0;
 	double corrected_cycles = 0;
-	double process_frequency_ratio = 0;
-	double process_corrected_cycles = 0;
 	double activity_weight = 0;
 	double weight_denominator = 0;
 	double attributed_active_energy_j = 0;
 	double base_time_weight = 0;
 	double base_time_denominator_s = 0;
 	double attributed_base_energy_j = 0;
-	double legacy_active_energy_j = 0;
-	double process_active_energy_j = 0;
 	double task_clock_coverage = 0;
 	double throughput = 0;
 	bool process_attribution_valid = false;
@@ -189,6 +175,12 @@ struct SocketEnergyWindow {
 	uint64_t process_boundary_max_ns = 0;
 	uint64_t process_maximum_checkpoint_delay_ns = 0;
 	uint64_t process_checkpoint_duration_ns = 0;
+	uint64_t process_helper_count = 0;
+	int64_t process_helper_futex_wake_count = -1;
+	uint64_t process_acknowledged_helper_count = 0;
+	uint64_t process_missing_helper_count = 0;
+	int32_t process_slowest_helper_cpu = -1;
+	string process_missing_helper_cpus;
 	uint64_t process_activity_map_insert_failure = 0;
 	uint64_t process_missing_counter = 0;
 	uint64_t process_invalid_counter_delta = 0;
@@ -207,7 +199,6 @@ struct SocketEnergyWindow {
 	bool used_time_fallback = false;
 	bool process_boundary_corrected = false;
 	bool process_attribution_valid = false;
-	string attribution_model = "legacy";
 	string process_status;
 	string status;
 };
@@ -261,8 +252,18 @@ struct PreparedSocketProcessActivity {
 	double corrected_weight_sum = 0;
 	double runtime_weight_sum = 0;
 	uint32_t monitored_cpu_count = 0;
+	uint32_t helper_count = 0;
+	uint32_t acknowledged_helper_count = 0;
+	uint32_t missing_helper_count = 0;
+	uint64_t boundary_min_ns = 0;
+	uint64_t boundary_max_ns = 0;
+	uint64_t maximum_checkpoint_delay_ns = 0;
+	uint64_t late_helper_count = 0;
+	int32_t slowest_helper_cpu = -1;
+	string missing_helper_cpus;
 	bool has_non_idle_activity = false;
 	bool all_pmu_valid = true;
+	bool checkpoint_valid = false;
 };
 
 struct PreparedProcessActivity {
@@ -287,23 +288,25 @@ struct DuckDBThreadShare {
 	bool use_segment_time = false;
 };
 
-struct PipelineProfileAggregate {
-	string pipeline_signature;
-	double core_freq_hz = 0;
-	double uncore_freq_hz = 0;
-	int smt_occupancy = 1;
-	uint64_t samples = 0;
-	double duration_s = 0;
-	double work_units = 0;
-	double corrected_cycles = 0;
-	double active_energy_j = 0;
-	double base_energy_j = 0;
+enum class PeriodicHardwareProfileMode : uint8_t {
+	LOGICAL = 0,
+	CONTROLLED = 1,
 };
+
+static const char *PeriodicHardwareProfileModeToString(PeriodicHardwareProfileMode mode) {
+	switch (mode) {
+	case PeriodicHardwareProfileMode::CONTROLLED:
+		return "CONTROLLED";
+	case PeriodicHardwareProfileMode::LOGICAL:
+	default:
+		return "LOGICAL";
+	}
+}
 
 struct PipelineEfficiencyAggregate {
 	uint64_t query_id = 0;
 	uint64_t pipeline_id = 0;
-	string pipeline_signature;
+	PeriodicHardwareProfileMode hardware_mode = PeriodicHardwareProfileMode::LOGICAL;
 	uint64_t start_ns = 0;
 	uint64_t end_ns = 0;
 	double core_freq_hz = 0;
@@ -348,6 +351,7 @@ struct LifecyclePhaseProfileAggregate {
 	uint64_t owner_pipeline_id = 0;
 	uint64_t lifecycle_member_count = 0;
 	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
+	PeriodicHardwareProfileMode hardware_mode = PeriodicHardwareProfileMode::LOGICAL;
 	uint64_t start_ns = 0;
 	uint64_t end_ns = 0;
 	double core_freq_hz = 0;
@@ -364,12 +368,14 @@ struct LifecyclePhaseProfileAggregate {
 struct PeriodicPipelineProfileKey {
 	uint64_t query_id = 0;
 	uint64_t pipeline_id = 0;
-	int64_t core_freq_hz = 0;
-	int64_t uncore_freq_hz = 0;
+	PeriodicHardwareProfileMode hardware_mode = PeriodicHardwareProfileMode::LOGICAL;
+	uint32_t core_frequency_khz = 0;
+	uint32_t uncore_frequency_khz = 0;
 
 	bool operator==(const PeriodicPipelineProfileKey &other) const {
-		return query_id == other.query_id && pipeline_id == other.pipeline_id && core_freq_hz == other.core_freq_hz &&
-		       uncore_freq_hz == other.uncore_freq_hz;
+		return query_id == other.query_id && pipeline_id == other.pipeline_id &&
+		       hardware_mode == other.hardware_mode && core_frequency_khz == other.core_frequency_khz &&
+		       uncore_frequency_khz == other.uncore_frequency_khz;
 	}
 };
 
@@ -377,8 +383,12 @@ struct PeriodicPipelineProfileKeyHash {
 	size_t operator()(const PeriodicPipelineProfileKey &key) const {
 		size_t result = std::hash<uint64_t> {}(key.query_id);
 		result ^= std::hash<uint64_t> {}(key.pipeline_id) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
-		result ^= std::hash<int64_t> {}(key.core_freq_hz) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
-		result ^= std::hash<int64_t> {}(key.uncore_freq_hz) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<int> {}(static_cast<int>(key.hardware_mode)) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<uint32_t> {}(key.core_frequency_khz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<uint32_t> {}(key.uncore_frequency_khz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
 		return result;
 	}
 };
@@ -387,12 +397,14 @@ struct PeriodicLifecycleProfileKey {
 	uint64_t query_id = 0;
 	uint64_t lifecycle_group_id = 0;
 	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
-	int64_t core_freq_hz = 0;
-	int64_t uncore_freq_hz = 0;
+	PeriodicHardwareProfileMode hardware_mode = PeriodicHardwareProfileMode::LOGICAL;
+	uint32_t core_frequency_khz = 0;
+	uint32_t uncore_frequency_khz = 0;
 
 	bool operator==(const PeriodicLifecycleProfileKey &other) const {
 		return query_id == other.query_id && lifecycle_group_id == other.lifecycle_group_id && phase == other.phase &&
-		       core_freq_hz == other.core_freq_hz && uncore_freq_hz == other.uncore_freq_hz;
+		       hardware_mode == other.hardware_mode && core_frequency_khz == other.core_frequency_khz &&
+		       uncore_frequency_khz == other.uncore_frequency_khz;
 	}
 };
 
@@ -403,23 +415,30 @@ struct PeriodicLifecycleProfileKeyHash {
 		          (result >> 2);
 		result ^= std::hash<int> {}(static_cast<int>(key.phase)) + 0x9e3779b97f4a7c15ULL + (result << 6) +
 		          (result >> 2);
-		result ^= std::hash<int64_t> {}(key.core_freq_hz) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
-		result ^= std::hash<int64_t> {}(key.uncore_freq_hz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		result ^= std::hash<int> {}(static_cast<int>(key.hardware_mode)) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<uint32_t> {}(key.core_frequency_khz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<uint32_t> {}(key.uncore_frequency_khz) + 0x9e3779b97f4a7c15ULL + (result << 6) +
 		          (result >> 2);
 		return result;
 	}
 };
 
-static int64_t PeriodicFrequencyKey(double frequency_hz) {
-	return static_cast<int64_t>(std::llround(frequency_hz));
+static bool HasControlledHardwareProfile(const EnergySegmentRecord &record) {
+	return record.hardware_state_stable && record.target_core_frequency_khz != 0 &&
+	       record.target_uncore_frequency_khz != 0;
 }
 
 static PeriodicPipelineProfileKey BuildPeriodicPipelineProfileKey(const EnergySegmentRecord &record) {
 	PeriodicPipelineProfileKey key;
 	key.query_id = record.query_id;
 	key.pipeline_id = record.pipeline_id;
-	key.core_freq_hz = PeriodicFrequencyKey(record.core_freq_hz);
-	key.uncore_freq_hz = PeriodicFrequencyKey(record.uncore_freq_hz);
+	if (HasControlledHardwareProfile(record)) {
+		key.hardware_mode = PeriodicHardwareProfileMode::CONTROLLED;
+		key.core_frequency_khz = record.target_core_frequency_khz;
+		key.uncore_frequency_khz = record.target_uncore_frequency_khz;
+	}
 	return key;
 }
 
@@ -435,8 +454,11 @@ static PeriodicLifecycleProfileKey BuildPeriodicLifecycleProfileKey(const Energy
 	key.query_id = record.query_id;
 	key.lifecycle_group_id = record.lifecycle_group_id;
 	key.phase = record.phase;
-	key.core_freq_hz = PeriodicFrequencyKey(record.core_freq_hz);
-	key.uncore_freq_hz = PeriodicFrequencyKey(record.uncore_freq_hz);
+	if (HasControlledHardwareProfile(record)) {
+		key.hardware_mode = PeriodicHardwareProfileMode::CONTROLLED;
+		key.core_frequency_khz = record.target_core_frequency_khz;
+		key.uncore_frequency_khz = record.target_uncore_frequency_khz;
+	}
 	return key;
 }
 
@@ -446,12 +468,9 @@ static unordered_map<ClientContext *, shared_ptr<QueryEnergyState>> g_queries;
 static std::atomic<uint64_t> g_system_segment_id {1};
 static mutex g_database_settings_lock;
 static unordered_map<const DatabaseInstance *, EnergyAttributionSettings> g_database_settings;
-static mutex g_base_power_cache_lock;
-static unordered_map<string, vector<BasePowerEntry>> g_base_power_cache;
-
 static void StoreDatabaseEnergySettings(DatabaseInstance &db, const EnergyAttributionSettings &settings) {
 	lock_guard<mutex> guard(g_database_settings_lock);
-	if (settings.enabled && settings.periodic_enabled) {
+	if (settings.enabled) {
 		g_database_settings[&db] = settings;
 	} else {
 		g_database_settings.erase(&db);
@@ -465,7 +484,7 @@ static bool TryGetDatabaseEnergySettings(const DatabaseInstance &db, EnergyAttri
 		return false;
 	}
 	settings = entry->second;
-	return settings.enabled && settings.periodic_enabled;
+	return settings.enabled;
 }
 
 static void ClearDatabaseEnergySettings(DatabaseInstance &db) {
@@ -608,46 +627,6 @@ static string CsvEscape(const string &input) {
 	return result;
 }
 
-static string TrimCopy(string input) {
-	StringUtil::Trim(input);
-	return input;
-}
-
-static vector<string> SplitCSVLine(const string &line) {
-	vector<string> result;
-	string current;
-	bool in_quotes = false;
-	for (idx_t i = 0; i < line.size(); i++) {
-		auto c = line[i];
-		if (c == '"') {
-			if (in_quotes && i + 1 < line.size() && line[i + 1] == '"') {
-				current += '"';
-				i++;
-			} else {
-				in_quotes = !in_quotes;
-			}
-		} else if (c == ',' && !in_quotes) {
-			result.push_back(TrimCopy(current));
-			current.clear();
-		} else {
-			current += c;
-		}
-	}
-	result.push_back(TrimCopy(current));
-	return result;
-}
-
-static double ParseDoubleOrZero(const string &value) {
-	if (value.empty()) {
-		return 0;
-	}
-	try {
-		return std::stod(value);
-	} catch (...) {
-		return 0;
-	}
-}
-
 static int ParseIntOrDefault(const string &value, int default_value) {
 	if (value.empty()) {
 		return default_value;
@@ -657,105 +636,6 @@ static int ParseIntOrDefault(const string &value, int default_value) {
 	} catch (...) {
 		return default_value;
 	}
-}
-
-static bool LoadBasePowerCSV(const string &path, vector<BasePowerEntry> &entries) {
-	if (path.empty()) {
-		return false;
-	}
-	std::ifstream input(path.c_str());
-	if (!input.good()) {
-		return false;
-	}
-	string line;
-	bool first = true;
-	while (std::getline(input, line)) {
-		line = TrimCopy(line);
-		if (line.empty() || line[0] == '#') {
-			continue;
-		}
-		auto fields = SplitCSVLine(line);
-		if (first && !fields.empty() && StringUtil::Lower(fields[0]) == "socket_id") {
-			first = false;
-			continue;
-		}
-		first = false;
-		if (fields.size() < 4) {
-			continue;
-		}
-		BasePowerEntry entry;
-		entry.socket_id = ParseIntOrDefault(fields[0], -1);
-		if (fields.size() >= 5) {
-			entry.core_freq_hz = ParseDoubleOrZero(fields[1]);
-			entry.uncore_freq_hz = ParseDoubleOrZero(fields[2]);
-			entry.smt_state = ParseIntOrDefault(fields[3], 0);
-			entry.base_power_w = ParseDoubleOrZero(fields[4]);
-		} else {
-			entry.core_freq_hz = 0;
-			entry.uncore_freq_hz = ParseDoubleOrZero(fields[1]);
-			entry.smt_state = 0;
-			entry.base_power_w = ParseDoubleOrZero(fields[2]);
-		}
-		if (entry.socket_id >= 0 && entry.base_power_w >= 0) {
-			entries.push_back(entry);
-		}
-	}
-	return !entries.empty();
-}
-
-static bool LoadBasePowerCSVCached(const string &path, vector<BasePowerEntry> &entries) {
-	entries.clear();
-	if (path.empty()) {
-		return false;
-	}
-	{
-		lock_guard<mutex> guard(g_base_power_cache_lock);
-		auto entry = g_base_power_cache.find(path);
-		if (entry != g_base_power_cache.end()) {
-			entries = entry->second;
-			return !entries.empty();
-		}
-	}
-	vector<BasePowerEntry> loaded;
-	if (!LoadBasePowerCSV(path, loaded)) {
-		return false;
-	}
-	{
-		lock_guard<mutex> guard(g_base_power_cache_lock);
-		g_base_power_cache[path] = loaded;
-	}
-	entries = std::move(loaded);
-	return !entries.empty();
-}
-
-static double FrequencyDistance(double lhs, double rhs) {
-	if (lhs <= 0 || rhs <= 0) {
-		return 0;
-	}
-	return std::abs(lhs - rhs) / std::max(lhs, rhs);
-}
-
-static bool LookupBasePower(const vector<BasePowerEntry> &entries, int socket_id, double core_freq_hz,
-                            double uncore_freq_hz, int smt_state, double &base_power_w) {
-	double best_score = std::numeric_limits<double>::max();
-	bool found = false;
-	for (idx_t i = 0; i < entries.size(); i++) {
-		const auto &entry = entries[i];
-		if (entry.socket_id != socket_id) {
-			continue;
-		}
-		double score = FrequencyDistance(entry.core_freq_hz, core_freq_hz) +
-		               FrequencyDistance(entry.uncore_freq_hz, uncore_freq_hz);
-		if (entry.smt_state > 0 && smt_state > 0 && entry.smt_state != smt_state) {
-			score += 1.0;
-		}
-		if (score < best_score) {
-			best_score = score;
-			base_power_w = entry.base_power_w;
-			found = true;
-		}
-	}
-	return found;
 }
 
 static int CurrentCPU() {
@@ -1078,11 +958,10 @@ public:
 	PerfEventGroup(const PerfEventGroup &) = delete;
 	PerfEventGroup &operator=(const PerfEventGroup &) = delete;
 
-	bool Open(int64_t tid, const string &counter_profile, bool include_kernel, bool open_ref_cycles) {
+	bool Open(int64_t tid) {
 #ifdef __linux__
 		if (IsOpen()) {
-			if (opened_tid == tid && opened_profile == counter_profile && opened_include_kernel == include_kernel &&
-			    opened_ref_cycles == open_ref_cycles) {
+			if (opened_tid == tid) {
 				return true;
 			}
 			Close();
@@ -1093,7 +972,7 @@ public:
 		task_clock_attr.size = sizeof(task_clock_attr);
 		task_clock_attr.config = PERF_COUNT_SW_TASK_CLOCK;
 		task_clock_attr.disabled = 0;
-		task_clock_attr.exclude_kernel = include_kernel ? 0 : 1;
+		task_clock_attr.exclude_kernel = 0;
 		task_clock_attr.exclude_hv = 1;
 		task_clock_attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 		task_clock_fd =
@@ -1104,23 +983,13 @@ public:
 			return false;
 		}
 
-		status = counter_profile;
-		cycles_fd = OpenIndependentHardwareCounter(tid, PERF_COUNT_HW_CPU_CYCLES, include_kernel);
+		status = "process";
+		cycles_fd = OpenIndependentHardwareCounter(tid, PERF_COUNT_HW_CPU_CYCLES);
 		if (cycles_fd < 0) {
 			status += StringUtil::Format("|cycles_unavailable:%s", std::strerror(errno));
 		}
-		if (open_ref_cycles) {
-			ref_cycles_fd = OpenIndependentHardwareCounter(tid, PERF_COUNT_HW_REF_CPU_CYCLES, include_kernel);
-			if (ref_cycles_fd < 0) {
-				status += StringUtil::Format("|ref_cycles_unavailable:%s", std::strerror(errno));
-			}
-		} else {
-			status += "|ref_cycles_process_proxy";
-		}
+		status += "|ref_cycles_process_proxy";
 		opened_tid = tid;
-		opened_profile = counter_profile;
-		opened_include_kernel = include_kernel;
-		opened_ref_cycles = open_ref_cycles;
 		return true;
 #else
 		status = "perf_event_open is Linux-only";
@@ -1171,23 +1040,6 @@ public:
 				                       cycles_bytes < 0 ? std::strerror(errno) : "short read");
 			}
 		}
-		if (ref_cycles_fd >= 0) {
-			uint64_t ref_cycles_buffer[3] = {};
-			auto ref_cycles_bytes = read(ref_cycles_fd, ref_cycles_buffer, sizeof(ref_cycles_buffer));
-			if (ref_cycles_bytes == static_cast<ssize_t>(sizeof(ref_cycles_buffer))) {
-				snapshot.ref_cycles = ref_cycles_buffer[0];
-				snapshot.ref_cycles_time_enabled = ref_cycles_buffer[1];
-				snapshot.ref_cycles_time_running = ref_cycles_buffer[2];
-				snapshot.ref_cycles_valid = true;
-				snapshot.scaled =
-				    snapshot.scaled || (snapshot.ref_cycles_time_running > 0 &&
-				                        snapshot.ref_cycles_time_enabled > snapshot.ref_cycles_time_running);
-			} else {
-				snapshot.status +=
-				    StringUtil::Format("|ref_cycles_read_failed:%s",
-				                       ref_cycles_bytes < 0 ? std::strerror(errno) : "short read");
-			}
-		}
 #endif
 		return snapshot;
 	}
@@ -1200,29 +1052,22 @@ public:
 		if (cycles_fd >= 0) {
 			close(cycles_fd);
 		}
-		if (ref_cycles_fd >= 0) {
-			close(ref_cycles_fd);
-		}
 #endif
 		task_clock_fd = -1;
 		cycles_fd = -1;
-		ref_cycles_fd = -1;
 		opened_tid = -1;
-		opened_profile.clear();
-		opened_include_kernel = false;
-		opened_ref_cycles = true;
 	}
 
 private:
 #ifdef __linux__
-	static int OpenIndependentHardwareCounter(int64_t tid, uint64_t config, bool include_kernel) {
+	static int OpenIndependentHardwareCounter(int64_t tid, uint64_t config) {
 		struct perf_event_attr attr;
 		memset(&attr, 0, sizeof(attr));
 		attr.type = PERF_TYPE_HARDWARE;
 		attr.size = sizeof(attr);
 		attr.config = config;
 		attr.disabled = 0;
-		attr.exclude_kernel = include_kernel ? 0 : 1;
+		attr.exclude_kernel = 0;
 		attr.exclude_hv = 1;
 		attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 		return NumericCast<int>(PerfEventOpen(&attr, static_cast<pid_t>(tid), -1, -1, 0));
@@ -1231,11 +1076,7 @@ private:
 
 	int task_clock_fd = -1;
 	int cycles_fd = -1;
-	int ref_cycles_fd = -1;
 	int64_t opened_tid = -1;
-	string opened_profile;
-	bool opened_include_kernel = false;
-	bool opened_ref_cycles = true;
 	string status = "not opened";
 };
 
@@ -1290,41 +1131,13 @@ static PerfCounters DeltaPerfCounters(const EnergyPerfSnapshot &start, const Ene
 		    ScaleCounterDelta(SnapshotDeltaValue(start.cycles, end.cycles), cycles_scale);
 	}
 
-	auto ref_cycles_time_enabled =
-	    SnapshotDeltaValue(start.ref_cycles_time_enabled, end.ref_cycles_time_enabled);
-	auto ref_cycles_time_running =
-	    SnapshotDeltaValue(start.ref_cycles_time_running, end.ref_cycles_time_running);
-	double ref_cycles_scale = 1.0;
-	if (start.ref_cycles_valid && end.ref_cycles_valid && ref_cycles_time_running > 0 &&
-	    ref_cycles_time_enabled > ref_cycles_time_running) {
-		ref_cycles_scale =
-		    static_cast<double>(ref_cycles_time_enabled) / static_cast<double>(ref_cycles_time_running);
-		counters.scaled = true;
-	} else if (start.ref_cycles_valid && end.ref_cycles_valid && ref_cycles_time_running == 0 &&
-	           ref_cycles_time_enabled > 0) {
-		counters.status += "|ref cycles never ran during segment";
-	} else if ((!start.ref_cycles_valid || !end.ref_cycles_valid) &&
-	           counters.status.find("ref_cycles_process_proxy") == string::npos) {
-		counters.status += "|ref cycles unavailable";
-	}
-	if (start.ref_cycles_valid && end.ref_cycles_valid && ref_cycles_time_running > 0) {
-		counters.ref_cycles =
-		    ScaleCounterDelta(SnapshotDeltaValue(start.ref_cycles, end.ref_cycles), ref_cycles_scale);
-	}
-	counters.valid =
-	    counters.task_clock_ns > 0 || counters.cycles > 0 || counters.ref_cycles > 0 || counters.instructions > 0;
+	counters.valid = counters.task_clock_ns > 0 || counters.cycles > 0;
 	return counters;
 }
 
 static void AddPerfCounters(PerfCounters &target, const PerfCounters &delta) {
 	target.task_clock_ns += delta.task_clock_ns;
 	target.cycles += delta.cycles;
-	target.instructions += delta.instructions;
-	target.ref_cycles += delta.ref_cycles;
-	target.cache_refs += delta.cache_refs;
-	target.cache_misses += delta.cache_misses;
-	target.llc_misses += delta.llc_misses;
-	target.offcore_responses += delta.offcore_responses;
 	target.valid = target.valid || delta.valid;
 	target.scaled = target.scaled || delta.scaled;
 	if (!delta.status.empty()) {
@@ -1339,46 +1152,10 @@ static void AddPerfCounters(PerfCounters &target, const PerfCounters &delta) {
 static void ApplyPerfCounters(EnergySegmentRecord &record, const PerfCounters &counters) {
 	record.task_clock_ns = counters.task_clock_ns;
 	record.cycles = counters.cycles;
-	record.instructions = counters.instructions;
-	record.ref_cycles = counters.ref_cycles;
-	record.cache_refs = counters.cache_refs;
-	record.cache_misses = counters.cache_misses;
-	record.llc_misses = counters.llc_misses;
-	record.offcore_responses = counters.offcore_responses;
 	record.counters_valid = counters.valid;
 	record.counters_scaled = counters.scaled;
 	record.counter_status = counters.status;
 }
-
-struct EnergyThreadSegmentBuffer {
-	int64_t linux_tid = -1;
-	mutex lock;
-	std::atomic<uint64_t> open_segment_start_ns {0};
-	vector<EnergySegmentRecord> segments;
-
-	void MarkSegmentOpen(uint64_t start_ns) {
-		open_segment_start_ns.store(start_ns, std::memory_order_release);
-	}
-
-	void MarkSegmentClosed() {
-		open_segment_start_ns.store(0, std::memory_order_release);
-	}
-
-	uint64_t OpenSegmentStartNs() const {
-		return open_segment_start_ns.load(std::memory_order_acquire);
-	}
-
-	void Append(EnergySegmentRecord record) {
-		lock_guard<mutex> guard(lock);
-		segments.push_back(std::move(record));
-	}
-
-	void Drain(vector<EnergySegmentRecord> &target) {
-		lock_guard<mutex> guard(lock);
-		target.insert(target.end(), std::make_move_iterator(segments.begin()), std::make_move_iterator(segments.end()));
-		segments.clear();
-	}
-};
 
 struct QueryEnergyState : public EnergyAttributionQueryHandle {
 	ClientContext *context = nullptr;
@@ -1386,21 +1163,10 @@ struct QueryEnergyState : public EnergyAttributionQueryHandle {
 	uint64_t query_id = 0;
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
-	string query;
-	string output_dir;
 	uint64_t start_ns = 0;
-	vector<RaplSnapshot> rapl_start;
-	RaplReader rapl;
-	vector<BasePowerEntry> base_power_entries;
 	std::map<int, double> uncore_freq_by_socket;
-	mutex lock;
 	std::atomic<uint64_t> next_segment_id {1};
 	std::atomic<bool> periodic_active {false};
-	vector<EnergySegmentRecord> segments;
-	vector<shared_ptr<EnergyThreadSegmentBuffer>> segment_buffers;
-	unordered_map<uint64_t, string> pipeline_signatures;
-	bool base_power_loaded = false;
-	bool rapl_available = false;
 };
 
 struct EnergyThreadState {
@@ -1411,22 +1177,11 @@ struct EnergyThreadState {
 	int pinned_socket_id = -1;
 	int pinned_physical_core_id = -1;
 	double pinned_core_freq_hz = 0;
-	QueryEnergyState *buffer_query = nullptr;
-	uint64_t buffer_query_id = 0;
-	uint64_t buffer_query_start_ns = 0;
-	EnergyThreadSegmentBuffer *buffer = nullptr;
 	QueryEnergyState *segment_id_query = nullptr;
 	uint64_t segment_id_query_id = 0;
 	uint64_t segment_id_query_start_ns = 0;
 	uint64_t next_segment_id = 0;
 	uint64_t segment_id_limit = 0;
-	PerfEventGroup perf_group;
-	string perf_profile;
-	string perf_status = "not opened";
-	bool perf_attempted = false;
-	bool perf_open = false;
-	bool perf_include_kernel = false;
-	bool perf_open_ref_cycles = true;
 
 	int64_t GetTID() {
 		if (tid < 0) {
@@ -1449,44 +1204,8 @@ struct EnergyThreadState {
 		return next_segment_id++;
 	}
 
-	EnergyPerfSnapshot ReadPerfSnapshot(int64_t current_tid, const EnergyAttributionSettings &settings) {
-		EnergyPerfSnapshot snapshot;
-		if (!settings.perf_counters_enabled) {
-			snapshot.status = "perf disabled";
-			return snapshot;
-		}
-		auto process_counter_mode = settings.attribution_model != "legacy";
-		auto include_kernel = process_counter_mode;
-		auto open_ref_cycles = !process_counter_mode;
-		if (perf_open && perf_profile == settings.counter_profile && perf_include_kernel == include_kernel &&
-		    perf_open_ref_cycles == open_ref_cycles) {
-			return perf_group.ReadSnapshot();
-		}
-		if (perf_attempted && !perf_open && perf_profile == settings.counter_profile &&
-		    perf_include_kernel == include_kernel && perf_open_ref_cycles == open_ref_cycles) {
-			snapshot.status = perf_status;
-			return snapshot;
-		}
-		if (perf_open) {
-			perf_group.Close();
-			perf_open = false;
-		}
-		tid = current_tid;
-		perf_profile = settings.counter_profile;
-		perf_include_kernel = include_kernel;
-		perf_open_ref_cycles = open_ref_cycles;
-		perf_attempted = true;
-		perf_open = perf_group.Open(current_tid, settings.counter_profile, include_kernel, open_ref_cycles);
-		perf_status = perf_open ? settings.counter_profile : perf_group.ReadSnapshot().status;
-		if (!perf_open) {
-			snapshot.status = perf_status;
-			return snapshot;
-		}
-		return perf_group.ReadSnapshot();
-	}
-
-	void InitializeHardware(const EnergyAttributionSettings &settings) {
-		if (hardware_initialized || !settings.metadata_cache_enabled) {
+	void InitializeHardware() {
+		if (hardware_initialized) {
 			return;
 		}
 		hardware_initialized = true;
@@ -1508,72 +1227,16 @@ struct EnergyThreadState {
 
 static thread_local EnergyThreadState g_thread_energy_state;
 
-static EnergyThreadSegmentBuffer *GetThreadSegmentBuffer(QueryEnergyState &query, int64_t tid) {
-	auto &thread_state = g_thread_energy_state;
-	if (thread_state.buffer && thread_state.buffer_query == &query && thread_state.buffer_query_id == query.query_id &&
-	    thread_state.buffer_query_start_ns == query.start_ns) {
-		return thread_state.buffer;
-	}
-	auto buffer = make_shared_ptr<EnergyThreadSegmentBuffer>();
-	buffer->linux_tid = tid;
-	buffer->segments.reserve(DEFAULT_THREAD_SEGMENT_BUFFER_CAPACITY);
-	{
-		lock_guard<mutex> guard(query.lock);
-		query.segment_buffers.push_back(buffer);
-	}
-	thread_state.buffer_query = &query;
-	thread_state.buffer_query_id = query.query_id;
-	thread_state.buffer_query_start_ns = query.start_ns;
-	thread_state.buffer = buffer.get();
-	return thread_state.buffer;
-}
-
 static string PipelineLabel(uint64_t pipeline_id) {
 	return StringUtil::Format("pipeline_%llu", pipeline_id);
-}
-
-static string LookupPipelineSignature(QueryEnergyState &query, uint64_t pipeline_id) {
-	if (!query.settings.pipeline_signatures_enabled) {
-		return PipelineLabel(pipeline_id);
-	}
-	lock_guard<mutex> guard(query.lock);
-	auto entry = query.pipeline_signatures.find(pipeline_id);
-	return entry == query.pipeline_signatures.end() ? PipelineLabel(pipeline_id) : entry->second;
-}
-
-static void RegisterPipelineSignature(QueryEnergyState &query, uint64_t pipeline_id, string signature) {
-	if (!query.settings.pipeline_signatures_enabled) {
-		return;
-	}
-	lock_guard<mutex> guard(query.lock);
-	if (query.pipeline_signatures.find(pipeline_id) == query.pipeline_signatures.end()) {
-		query.pipeline_signatures[pipeline_id] = std::move(signature);
-	}
 }
 
 static double GetQueryUncoreFrequency(QueryEnergyState &query, int socket_id) {
 	if (socket_id < 0) {
 		return 0;
 	}
-	if (query.settings.metadata_cache_enabled) {
-		auto entry = query.uncore_freq_by_socket.find(socket_id);
-		return entry == query.uncore_freq_by_socket.end() ? 0 : entry->second;
-	}
-	return ReadUncoreFrequencyHz(socket_id);
-}
-
-static void FillPipelineSignatures(const unordered_map<uint64_t, string> &signatures,
-                                   vector<EnergySegmentRecord> &segments, bool full_signatures_enabled) {
-	for (idx_t i = 0; i < segments.size(); i++) {
-		if (full_signatures_enabled) {
-			auto entry = signatures.find(segments[i].pipeline_id);
-			if (entry != signatures.end()) {
-				segments[i].pipeline_signature = entry->second;
-				continue;
-			}
-		}
-		segments[i].pipeline_signature = PipelineLabel(segments[i].pipeline_id);
-	}
+	auto entry = query.uncore_freq_by_socket.find(socket_id);
+	return entry == query.uncore_freq_by_socket.end() ? 0 : entry->second;
 }
 
 static double SegmentDuration(const EnergySegmentRecord &segment) {
@@ -1586,17 +1249,7 @@ static double SegmentDuration(const EnergySegmentRecord &segment) {
 	return 0;
 }
 
-static double SegmentFrequencyRatio(const EnergySegmentRecord &record) {
-	if (record.ref_cycles > 0) {
-		return static_cast<double>(record.cycles) / static_cast<double>(record.ref_cycles);
-	}
-	return 0;
-}
-
 static double SegmentCorrectedCycles(const EnergySegmentRecord &record) {
-	if (record.ref_cycles > 0) {
-		return static_cast<double>(record.cycles) * SegmentFrequencyRatio(record);
-	}
 	return static_cast<double>(record.cycles);
 }
 
@@ -1640,39 +1293,6 @@ static void ComputeSMTOccupancy(vector<AttributedSegment> &segments) {
 		                 static_cast<int64_t>(ends_before_or_at_start - group.ends.begin());
 		record.smt_occupancy = MaxValue<int>(1, static_cast<int>(occupancy));
 	}
-}
-
-static double AverageCoreFreqForSocket(const vector<AttributedSegment> &segments, int socket_id) {
-	double weighted = 0;
-	double duration = 0;
-	for (idx_t i = 0; i < segments.size(); i++) {
-		const auto &segment = segments[i].record;
-		if (segment.socket_id != socket_id || segment.core_freq_hz <= 0) {
-			continue;
-		}
-		auto segment_duration = SegmentDuration(segment);
-		weighted += segment.core_freq_hz * segment_duration;
-		duration += segment_duration;
-	}
-	return duration > 0 ? weighted / duration : 0;
-}
-
-static double AverageUncoreFreqForSocket(const vector<AttributedSegment> &segments, int socket_id) {
-	double weighted = 0;
-	double duration = 0;
-	for (idx_t i = 0; i < segments.size(); i++) {
-		const auto &segment = segments[i].record;
-		if (segment.socket_id != socket_id || segment.uncore_freq_hz <= 0) {
-			continue;
-		}
-		auto segment_duration = SegmentDuration(segment);
-		weighted += segment.uncore_freq_hz * segment_duration;
-		duration += segment_duration;
-	}
-	if (duration > 0) {
-		return weighted / duration;
-	}
-	return ReadUncoreFrequencyHz(socket_id);
 }
 
 struct SocketFrequencyAverages {
@@ -1784,195 +1404,17 @@ static string SegmentStatusBase(const EnergySegmentRecord &segment) {
 	return status;
 }
 
-static double MergedIntervalDurationS(vector<std::pair<uint64_t, uint64_t>> &intervals) {
-	if (intervals.empty()) {
-		return 0;
-	}
-	std::sort(intervals.begin(), intervals.end());
-	uint64_t merged_start = intervals[0].first;
-	uint64_t merged_end = intervals[0].second;
-	uint64_t duration_ns = 0;
-	for (idx_t i = 1; i < intervals.size(); i++) {
-		if (intervals[i].first <= merged_end) {
-			merged_end = MaxValue<uint64_t>(merged_end, intervals[i].second);
-			continue;
-		}
-		if (merged_end > merged_start) {
-			duration_ns += merged_end - merged_start;
-		}
-		merged_start = intervals[i].first;
-		merged_end = intervals[i].second;
-	}
-	if (merged_end > merged_start) {
-		duration_ns += merged_end - merged_start;
-	}
-	return static_cast<double>(duration_ns) / static_cast<double>(NSEC_PER_SEC);
-}
-
-static vector<SocketEnergyWindow> BuildSocketWindows(QueryEnergyState &state, const vector<AttributedSegment> &segments,
-                                                     const vector<RaplSnapshot> &rapl_end, uint64_t end_ns) {
-	vector<SocketEnergyWindow> windows;
-	std::map<int, RaplSnapshot> start_by_socket;
-	for (idx_t i = 0; i < state.rapl_start.size(); i++) {
-		start_by_socket[state.rapl_start[i].socket_id] = state.rapl_start[i];
-	}
-	for (idx_t i = 0; i < rapl_end.size(); i++) {
-		const auto &end = rapl_end[i];
-		auto start_entry = start_by_socket.find(end.socket_id);
-		if (start_entry == start_by_socket.end()) {
-			continue;
-		}
-		SocketEnergyWindow window;
-		window.window_id = state.query_id;
-		window.socket_id = end.socket_id;
-		window.start_ns = state.start_ns;
-		window.end_ns = end_ns;
-		window.duration_s = end_ns > state.start_ns
-		                        ? static_cast<double>(end_ns - state.start_ns) / static_cast<double>(NSEC_PER_SEC)
-		                        : 0;
-		window.rapl_start_uj = start_entry->second.energy_uj;
-		window.rapl_end_uj = end.energy_uj;
-		window.rapl_valid = start_entry->second.valid && end.valid;
-		auto delta_uj = RaplDeltaUJ(start_entry->second, end);
-		window.package_energy_j = static_cast<double>(delta_uj) / 1000000.0;
-		window.core_freq_hz = AverageCoreFreqForSocket(segments, window.socket_id);
-		window.uncore_freq_hz = AverageUncoreFreqForSocket(segments, window.socket_id);
-		double base_power_w = 0;
-		window.base_power_valid = LookupBasePower(state.base_power_entries, window.socket_id, window.core_freq_hz,
-		                                          window.uncore_freq_hz, 0, base_power_w);
-		window.modeled_base_energy_j = window.base_power_valid ? base_power_w * window.duration_s : 0;
-		window.base_energy_j = window.rapl_valid
-		                           ? MinValue<double>(window.modeled_base_energy_j, window.package_energy_j)
-		                           : window.modeled_base_energy_j;
-		window.base_model_excess_energy_j =
-		    MaxValue<double>(0, window.modeled_base_energy_j - window.base_energy_j);
-		window.total_base_energy_j = window.base_energy_j;
-		window.active_package_energy_j = std::max(0.0, window.package_energy_j - window.base_energy_j);
-		if (!window.rapl_valid) {
-			window.status = "rapl_unavailable";
-		} else if (!window.base_power_valid) {
-			window.status = "missing_base_power_calibration";
-		} else {
-			window.status = "ok";
-		}
-		windows.push_back(window);
-	}
-	if (!windows.empty()) {
-		return windows;
-	}
-	std::map<int, bool> sockets;
-	for (idx_t i = 0; i < segments.size(); i++) {
-		if (segments[i].record.socket_id >= 0) {
-			sockets[segments[i].record.socket_id] = true;
-		}
-	}
-	for (auto entry = sockets.begin(); entry != sockets.end(); ++entry) {
-		SocketEnergyWindow window;
-		window.window_id = state.query_id;
-		window.socket_id = entry->first;
-		window.start_ns = state.start_ns;
-		window.end_ns = end_ns;
-		window.duration_s = end_ns > state.start_ns
-		                        ? static_cast<double>(end_ns - state.start_ns) / static_cast<double>(NSEC_PER_SEC)
-		                        : 0;
-		window.core_freq_hz = AverageCoreFreqForSocket(segments, window.socket_id);
-		window.uncore_freq_hz = AverageUncoreFreqForSocket(segments, window.socket_id);
-		window.status = "rapl_unavailable";
-		window.total_base_energy_j = window.base_energy_j;
-		windows.push_back(window);
-	}
-	return windows;
-}
-
 static void PrepareSegmentsForAttribution(vector<AttributedSegment> &segments) {
 	ComputeSMTOccupancy(segments);
 	for (idx_t i = 0; i < segments.size(); i++) {
 		auto &segment = segments[i];
 		segment.attribution_status = SegmentStatusBase(segment.record);
-		if (segment.record.ref_cycles > 0) {
-			segment.frequency_ratio = SegmentFrequencyRatio(segment.record);
-			segment.corrected_cycles = SegmentCorrectedCycles(segment.record);
-		} else {
-			segment.frequency_ratio = 0;
-			segment.corrected_cycles = SegmentCorrectedCycles(segment.record);
-			if (segment.record.cycles > 0) {
-				segment.attribution_status += "|missing_ref_cycles";
-			}
-		}
+		segment.frequency_ratio = 0;
+		segment.corrected_cycles = SegmentCorrectedCycles(segment.record);
 		auto duration = SegmentDuration(segment.record);
 		if (duration > 0 && segment.record.work_units > 0) {
 			segment.throughput = static_cast<double>(segment.record.work_units) / duration;
 		}
-	}
-}
-
-static void AttributeSegments(vector<AttributedSegment> &segments, vector<SocketEnergyWindow> &windows) {
-	PrepareSegmentsForAttribution(segments);
-	vector<std::pair<idx_t, double>> eligible_segments;
-	eligible_segments.reserve(segments.size());
-	vector<std::pair<uint64_t, uint64_t>> busy_intervals;
-	busy_intervals.reserve(segments.size());
-	for (idx_t w = 0; w < windows.size(); w++) {
-		auto &window = windows[w];
-		double weight_sum = 0;
-		double time_sum = 0;
-		eligible_segments.clear();
-		busy_intervals.clear();
-		window.segment_count = 0;
-		for (idx_t i = 0; i < segments.size(); i++) {
-			auto &segment = segments[i];
-			if (segment.record.socket_id != window.socket_id || segment.record.migrated) {
-				continue;
-			}
-			auto duration = SegmentDuration(segment.record);
-			eligible_segments.emplace_back(i, duration);
-			window.segment_count++;
-			time_sum += duration;
-			if (segment.record.counters_valid && segment.corrected_cycles > 0) {
-				weight_sum += segment.corrected_cycles;
-			}
-			if (segment.record.end_ns > segment.record.start_ns) {
-				busy_intervals.emplace_back(segment.record.start_ns, segment.record.end_ns);
-			}
-		}
-		window.used_time_fallback = weight_sum <= 0;
-		window.total_base_energy_j = window.base_energy_j;
-		window.busy_wall_time_s = MergedIntervalDurationS(busy_intervals);
-		window.busy_wall_time_s = MinValue<double>(window.busy_wall_time_s, window.duration_s);
-		window.idle_gap_wall_time_s = MaxValue<double>(0, window.duration_s - window.busy_wall_time_s);
-		window.busy_base_energy_j =
-		    window.duration_s > 0 ? window.base_energy_j * window.busy_wall_time_s / window.duration_s : 0;
-		window.idle_gap_base_energy_j = MaxValue<double>(0, window.base_energy_j - window.busy_base_energy_j);
-		for (idx_t i = 0; i < eligible_segments.size(); i++) {
-			auto &segment = segments[eligible_segments[i].first];
-			auto duration = eligible_segments[i].second;
-			double weight = 0;
-			if (weight_sum > 0 && segment.record.counters_valid && segment.corrected_cycles > 0) {
-				segment.activity_weight = segment.corrected_cycles;
-				segment.weight_denominator = weight_sum;
-				weight = segment.activity_weight / segment.weight_denominator;
-			} else if (weight_sum <= 0 && time_sum > 0) {
-				segment.activity_weight = duration;
-				segment.weight_denominator = time_sum;
-				weight = segment.activity_weight / segment.weight_denominator;
-				segment.attribution_status += "|time_weight_fallback";
-			} else {
-				segment.attribution_status += "|excluded_no_counter_weight";
-			}
-			segment.attributed_active_energy_j = window.active_package_energy_j * weight;
-			window.summed_attributed_active_energy_j += segment.attributed_active_energy_j;
-			if (time_sum <= 0) {
-				segment.attribution_status += "|excluded_no_base_time";
-				continue;
-			}
-			segment.base_time_weight = duration;
-			segment.base_time_denominator_s = time_sum;
-			segment.attributed_base_energy_j =
-			    window.busy_base_energy_j * segment.base_time_weight / segment.base_time_denominator_s;
-			window.summed_attributed_base_energy_j += segment.attributed_base_energy_j;
-		}
-		window.active_conservation_error_j = window.active_package_energy_j - window.summed_attributed_active_energy_j;
-		window.base_conservation_error_j = window.busy_base_energy_j - window.summed_attributed_base_energy_j;
 	}
 }
 
@@ -1983,8 +1425,18 @@ static void PrepareProcessActivity(const ProcessActivityWindow &activity, Prepar
 		socket.corrected_weight_sum = 0;
 		socket.runtime_weight_sum = 0;
 		socket.monitored_cpu_count = 0;
+		socket.helper_count = 0;
+		socket.acknowledged_helper_count = 0;
+		socket.missing_helper_count = 0;
+		socket.boundary_min_ns = 0;
+		socket.boundary_max_ns = 0;
+		socket.maximum_checkpoint_delay_ns = 0;
+		socket.late_helper_count = 0;
+		socket.slowest_helper_cpu = -1;
+		socket.missing_helper_cpus.clear();
 		socket.has_non_idle_activity = false;
 		socket.all_pmu_valid = true;
+		socket.checkpoint_valid = false;
 	}
 	auto find_or_create_socket = [&](int socket_id) -> PreparedSocketProcessActivity & {
 		auto socket_entry = prepared.socket_to_index.find(socket_id);
@@ -2003,6 +1455,22 @@ static void PrepareProcessActivity(const ProcessActivityWindow &activity, Prepar
 			continue;
 		}
 		find_or_create_socket(topology.socket_id).monitored_cpu_count = topology.monitored_cpu_count;
+	}
+	for (const auto &checkpoint : activity.socket_checkpoints) {
+		if (checkpoint.socket_id < 0) {
+			continue;
+		}
+		auto &socket = find_or_create_socket(checkpoint.socket_id);
+		socket.helper_count = checkpoint.helper_count;
+		socket.acknowledged_helper_count = checkpoint.acknowledged_helper_count;
+		socket.missing_helper_count = checkpoint.missing_helper_count;
+		socket.boundary_min_ns = checkpoint.boundary_min_ns;
+		socket.boundary_max_ns = checkpoint.boundary_max_ns;
+		socket.maximum_checkpoint_delay_ns = checkpoint.maximum_checkpoint_delay_ns;
+		socket.late_helper_count = checkpoint.late_helper_count;
+		socket.slowest_helper_cpu = checkpoint.slowest_helper_cpu;
+		socket.missing_helper_cpus = checkpoint.missing_helper_cpus;
+		socket.checkpoint_valid = checkpoint.valid;
 	}
 	for (idx_t i = 0; i < activity.records.size(); i++) {
 		const auto &record = activity.records[i];
@@ -2070,6 +1538,12 @@ static void AttributeSegmentsByProcess(
 	window.process_boundary_max_ns = activity.boundary_max_ns;
 	window.process_maximum_checkpoint_delay_ns = activity.maximum_checkpoint_delay_ns;
 	window.process_checkpoint_duration_ns = activity.checkpoint_duration_ns;
+	window.process_helper_count = activity.helper_count;
+	window.process_helper_futex_wake_count = activity.helper_futex_wake_count;
+	window.process_acknowledged_helper_count = activity.acknowledged_helper_count;
+	window.process_missing_helper_count = activity.missing_helper_count;
+	window.process_slowest_helper_cpu = activity.slowest_helper_cpu;
+	window.process_missing_helper_cpus = activity.missing_helper_cpus;
 	window.process_activity_map_insert_failure = activity.activity_map_insert_failure;
 	window.process_missing_counter = activity.missing_counter;
 	window.process_invalid_counter_delta = activity.invalid_counter_delta;
@@ -2084,6 +1558,34 @@ static void AttributeSegmentsByProcess(
 	window.process_lookup_failures = activity.lookup_failures;
 	window.process_boundary_corrected = activity.boundary_corrected;
 	window.process_status = activity.status;
+	auto socket_checkpoint_valid = prepared_socket && prepared_socket->checkpoint_valid;
+	if (prepared_socket) {
+		window.process_boundary_min_ns = prepared_socket->boundary_min_ns;
+		window.process_boundary_max_ns = prepared_socket->boundary_max_ns;
+		window.process_maximum_checkpoint_delay_ns = prepared_socket->maximum_checkpoint_delay_ns;
+		window.process_helper_count = prepared_socket->helper_count;
+		window.process_acknowledged_helper_count = prepared_socket->acknowledged_helper_count;
+		window.process_missing_helper_count = prepared_socket->missing_helper_count;
+		window.process_slowest_helper_cpu = prepared_socket->slowest_helper_cpu;
+		window.process_missing_helper_cpus = prepared_socket->missing_helper_cpus;
+		window.process_late_helper_count = prepared_socket->late_helper_count;
+		window.process_boundary_corrected = prepared_socket->late_helper_count > 0;
+		if (activity.status == "ok" || activity.status == "boundary_corrected") {
+			window.process_status = window.process_boundary_corrected ? "boundary_corrected" : "ok";
+		}
+		if (!socket_checkpoint_valid) {
+			auto checkpoint_status = StringUtil::Format(
+			    "checkpoint_timeout:%llu/%llu", static_cast<unsigned long long>(prepared_socket->acknowledged_helper_count),
+			    static_cast<unsigned long long>(prepared_socket->helper_count));
+			if (window.process_status != "ok" && window.process_status != "boundary_corrected" &&
+			    !window.process_status.empty()) {
+				checkpoint_status += "|" + window.process_status;
+			} else if (window.process_boundary_corrected) {
+				checkpoint_status += "|boundary_corrected";
+			}
+			window.process_status = std::move(checkpoint_status);
+		}
+	}
 
 	if (!prepared_socket || prepared_socket->record_indices.empty() || prepared_socket->runtime_weight_sum <= 0) {
 		window.process_attribution_valid = false;
@@ -2199,10 +1701,7 @@ static void AttributeSegmentsByProcess(
 		segment.attributed_base_energy_j = 0;
 		segment.base_time_weight = 0;
 		segment.base_time_denominator_s = 0;
-		segment.process_active_energy_j = 0;
 		segment.process_attribution_valid = false;
-		segment.process_frequency_ratio = 0;
-		segment.process_corrected_cycles = 0;
 		segment.process_counter_source.clear();
 		auto thread_entry = tid_to_thread.find(segment.record.linux_tid);
 		if (thread_entry == tid_to_thread.end()) {
@@ -2216,12 +1715,7 @@ static void AttributeSegmentsByProcess(
 		    thread.corrected_ref_cycles > 0 ? thread.corrected_cycles / thread.corrected_ref_cycles : 0;
 		auto activity_rate =
 		    thread.runtime_ns > 0 ? thread.activity_weight / static_cast<double>(thread.runtime_ns) : 0;
-		if (segment.record.cycles > 0 && segment.record.ref_cycles > 0) {
-			segment.frequency_ratio = SegmentFrequencyRatio(segment.record);
-			segment.corrected_cycles = SegmentCorrectedCycles(segment.record);
-			segment.process_counter_source = "direct_segment_ref_cycles";
-			segment.attribution_status += "|direct_segment_ref_cycles";
-		} else if (segment.record.cycles > 0 && segment.record.task_clock_ns > 0 && reference_rate > 0) {
+		if (segment.record.cycles > 0 && segment.record.task_clock_ns > 0 && reference_rate > 0) {
 			auto estimated_ref_cycles = reference_rate * static_cast<double>(segment.record.task_clock_ns);
 			segment.frequency_ratio =
 			    estimated_ref_cycles > 0 ? static_cast<double>(segment.record.cycles) / estimated_ref_cycles : 0;
@@ -2234,8 +1728,6 @@ static void AttributeSegmentsByProcess(
 			segment.process_counter_source = "process_activity_rate_fallback";
 			segment.attribution_status += "|process_activity_rate_fallback";
 		}
-		segment.process_frequency_ratio = segment.frequency_ratio;
-		segment.process_corrected_cycles = segment.corrected_cycles;
 		segment_thread_slots[i] = NumericCast<int32_t>(thread_index);
 		thread.segment_cycle_sum += segment.corrected_cycles;
 		thread.segment_task_clock_sum += segment.record.task_clock_ns;
@@ -2285,9 +1777,8 @@ static void AttributeSegmentsByProcess(
 		segment.activity_weight = segment_weight;
 		segment.weight_denominator = thread.segment_denominator;
 		segment.task_clock_coverage = thread.task_clock_coverage;
-		segment.process_active_energy_j =
+		segment.attributed_active_energy_j =
 		    thread.covered_active_energy_j * segment_weight / thread.segment_denominator;
-		segment.attributed_active_energy_j = segment.process_active_energy_j;
 		segment.base_time_weight =
 		    static_cast<double>(segment.record.task_clock_ns) / static_cast<double>(NSEC_PER_SEC);
 		segment.base_time_denominator_s =
@@ -2297,9 +1788,9 @@ static void AttributeSegmentsByProcess(
 		        ? thread.covered_base_energy_j * static_cast<double>(segment.record.task_clock_ns) /
 		              static_cast<double>(thread.segment_task_clock_sum)
 		        : 0;
-		segment.process_attribution_valid = activity.valid && !use_time_fallback;
+		segment.process_attribution_valid = activity.valid && socket_checkpoint_valid && !use_time_fallback;
 		segment.attribution_status += use_segment_time ? "|process_task_clock_fallback" : "|process_corrected_cycles";
-		window.duckdb_instrumented_active_energy_j += segment.process_active_energy_j;
+		window.duckdb_instrumented_active_energy_j += segment.attributed_active_energy_j;
 		window.duckdb_instrumented_base_energy_j += segment.attributed_base_energy_j;
 	}
 	window.process_conservation_error_j =
@@ -2319,6 +1810,7 @@ static void AttributeSegmentsByProcess(
 	auto duckdb_tolerance = std::max(1e-12, window.duckdb_process_active_energy_j * 1e-9);
 	auto duckdb_base_tolerance = std::max(1e-12, window.duckdb_process_base_energy_j * 1e-9);
 	window.process_attribution_valid = window.rapl_valid && window.base_power_valid && activity.valid &&
+	                                   socket_checkpoint_valid &&
 	                                   !use_time_fallback && runtime_coverage_valid &&
 	                                   std::abs(window.process_conservation_error_j) <= process_tolerance &&
 	                                   std::abs(window.process_base_conservation_error_j) <= process_base_tolerance &&
@@ -2354,97 +1846,6 @@ static void AttributeSegmentsByProcess(
 	}
 }
 
-static void CopyProcessDiagnostics(SocketEnergyWindow &target, const SocketEnergyWindow &source) {
-	target.process_attributed_active_energy_j = source.process_attributed_active_energy_j;
-	target.process_attributed_base_energy_j = source.process_attributed_base_energy_j;
-	target.process_conservation_error_j = source.process_conservation_error_j;
-	target.process_base_conservation_error_j = source.process_base_conservation_error_j;
-	target.duckdb_process_active_energy_j = source.duckdb_process_active_energy_j;
-	target.duckdb_process_base_energy_j = source.duckdb_process_base_energy_j;
-	target.external_process_active_energy_j = source.external_process_active_energy_j;
-	target.external_process_base_energy_j = source.external_process_base_energy_j;
-	target.host_kernel_active_energy_j = source.host_kernel_active_energy_j;
-	target.host_kernel_base_energy_j = source.host_kernel_base_energy_j;
-	target.host_irq_active_energy_j = source.host_irq_active_energy_j;
-	target.host_irq_base_energy_j = source.host_irq_base_energy_j;
-	target.system_idle_active_energy_j = source.system_idle_active_energy_j;
-	target.system_idle_base_energy_j = source.system_idle_base_energy_j;
-	target.measurement_overhead_active_energy_j = source.measurement_overhead_active_energy_j;
-	target.measurement_overhead_base_energy_j = source.measurement_overhead_base_energy_j;
-	target.duckdb_instrumented_active_energy_j = source.duckdb_instrumented_active_energy_j;
-	target.duckdb_instrumented_base_energy_j = source.duckdb_instrumented_base_energy_j;
-	target.duckdb_uninstrumented_active_energy_j = source.duckdb_uninstrumented_active_energy_j;
-	target.duckdb_uninstrumented_base_energy_j = source.duckdb_uninstrumented_base_energy_j;
-	target.duckdb_hierarchy_error_j = source.duckdb_hierarchy_error_j;
-	target.duckdb_base_hierarchy_error_j = source.duckdb_base_hierarchy_error_j;
-	target.process_monitored_cpu_count = source.process_monitored_cpu_count;
-	target.process_observed_runtime_ns = source.process_observed_runtime_ns;
-	target.process_expected_runtime_ns = source.process_expected_runtime_ns;
-	target.process_runtime_coverage = source.process_runtime_coverage;
-	target.process_generation = source.process_generation;
-	target.process_transition_ns = source.process_transition_ns;
-	target.process_boundary_min_ns = source.process_boundary_min_ns;
-	target.process_boundary_max_ns = source.process_boundary_max_ns;
-	target.process_maximum_checkpoint_delay_ns = source.process_maximum_checkpoint_delay_ns;
-	target.process_checkpoint_duration_ns = source.process_checkpoint_duration_ns;
-	target.process_activity_map_insert_failure = source.process_activity_map_insert_failure;
-	target.process_missing_counter = source.process_missing_counter;
-	target.process_invalid_counter_delta = source.process_invalid_counter_delta;
-	target.process_interrupt_underflow = source.process_interrupt_underflow;
-	target.process_boundary_split_count = source.process_boundary_split_count;
-	target.process_boundary_split_cpu_count = source.process_boundary_split_cpu_count;
-	target.process_boundary_split_runtime_ns = source.process_boundary_split_runtime_ns;
-	target.process_boundary_split_cycles = source.process_boundary_split_cycles;
-	target.process_boundary_split_ref_cycles = source.process_boundary_split_ref_cycles;
-	target.process_late_helper_count = source.process_late_helper_count;
-	target.process_lost_records = source.process_lost_records;
-	target.process_lookup_failures = source.process_lookup_failures;
-	target.process_boundary_corrected = source.process_boundary_corrected;
-	target.process_attribution_valid = source.process_attribution_valid;
-	target.process_status = source.process_status;
-}
-
-static string ProfileKey(const EnergySegmentRecord &record) {
-	return record.pipeline_signature + "|" +
-	       StringUtil::Format("%.0f|%.0f|%d", record.core_freq_hz, record.uncore_freq_hz, record.smt_occupancy);
-}
-
-static string EfficiencyProfileKey(const EnergySegmentRecord &record) {
-	return std::to_string(record.query_id) + "|" + std::to_string(record.pipeline_id) + "|" +
-	       record.pipeline_signature + "|" +
-	       StringUtil::Format("%.0f|%.0f|%d", record.core_freq_hz, record.uncore_freq_hz, record.smt_occupancy);
-}
-
-static vector<PipelineProfileAggregate> BuildProfiles(const vector<AttributedSegment> &segments) {
-	std::map<string, PipelineProfileAggregate> profiles;
-	for (idx_t i = 0; i < segments.size(); i++) {
-		const auto &segment = segments[i];
-		if (!segment.record.counters_valid || !segment.record.hardware_state_stable || segment.record.work_units == 0 ||
-		    SegmentDuration(segment.record) <= 0) {
-			continue;
-		}
-		auto key = ProfileKey(segment.record);
-		auto &profile = profiles[key];
-		if (profile.samples == 0) {
-			profile.pipeline_signature = segment.record.pipeline_signature;
-			profile.core_freq_hz = segment.record.core_freq_hz;
-			profile.uncore_freq_hz = segment.record.uncore_freq_hz;
-			profile.smt_occupancy = segment.record.smt_occupancy;
-		}
-		profile.samples++;
-		profile.duration_s += SegmentDuration(segment.record);
-		profile.work_units += static_cast<double>(segment.record.work_units);
-		profile.corrected_cycles += segment.corrected_cycles;
-		profile.active_energy_j += segment.attributed_active_energy_j;
-		profile.base_energy_j += segment.attributed_base_energy_j;
-	}
-	vector<PipelineProfileAggregate> result;
-	for (auto entry = profiles.begin(); entry != profiles.end(); ++entry) {
-		result.push_back(entry->second);
-	}
-	return result;
-}
-
 static void UpdateEfficiencyAggregateTimeRange(PipelineEfficiencyAggregate &profile, uint64_t start_ns,
                                                uint64_t end_ns) {
 	if (start_ns > 0) {
@@ -2465,186 +1866,6 @@ static void UpdateLifecycleProfileTimeRange(LifecyclePhaseProfileAggregate &prof
 	}
 }
 
-static vector<PipelineEfficiencyAggregate> BuildEfficiencyProfiles(const vector<AttributedSegment> &segments) {
-	std::map<string, PipelineEfficiencyAggregate> profiles;
-	for (idx_t i = 0; i < segments.size(); i++) {
-		const auto &segment = segments[i];
-		auto duration = SegmentDuration(segment.record);
-		if (!segment.record.counters_valid || !segment.record.hardware_state_stable || duration <= 0) {
-			continue;
-		}
-
-		auto key = EfficiencyProfileKey(segment.record);
-		auto &profile = profiles[key];
-		if (profile.sample_count == 0) {
-			profile.query_id = segment.record.query_id;
-			profile.pipeline_id = segment.record.pipeline_id;
-			profile.pipeline_signature = segment.record.pipeline_signature;
-			profile.core_freq_hz = segment.record.core_freq_hz;
-			profile.uncore_freq_hz = segment.record.uncore_freq_hz;
-			profile.smt_occupancy = segment.record.smt_occupancy;
-		}
-		UpdateEfficiencyAggregateTimeRange(profile, segment.record.start_ns, segment.record.end_ns);
-
-		profile.sample_count++;
-		profile.total_duration_s += duration;
-		profile.attributed_active_energy_j += segment.attributed_active_energy_j;
-		profile.base_time_share_energy_j += segment.attributed_base_energy_j;
-		profile.corrected_cycles += segment.corrected_cycles;
-
-		if (segment.record.work_units > 0) {
-			profile.valid_input_sample_count++;
-			profile.total_input_rows += static_cast<double>(segment.record.work_units);
-			profile.total_input_chunks += static_cast<double>(segment.record.chunks);
-			profile.input_duration_s += duration;
-			profile.input_attributed_active_energy_j += segment.attributed_active_energy_j;
-			profile.input_base_time_share_energy_j += segment.attributed_base_energy_j;
-			profile.input_corrected_cycles += segment.corrected_cycles;
-		} else {
-			profile.energy_only_sample_count++;
-			profile.energy_only_duration_s += duration;
-			profile.energy_only_active_energy_j += segment.attributed_active_energy_j;
-			profile.energy_only_base_time_share_energy_j += segment.attributed_base_energy_j;
-		}
-	}
-	vector<PipelineEfficiencyAggregate> result;
-	for (auto entry = profiles.begin(); entry != profiles.end(); ++entry) {
-		result.push_back(entry->second);
-	}
-	return result;
-}
-
-static void WriteSegmentsCSV(const string &path, const vector<AttributedSegment> &segments) {
-	std::ofstream out(path.c_str());
-	out << "segment_id,plan_version,worker_id,linux_tid,socket_id,physical_core_id,logical_cpu_id,end_socket_id,"
-	       "end_physical_core_id,end_logical_cpu_id,query_id,pipeline_id,pipeline_signature,role,phase_kind,system_category,"
-	       "lifecycle_group_id,owner_pipeline_id,lifecycle_member_count,start_ns,end_ns,"
-	       "duration_s,work_units,tuples,chunks,core_freq_hz,uncore_freq_hz,smt_occupancy,cycles,instructions,"
-	       "ref_cycles,cache_refs,cache_misses,llc_misses,offcore_responses,counters_valid,counters_scaled,"
-	       "hardware_state_stable,migrated,counter_status\n";
-	for (idx_t i = 0; i < segments.size(); i++) {
-		const auto &r = segments[i].record;
-		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << "," << r.socket_id
-		    << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
-		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id << ","
-		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << ","
-		    << EnergySegmentPhaseToString(r.phase) << "," << EnergySystemCategoryToString(r.system_category) << ","
-		    << r.lifecycle_group_id << "," << r.owner_pipeline_id << ","
-		    << r.lifecycle_member_count << "," << r.start_ns << "," << r.end_ns << "," << r.duration_s << ","
-		    << r.work_units << "," << r.tuples << "," << r.chunks << ","
-		    << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy << "," << r.cycles << ","
-		    << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << "," << r.cache_misses << ","
-		    << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid << "," << r.counters_scaled << ","
-		    << r.hardware_state_stable << "," << r.migrated << "," << CsvEscape(r.counter_status) << "\n";
-	}
-}
-
-static void WriteClosedSegmentsCSV(const string &path, vector<EnergySegmentRecord> &segments) {
-	std::sort(segments.begin(), segments.end(), [](const EnergySegmentRecord &lhs, const EnergySegmentRecord &rhs) {
-		if (lhs.start_ns != rhs.start_ns) {
-			return lhs.start_ns < rhs.start_ns;
-		}
-		return lhs.segment_id < rhs.segment_id;
-	});
-	std::ofstream out(path.c_str());
-	out << "segment_id,plan_version,worker_id,linux_tid,socket_id,physical_core_id,logical_cpu_id,end_socket_id,"
-	       "end_physical_core_id,end_logical_cpu_id,query_id,pipeline_id,pipeline_signature,role,phase_kind,system_category,"
-	       "lifecycle_group_id,owner_pipeline_id,lifecycle_member_count,start_ns,end_ns,"
-	       "duration_s,work_units,tuples,chunks,core_freq_hz,uncore_freq_hz,smt_occupancy,cycles,instructions,"
-	       "ref_cycles,cache_refs,cache_misses,llc_misses,offcore_responses,counters_valid,counters_scaled,"
-	       "hardware_state_stable,migrated,counter_status,frequency_ratio,corrected_cycles,throughput_rows_per_s\n";
-	for (idx_t i = 0; i < segments.size(); i++) {
-		const auto &r = segments[i];
-		auto duration = SegmentDuration(r);
-		auto throughput = duration > 0 ? static_cast<double>(r.work_units) / duration : 0;
-		out << r.segment_id << "," << r.plan_version << "," << r.worker_id << "," << r.linux_tid << "," << r.socket_id
-		    << "," << r.physical_core_id << "," << r.logical_cpu_id << "," << r.end_socket_id << ","
-		    << r.end_physical_core_id << "," << r.end_logical_cpu_id << "," << r.query_id << "," << r.pipeline_id << ","
-		    << CsvEscape(r.pipeline_signature) << "," << EnergySegmentRoleToString(r.role) << ","
-		    << EnergySegmentPhaseToString(r.phase) << "," << EnergySystemCategoryToString(r.system_category) << ","
-		    << r.lifecycle_group_id << "," << r.owner_pipeline_id << ","
-		    << r.lifecycle_member_count << "," << r.start_ns << "," << r.end_ns << "," << duration << ","
-		    << r.work_units << "," << r.tuples << "," << r.chunks << ","
-		    << r.core_freq_hz << "," << r.uncore_freq_hz << "," << r.smt_occupancy << "," << r.cycles << ","
-		    << r.instructions << "," << r.ref_cycles << "," << r.cache_refs << "," << r.cache_misses << ","
-		    << r.llc_misses << "," << r.offcore_responses << "," << r.counters_valid << "," << r.counters_scaled << ","
-		    << r.hardware_state_stable << "," << r.migrated << "," << CsvEscape(r.counter_status) << ","
-		    << SegmentFrequencyRatio(r) << "," << SegmentCorrectedCycles(r) << "," << throughput << "\n";
-	}
-}
-
-static void WriteSocketWindowsCSV(const string &path, const vector<SocketEnergyWindow> &windows) {
-	std::ofstream out(path.c_str());
-	out << "window_id,socket_id,start_ns,end_ns,duration_s,rapl_start_uj,rapl_end_uj,package_energy_j,core_freq_hz,"
-	       "uncore_freq_hz,base_energy_j,active_package_energy_j,summed_attributed_active_energy_j,"
-	       "active_conservation_error_j,summed_attributed_base_energy_j,base_conservation_error_j,"
-	       "summed_charged_energy_j,package_conservation_error_j,rapl_valid,base_power_valid,used_time_fallback,status,"
-	       "segment_count,total_base_energy_j,busy_wall_time_s,idle_gap_wall_time_s,busy_base_energy_j,"
-	       "idle_gap_base_energy_j\n";
-	for (idx_t i = 0; i < windows.size(); i++) {
-		const auto &w = windows[i];
-		double summed_charged_energy = w.summed_attributed_active_energy_j + w.summed_attributed_base_energy_j;
-		double package_conservation_error = w.package_energy_j - summed_charged_energy;
-		out << w.window_id << "," << w.socket_id << "," << w.start_ns << "," << w.end_ns << "," << w.duration_s << ","
-		    << w.rapl_start_uj << "," << w.rapl_end_uj << "," << w.package_energy_j << "," << w.core_freq_hz << ","
-		    << w.uncore_freq_hz << "," << w.base_energy_j << "," << w.active_package_energy_j << ","
-		    << w.summed_attributed_active_energy_j << "," << w.active_conservation_error_j << ","
-		    << w.summed_attributed_base_energy_j << "," << w.base_conservation_error_j << "," << summed_charged_energy
-		    << "," << package_conservation_error << "," << w.rapl_valid << "," << w.base_power_valid << ","
-		    << w.used_time_fallback << "," << CsvEscape(w.status) << "," << w.segment_count << ","
-		    << w.total_base_energy_j << "," << w.busy_wall_time_s << "," << w.idle_gap_wall_time_s << ","
-		    << w.busy_base_energy_j << "," << w.idle_gap_base_energy_j << "\n";
-	}
-}
-
-static void WriteAttributedSegmentsCSV(const string &path, const vector<AttributedSegment> &segments) {
-	std::ofstream out(path.c_str());
-	out << "segment_id,query_id,pipeline_id,pipeline_signature,phase_kind,lifecycle_group_id,owner_pipeline_id,"
-	       "lifecycle_member_count,socket_id,physical_core_id,logical_cpu_id,duration_s,"
-	       "work_units,frequency_ratio,corrected_cycles,activity_weight,weight_denominator,"
-	       "attributed_active_energy_j,base_time_weight,base_time_denominator_s,attributed_base_energy_j,"
-	       "charged_total_energy_j,throughput,corrected_cycles_per_work,active_package_power_w,charged_power_w,"
-	       "attribution_status\n";
-	for (idx_t i = 0; i < segments.size(); i++) {
-		const auto &s = segments[i];
-		double cycles_per_work =
-		    s.record.work_units > 0 ? s.corrected_cycles / static_cast<double>(s.record.work_units) : 0;
-		double duration = SegmentDuration(s.record);
-		double charged_total_energy = s.attributed_active_energy_j + s.attributed_base_energy_j;
-		double active_power = duration > 0 ? s.attributed_active_energy_j / duration : 0;
-		double charged_power = duration > 0 ? charged_total_energy / duration : 0;
-		out << s.record.segment_id << "," << s.record.query_id << "," << s.record.pipeline_id << ","
-		    << CsvEscape(s.record.pipeline_signature) << "," << EnergySegmentPhaseToString(s.record.phase) << ","
-		    << s.record.lifecycle_group_id << "," << s.record.owner_pipeline_id << ","
-		    << s.record.lifecycle_member_count << "," << s.record.socket_id << "," << s.record.physical_core_id << ","
-		    << s.record.logical_cpu_id << "," << duration << "," << s.record.work_units << ","
-		    << s.frequency_ratio << "," << s.corrected_cycles << "," << s.activity_weight << "," << s.weight_denominator
-		    << "," << s.attributed_active_energy_j << "," << s.base_time_weight << "," << s.base_time_denominator_s
-		    << "," << s.attributed_base_energy_j << "," << charged_total_energy << "," << s.throughput << ","
-		    << cycles_per_work << "," << active_power << "," << charged_power << "," << CsvEscape(s.attribution_status)
-		    << "\n";
-	}
-}
-
-static void WriteProfilesCSV(const string &path, const vector<PipelineProfileAggregate> &profiles) {
-	std::ofstream out(path.c_str());
-	out << "pipeline_signature,core_freq_hz,uncore_freq_hz,smt_occupancy,sample_count,throughput_estimate,"
-	       "corrected_cycles_per_work_estimate,active_package_power_estimate_w,charged_package_power_estimate_w,"
-	       "total_work_units,total_duration_s,total_active_energy_j,total_base_energy_j,total_charged_energy_j\n";
-	for (idx_t i = 0; i < profiles.size(); i++) {
-		const auto &p = profiles[i];
-		double throughput = p.duration_s > 0 ? p.work_units / p.duration_s : 0;
-		double cycles_per_work = p.work_units > 0 ? p.corrected_cycles / p.work_units : 0;
-		double active_power = p.duration_s > 0 ? p.active_energy_j / p.duration_s : 0;
-		double charged_energy = p.active_energy_j + p.base_energy_j;
-		double charged_power = p.duration_s > 0 ? charged_energy / p.duration_s : 0;
-		out << CsvEscape(p.pipeline_signature) << "," << p.core_freq_hz << "," << p.uncore_freq_hz << ","
-		    << p.smt_occupancy << "," << p.samples << "," << throughput << "," << cycles_per_work << "," << active_power
-		    << "," << charged_power << "," << p.work_units << "," << p.duration_s << "," << p.active_energy_j << ","
-		    << p.base_energy_j << "," << charged_energy << "\n";
-	}
-}
-
 static string JoinUInt64List(const vector<uint64_t> &values) {
 	std::ostringstream out;
 	for (idx_t i = 0; i < values.size(); i++) {
@@ -2659,7 +1880,7 @@ static string JoinUInt64List(const vector<uint64_t> &values) {
 static void WriteLifecyclePhaseProfilesCSV(const string &path, const vector<LifecyclePhaseProfileAggregate> &profiles) {
 	std::ofstream out(path.c_str());
 	out << "query_id,lifecycle_group_id,phase_kind,owner_pipeline_id,lifecycle_member_count,member_pipeline_ids,"
-	       "core_freq_hz,uncore_freq_hz,smt_occupancy,sample_count,start_ns,end_ns,elapsed_s,total_duration_s,"
+	       "hardware_mode,core_freq_hz,uncore_freq_hz,smt_occupancy,sample_count,start_ns,end_ns,elapsed_s,total_duration_s,"
 	       "attributed_active_energy_j,base_time_share_energy_j,charged_total_energy_j,active_power_w,charged_power_w,"
 	       "corrected_cycles\n";
 	for (idx_t i = 0; i < profiles.size(); i++) {
@@ -2671,22 +1892,26 @@ static void WriteLifecyclePhaseProfilesCSV(const string &path, const vector<Life
 		double charged_power = p.total_duration_s > 0 ? charged_total_energy / p.total_duration_s : 0;
 		out << p.query_id << "," << p.lifecycle_group_id << "," << EnergySegmentPhaseToString(p.phase) << ","
 		    << p.owner_pipeline_id << "," << p.lifecycle_member_count << ","
-		    << CsvEscape(JoinUInt64List(p.member_pipeline_ids)) << "," << p.core_freq_hz << "," << p.uncore_freq_hz
-		    << "," << p.smt_occupancy << "," << p.sample_count << "," << p.start_ns << "," << p.end_ns << ","
-		    << elapsed_s << "," << p.total_duration_s << "," << p.attributed_active_energy_j << ","
-		    << p.base_time_share_energy_j << "," << charged_total_energy << "," << active_power << "," << charged_power
-		    << "," << p.corrected_cycles << "\n";
+		    << CsvEscape(JoinUInt64List(p.member_pipeline_ids)) << ","
+		    << PeriodicHardwareProfileModeToString(p.hardware_mode) << "," << p.core_freq_hz << ","
+		    << p.uncore_freq_hz << "," << p.smt_occupancy << "," << p.sample_count << "," << p.start_ns << ","
+		    << p.end_ns << "," << elapsed_s << "," << p.total_duration_s << "," << p.attributed_active_energy_j << ","
+		    << p.base_time_share_energy_j << "," << charged_total_energy << "," << active_power << ","
+		    << charged_power << "," << p.corrected_cycles << "\n";
 	}
 }
 
 static void WriteLifecycleGroupMembersCSV(const string &path, const vector<LifecyclePhaseProfileAggregate> &profiles) {
 	std::ofstream out(path.c_str());
-	out << "query_id,lifecycle_group_id,phase_kind,owner_pipeline_id,lifecycle_member_count,member_pipeline_id\n";
+	out << "query_id,lifecycle_group_id,phase_kind,hardware_mode,core_freq_hz,uncore_freq_hz,owner_pipeline_id,"
+	       "lifecycle_member_count,member_pipeline_id\n";
 	for (idx_t i = 0; i < profiles.size(); i++) {
 		const auto &p = profiles[i];
 		for (auto member_pipeline_id : p.member_pipeline_ids) {
 			out << p.query_id << "," << p.lifecycle_group_id << "," << EnergySegmentPhaseToString(p.phase) << ","
-			    << p.owner_pipeline_id << "," << p.lifecycle_member_count << "," << member_pipeline_id << "\n";
+			    << PeriodicHardwareProfileModeToString(p.hardware_mode) << "," << p.core_freq_hz << ","
+			    << p.uncore_freq_hz << "," << p.owner_pipeline_id << "," << p.lifecycle_member_count << ","
+			    << member_pipeline_id << "\n";
 		}
 	}
 }
@@ -2713,7 +1938,7 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 	if (include_query_lifecycle) {
 		out << "start_ns,end_ns,elapsed_s,";
 	}
-	out << "pipeline_id,pipeline_signature,core_freq_hz,uncore_freq_hz,smt_occupancy,sample_count,"
+	out << "pipeline_id,hardware_mode,core_freq_hz,uncore_freq_hz,smt_occupancy,sample_count,"
 	       "valid_input_sample_count,energy_only_sample_count,total_input_rows,total_input_chunks,total_duration_s,"
 	       "input_duration_s,total_duration_throughput_rows_per_s,input_segment_throughput_rows_per_s,"
 	       "attributed_active_energy_j,input_attributed_active_energy_j,base_time_share_energy_j,"
@@ -2763,145 +1988,28 @@ static void WriteEfficiencyProfilesCSV(const string &path, const vector<Pipeline
 		if (include_query_lifecycle) {
 			out << p.start_ns << "," << p.end_ns << "," << elapsed_s << ",";
 		}
-		out << p.pipeline_id << "," << CsvEscape(p.pipeline_signature) << "," << p.core_freq_hz << ","
-		    << p.uncore_freq_hz << "," << p.smt_occupancy << "," << p.sample_count << "," << p.valid_input_sample_count
-		    << "," << p.energy_only_sample_count << "," << p.total_input_rows << "," << p.total_input_chunks << ","
-		    << p.total_duration_s << "," << p.input_duration_s << "," << total_throughput << "," << input_throughput
-		    << "," << p.attributed_active_energy_j << "," << p.input_attributed_active_energy_j << ","
-		    << p.base_time_share_energy_j << "," << p.input_base_time_share_energy_j << "," << charged_total_energy
-		    << "," << input_charged_total_energy << "," << active_power << "," << charged_power << ","
-		    << active_throughput_per_watt << "," << charged_throughput_per_watt << "," << active_energy_per_row << ","
-		    << charged_energy_per_row << "," << p.corrected_cycles << "," << corrected_cycles_per_row << ","
-		    << input_corrected_cycles_per_row << "," << p.energy_only_duration_s << "," << p.energy_only_active_energy_j
-		    << "," << p.energy_only_base_time_share_energy_j << "," << energy_only_charged_energy << ","
+		out << p.pipeline_id << "," << PeriodicHardwareProfileModeToString(p.hardware_mode) << "," << p.core_freq_hz
+		    << "," << p.uncore_freq_hz << "," << p.smt_occupancy << "," << p.sample_count << ","
+		    << p.valid_input_sample_count << "," << p.energy_only_sample_count << "," << p.total_input_rows << ","
+		    << p.total_input_chunks << "," << p.total_duration_s << "," << p.input_duration_s << ","
+		    << total_throughput << "," << input_throughput << "," << p.attributed_active_energy_j << ","
+		    << p.input_attributed_active_energy_j << "," << p.base_time_share_energy_j << ","
+		    << p.input_base_time_share_energy_j << "," << charged_total_energy << "," << input_charged_total_energy
+		    << "," << active_power << "," << charged_power << "," << active_throughput_per_watt << ","
+		    << charged_throughput_per_watt << "," << active_energy_per_row << "," << charged_energy_per_row << ","
+		    << p.corrected_cycles << "," << corrected_cycles_per_row << "," << input_corrected_cycles_per_row << ","
+		    << p.energy_only_duration_s << "," << p.energy_only_active_energy_j << ","
+		    << p.energy_only_base_time_share_energy_j << "," << energy_only_charged_energy << ","
 		    << allocated_initialize_energy << "," << allocated_prepare_finish_energy << ","
 		    << allocated_finish_energy << "," << allocated_lifecycle_energy << ","
-		    << charged_total_energy + allocated_lifecycle_energy << ","
-		    << p.allocated_initialize_active_energy_j << "," << p.allocated_initialize_base_energy_j << ","
-		    << p.allocated_prepare_finish_active_energy_j << "," << p.allocated_prepare_finish_base_energy_j << ","
-		    << p.allocated_finish_active_energy_j << "," << p.allocated_finish_base_energy_j << ","
-		    << allocated_lifecycle_active_energy << "," << allocated_lifecycle_base_energy << ","
+		    << charged_total_energy + allocated_lifecycle_energy << "," << p.allocated_initialize_active_energy_j
+		    << "," << p.allocated_initialize_base_energy_j << "," << p.allocated_prepare_finish_active_energy_j << ","
+		    << p.allocated_prepare_finish_base_energy_j << "," << p.allocated_finish_active_energy_j << ","
+		    << p.allocated_finish_base_energy_j << "," << allocated_lifecycle_active_energy << ","
+		    << allocated_lifecycle_base_energy << ","
 		    << p.attributed_active_energy_j + allocated_lifecycle_active_energy << ","
 		    << p.base_time_share_energy_j + allocated_lifecycle_base_energy << "\n";
 	}
-}
-
-static void WriteValidationSummary(const string &path, const vector<SocketEnergyWindow> &windows,
-                                   const vector<AttributedSegment> &segments) {
-	std::ofstream out(path.c_str());
-	bool any_migration = false;
-	idx_t input_segment_count = 0;
-	idx_t energy_only_segment_count = 0;
-	double input_segment_active_energy_j = 0;
-	double energy_only_segment_active_energy_j = 0;
-	double input_segment_base_energy_j = 0;
-	double energy_only_segment_base_energy_j = 0;
-	for (idx_t i = 0; i < segments.size(); i++) {
-		any_migration = any_migration || segments[i].record.migrated;
-		if (segments[i].record.work_units > 0) {
-			input_segment_count++;
-			input_segment_active_energy_j += segments[i].attributed_active_energy_j;
-			input_segment_base_energy_j += segments[i].attributed_base_energy_j;
-		} else {
-			energy_only_segment_count++;
-			energy_only_segment_active_energy_j += segments[i].attributed_active_energy_j;
-			energy_only_segment_base_energy_j += segments[i].attributed_base_energy_j;
-		}
-	}
-	out << "{\n";
-	out << "  \"socket_windows\": [\n";
-	for (idx_t i = 0; i < windows.size(); i++) {
-		const auto &w = windows[i];
-		double summed_charged_energy = w.summed_attributed_active_energy_j + w.summed_attributed_base_energy_j;
-		double package_conservation_error = w.package_energy_j - summed_charged_energy;
-		out << "    {\"socket_id\": " << w.socket_id << ", \"active_package_energy_j\": " << w.active_package_energy_j
-		    << ", \"attributed_active_energy_j\": " << w.summed_attributed_active_energy_j
-		    << ", \"active_conservation_error_j\": " << w.active_conservation_error_j
-		    << ", \"base_energy_j\": " << w.base_energy_j
-		    << ", \"attributed_base_energy_j\": " << w.summed_attributed_base_energy_j
-		    << ", \"base_conservation_error_j\": " << w.base_conservation_error_j
-		    << ", \"charged_energy_j\": " << summed_charged_energy
-		    << ", \"package_conservation_error_j\": " << package_conservation_error
-		    << ", \"time_fallback\": " << (w.used_time_fallback ? "true" : "false") << "}";
-		if (i + 1 < windows.size()) {
-			out << ",";
-		}
-		out << "\n";
-	}
-	out << "  ],\n";
-	out << "  \"segment_count\": " << segments.size() << ",\n";
-	out << "  \"input_segment_count\": " << input_segment_count << ",\n";
-	out << "  \"energy_only_segment_count\": " << energy_only_segment_count << ",\n";
-	out << "  \"input_segment_active_energy_j\": " << input_segment_active_energy_j << ",\n";
-	out << "  \"energy_only_segment_active_energy_j\": " << energy_only_segment_active_energy_j << ",\n";
-	out << "  \"input_segment_base_energy_j\": " << input_segment_base_energy_j << ",\n";
-	out << "  \"energy_only_segment_base_energy_j\": " << energy_only_segment_base_energy_j << ",\n";
-	out << "  \"migration_observed\": " << (any_migration ? "true" : "false") << ",\n";
-	out << "  \"base_energy_attributed_to_pipelines\": true\n";
-	out << "}\n";
-}
-
-static void FinalizeAndWrite(QueryEnergyState &state) {
-	auto end_ns = TimestampNs();
-	if (!state.settings.export_enabled && !state.settings.profile_update_enabled) {
-		return;
-	}
-	vector<RaplSnapshot> rapl_end;
-	if (state.settings.rapl_enabled) {
-		rapl_end = state.rapl.Read();
-	}
-	vector<EnergySegmentRecord> raw_segments;
-	unordered_map<uint64_t, string> pipeline_signatures;
-	vector<shared_ptr<EnergyThreadSegmentBuffer>> segment_buffers;
-	{
-		lock_guard<mutex> guard(state.lock);
-		raw_segments = state.segments;
-		segment_buffers = state.segment_buffers;
-		pipeline_signatures = state.pipeline_signatures;
-	}
-	for (idx_t i = 0; i < segment_buffers.size(); i++) {
-		const auto &buffer = segment_buffers[i];
-		if (!buffer) {
-			continue;
-		}
-		buffer->Drain(raw_segments);
-	}
-	FillPipelineSignatures(pipeline_signatures, raw_segments, state.settings.pipeline_signatures_enabled);
-	std::sort(
-	    raw_segments.begin(), raw_segments.end(),
-	    [](const EnergySegmentRecord &lhs, const EnergySegmentRecord &rhs) { return lhs.segment_id < rhs.segment_id; });
-	vector<AttributedSegment> segments;
-	for (idx_t i = 0; i < raw_segments.size(); i++) {
-		AttributedSegment attributed;
-		attributed.record = raw_segments[i];
-		segments.push_back(attributed);
-	}
-	vector<SocketEnergyWindow> windows;
-	if (state.settings.rapl_enabled) {
-		windows = BuildSocketWindows(state, segments, rapl_end, end_ns);
-		AttributeSegments(segments, windows);
-	}
-	auto profiles = BuildProfiles(segments);
-	auto efficiency_profiles = BuildEfficiencyProfiles(segments);
-
-	if (!state.settings.export_enabled) {
-		return;
-	}
-	auto output_segments = segments;
-	std::sort(output_segments.begin(), output_segments.end(),
-	          [](const AttributedSegment &lhs, const AttributedSegment &rhs) {
-		          if (lhs.record.start_ns != rhs.record.start_ns) {
-			          return lhs.record.start_ns < rhs.record.start_ns;
-		          }
-		          return lhs.record.segment_id < rhs.record.segment_id;
-	          });
-	EnsureDirectoryRecursive(state.output_dir);
-	WriteSegmentsCSV(state.output_dir + "/energy_segments.csv", output_segments);
-	WriteSocketWindowsCSV(state.output_dir + "/socket_energy_windows.csv", windows);
-	WriteAttributedSegmentsCSV(state.output_dir + "/attributed_segments.csv", output_segments);
-	WriteProfilesCSV(state.output_dir + "/pipeline_energy_profiles.csv", profiles);
-	WriteEfficiencyProfilesCSV(state.output_dir + "/pipeline_efficiency_profiles.csv", efficiency_profiles);
-	WriteValidationSummary(state.output_dir + "/validation_summary.json", windows, segments);
 }
 
 static uint64_t ScaleByFraction(uint64_t value, double fraction) {
@@ -2928,17 +2036,12 @@ static EnergySegmentRecord SliceSegmentRecord(const EnergySegmentRecord &record,
 	result.chunks = ScaleByFraction(record.chunks, fraction);
 	result.task_clock_ns = ScaleByFraction(record.task_clock_ns, fraction);
 	result.cycles = ScaleByFraction(record.cycles, fraction);
-	result.instructions = ScaleByFraction(record.instructions, fraction);
-	result.ref_cycles = ScaleByFraction(record.ref_cycles, fraction);
-	result.cache_refs = ScaleByFraction(record.cache_refs, fraction);
-	result.cache_misses = ScaleByFraction(record.cache_misses, fraction);
-	result.llc_misses = ScaleByFraction(record.llc_misses, fraction);
-	result.offcore_responses = ScaleByFraction(record.offcore_responses, fraction);
 	return result;
 }
 
 static void AddSegmentToEfficiencyAggregate(PipelineEfficiencyAggregate &profile, const AttributedSegment &segment,
-                                            bool initialize_pipeline_identity) {
+                                            bool initialize_pipeline_identity,
+                                            const PeriodicPipelineProfileKey *hardware_key) {
 	auto duration = SegmentDuration(segment.record);
 	if (!segment.record.counters_valid || !segment.record.hardware_state_stable || duration <= 0) {
 		return;
@@ -2947,12 +2050,12 @@ static void AddSegmentToEfficiencyAggregate(PipelineEfficiencyAggregate &profile
 		profile.query_id = segment.record.query_id;
 		if (initialize_pipeline_identity) {
 			profile.pipeline_id = segment.record.pipeline_id;
-			profile.pipeline_signature = segment.record.pipeline_signature;
-		} else {
-			profile.pipeline_signature = StringUtil::Format("query_%llu", segment.record.query_id);
 		}
-		profile.core_freq_hz = segment.record.core_freq_hz;
-		profile.uncore_freq_hz = segment.record.uncore_freq_hz;
+		if (hardware_key) {
+			profile.hardware_mode = hardware_key->hardware_mode;
+			profile.core_freq_hz = static_cast<double>(hardware_key->core_frequency_khz) * 1000.0;
+			profile.uncore_freq_hz = static_cast<double>(hardware_key->uncore_frequency_khz) * 1000.0;
+		}
 		profile.smt_occupancy = segment.record.smt_occupancy;
 	}
 	UpdateEfficiencyAggregateTimeRange(profile, segment.record.start_ns, segment.record.end_ns);
@@ -2979,7 +2082,8 @@ static void AddSegmentToEfficiencyAggregate(PipelineEfficiencyAggregate &profile
 
 static void AddThroughputObservationToEfficiencyAggregate(PipelineEfficiencyAggregate &profile,
                                                           const EnergySegmentRecord &record,
-                                                          bool initialize_pipeline_identity) {
+                                                          bool initialize_pipeline_identity,
+                                                          const PeriodicPipelineProfileKey *hardware_key) {
 	auto duration = SegmentDuration(record);
 	if (!record.counters_valid || !record.hardware_state_stable || duration <= 0 || record.work_units == 0) {
 		return;
@@ -2988,12 +2092,12 @@ static void AddThroughputObservationToEfficiencyAggregate(PipelineEfficiencyAggr
 		profile.query_id = record.query_id;
 		if (initialize_pipeline_identity) {
 			profile.pipeline_id = record.pipeline_id;
-			profile.pipeline_signature = record.pipeline_signature;
-		} else {
-			profile.pipeline_signature = StringUtil::Format("query_%llu", record.query_id);
 		}
-		profile.core_freq_hz = record.core_freq_hz;
-		profile.uncore_freq_hz = record.uncore_freq_hz;
+		if (hardware_key) {
+			profile.hardware_mode = hardware_key->hardware_mode;
+			profile.core_freq_hz = static_cast<double>(hardware_key->core_frequency_khz) * 1000.0;
+			profile.uncore_freq_hz = static_cast<double>(hardware_key->uncore_frequency_khz) * 1000.0;
+		}
 		profile.smt_occupancy = record.smt_occupancy;
 	}
 	UpdateEfficiencyAggregateTimeRange(profile, record.start_ns, record.end_ns);
@@ -3011,7 +2115,7 @@ static void MergeEfficiencyAggregate(PipelineEfficiencyAggregate &target, const 
 	if (target.sample_count == 0 && target.valid_input_sample_count == 0 && target.energy_only_sample_count == 0) {
 		target.query_id = source.query_id;
 		target.pipeline_id = source.pipeline_id;
-		target.pipeline_signature = source.pipeline_signature;
+		target.hardware_mode = source.hardware_mode;
 		target.core_freq_hz = source.core_freq_hz;
 		target.uncore_freq_hz = source.uncore_freq_hz;
 		target.smt_occupancy = source.smt_occupancy;
@@ -3041,7 +2145,8 @@ static void MergeEfficiencyAggregate(PipelineEfficiencyAggregate &target, const 
 	target.allocated_finish_base_energy_j += source.allocated_finish_base_energy_j;
 }
 
-static bool AddLifecycleSegmentToProfile(LifecyclePhaseProfileAggregate &profile, const AttributedSegment &segment) {
+static bool AddLifecycleSegmentToProfile(LifecyclePhaseProfileAggregate &profile, const AttributedSegment &segment,
+                                         const PeriodicLifecycleProfileKey &hardware_key) {
 	auto duration = SegmentDuration(segment.record);
 	if (!segment.record.counters_valid || !segment.record.hardware_state_stable || duration <= 0) {
 		return false;
@@ -3052,8 +2157,9 @@ static bool AddLifecycleSegmentToProfile(LifecyclePhaseProfileAggregate &profile
 		profile.owner_pipeline_id = segment.record.owner_pipeline_id;
 		profile.lifecycle_member_count = segment.record.lifecycle_member_count;
 		profile.phase = segment.record.phase;
-		profile.core_freq_hz = segment.record.core_freq_hz;
-		profile.uncore_freq_hz = segment.record.uncore_freq_hz;
+		profile.hardware_mode = hardware_key.hardware_mode;
+		profile.core_freq_hz = static_cast<double>(hardware_key.core_frequency_khz) * 1000.0;
+		profile.uncore_freq_hz = static_cast<double>(hardware_key.uncore_frequency_khz) * 1000.0;
 		profile.smt_occupancy = segment.record.smt_occupancy;
 		profile.member_pipeline_ids = segment.record.lifecycle_member_pipeline_ids;
 	}
@@ -3068,13 +2174,14 @@ static bool AddLifecycleSegmentToProfile(LifecyclePhaseProfileAggregate &profile
 
 static void AddAllocatedLifecycleEnergy(PipelineEfficiencyAggregate &profile, const AttributedSegment &segment,
                                         uint64_t pipeline_id, double allocated_active_energy_j,
-                                        double allocated_base_energy_j) {
+                                        double allocated_base_energy_j,
+                                        const PeriodicPipelineProfileKey &hardware_key) {
 	if (profile.sample_count == 0 && profile.valid_input_sample_count == 0 && profile.energy_only_sample_count == 0) {
 		profile.query_id = segment.record.query_id;
 		profile.pipeline_id = pipeline_id;
-		profile.pipeline_signature = StringUtil::Format("pipeline_%llu", pipeline_id);
-		profile.core_freq_hz = segment.record.core_freq_hz;
-		profile.uncore_freq_hz = segment.record.uncore_freq_hz;
+		profile.hardware_mode = hardware_key.hardware_mode;
+		profile.core_freq_hz = static_cast<double>(hardware_key.core_frequency_khz) * 1000.0;
+		profile.uncore_freq_hz = static_cast<double>(hardware_key.uncore_frequency_khz) * 1000.0;
 		profile.smt_occupancy = segment.record.smt_occupancy;
 	}
 	UpdateEfficiencyAggregateTimeRange(profile, segment.record.start_ns, segment.record.end_ns);
@@ -3188,14 +2295,38 @@ struct PeriodicRuntimeOverheadStats {
 	idx_t segments_attributed = 0;
 };
 
+enum class PeriodicSampleReason : uint8_t {
+	ACTIVE_PERIODIC,
+	IDLE_PERIODIC,
+	ACTIVITY_TRANSITION,
+	SHUTDOWN
+};
+
+static void AddRuntimeOverheadStats(PeriodicRuntimeOverheadStats &stats,
+                                    const PeriodicRuntimeOverheadRecord &record) {
+	stats.count++;
+	stats.total_wall_ns += record.wall_ns;
+	stats.max_wall_ns = MaxValue<uint64_t>(stats.max_wall_ns, record.wall_ns);
+	stats.total_cpu_ns += record.cpu_ns;
+	stats.max_cpu_ns = MaxValue<uint64_t>(stats.max_cpu_ns, record.cpu_ns);
+	stats.total_lock_wait_ns += record.lock_wait_ns;
+	stats.max_lock_wait_ns = MaxValue<uint64_t>(stats.max_lock_wait_ns, record.lock_wait_ns);
+	stats.total_lock_hold_ns += record.lock_hold_ns;
+	stats.max_lock_hold_ns = MaxValue<uint64_t>(stats.max_lock_hold_ns, record.lock_hold_ns);
+	stats.total_attribute_segments_ns += record.attribute_segments_ns;
+	stats.max_attribute_segments_ns =
+	    MaxValue<uint64_t>(stats.max_attribute_segments_ns, record.attribute_segments_ns);
+	stats.total_profile_update_ns += record.profile_update_ns;
+	stats.total_csv_append_ns += record.csv_append_ns;
+	stats.windows_finalized += record.windows_finalized;
+	stats.segments_attributed += record.segments_attributed;
+}
+
 struct PeriodicWorkerSegmentState {
 	int64_t linux_tid = -1;
 	mutex lock;
 	PerfEventGroup perf_group;
-	string perf_profile;
 	bool perf_open = false;
-	bool perf_include_kernel = false;
-	bool perf_open_ref_cycles = true;
 	string perf_status = "not opened";
 	bool active = false;
 	bool in_active_worker_list = false;
@@ -3224,7 +2355,7 @@ public:
 
 	void Configure(DatabaseInstance &db, const EnergyAttributionSettings &settings_p) {
 		std::thread thread_to_join;
-		bool should_start = settings_p.enabled && settings_p.periodic_enabled;
+		bool should_start = settings_p.enabled;
 		{
 			std::unique_lock<mutex> guard(lock);
 			if (running && active_db == &db) {
@@ -3320,8 +2451,19 @@ public:
 		queries[query.get()] = query;
 		query_active[query.get()] = true;
 		observed_query_activity.store(true, std::memory_order_release);
-		active_query_count.fetch_add(1, std::memory_order_relaxed);
-		cv.notify_all();
+		auto previous_active_queries = active_query_count.fetch_add(1, std::memory_order_relaxed);
+		if (adaptive_sampling_enabled && previous_active_queries == 0) {
+			activity_transition_generation++;
+			cv.notify_all();
+		}
+	}
+
+	void RegisterPipelineMetadata(uint64_t query_id, uint64_t pipeline_id, string pipeline_signature) {
+		std::unique_lock<mutex> guard(lock);
+		if (!running) {
+			return;
+		}
+		pipeline_signatures.emplace(std::make_pair(query_id, pipeline_id), std::move(pipeline_signature));
 	}
 
 	void MarkQueryEnded(const shared_ptr<QueryEnergyState> &query) {
@@ -3341,13 +2483,12 @@ public:
 			auto active_entry = query_active.find(query.get());
 			if (active_entry != query_active.end() && active_entry->second) {
 				active_entry->second = false;
-				DecrementActiveQueryCount();
+				if (DecrementActiveQueryCount() && adaptive_sampling_enabled) {
+					activity_transition_generation++;
+				}
 			}
 			auto &query_profile = query_profiles[query->query_id];
 			query_profile.query_id = query->query_id;
-			if (query_profile.pipeline_signature.empty()) {
-				query_profile.pipeline_signature = StringUtil::Format("query_%llu", query->query_id);
-			}
 			UpdateEfficiencyAggregateTimeRange(query_profile, query->start_ns, wall_start_ns);
 			queries.erase(query.get());
 			query_active.erase(query.get());
@@ -3379,7 +2520,7 @@ public:
 			worker_state->record = std::move(record);
 			worker_state->last_boundary_ns = worker_state->record.start_ns;
 			worker_state->accumulated_counters = PerfCounters();
-			worker_state->last_perf = ReadWorkerPerfSnapshotLocked(*worker_state, query->settings);
+			worker_state->last_perf = ReadWorkerPerfSnapshotLocked(*worker_state);
 			worker_state->active = true;
 			worker_state->active_atomic.store(true, std::memory_order_release);
 		}
@@ -3419,7 +2560,7 @@ public:
 			worker_state->record = std::move(record);
 			worker_state->last_boundary_ns = worker_state->record.start_ns;
 			worker_state->accumulated_counters = PerfCounters();
-			worker_state->last_perf = ReadWorkerPerfSnapshotLocked(*worker_state, settings);
+			worker_state->last_perf = ReadWorkerPerfSnapshotLocked(*worker_state);
 			worker_state->active = true;
 			worker_state->active_atomic.store(true, std::memory_order_release);
 		}
@@ -3468,36 +2609,46 @@ public:
 	}
 
 private:
+	string PipelineSignatureLocked(uint64_t query_id, uint64_t pipeline_id,
+	                              EnergySystemCategory category = EnergySystemCategory::NONE) const {
+		if (category != EnergySystemCategory::NONE) {
+			return EnergySystemCategoryToString(category);
+		}
+		auto entry = pipeline_signatures.find(std::make_pair(query_id, pipeline_id));
+		return entry == pipeline_signatures.end() ? PipelineLabel(pipeline_id) : entry->second;
+	}
+
 	static bool SettingsMatch(const EnergyAttributionSettings &lhs, const EnergyAttributionSettings &rhs) {
-		return lhs.enabled == rhs.enabled && lhs.rapl_enabled == rhs.rapl_enabled &&
-		       lhs.perf_counters_enabled == rhs.perf_counters_enabled && lhs.export_enabled == rhs.export_enabled &&
-		       lhs.debug_export_enabled == rhs.debug_export_enabled &&
-		       lhs.closed_segments_export_enabled == rhs.closed_segments_export_enabled &&
-		       lhs.overhead_detail_enabled == rhs.overhead_detail_enabled &&
-		       lhs.pipeline_signatures_enabled == rhs.pipeline_signatures_enabled &&
-		       lhs.metadata_cache_enabled == rhs.metadata_cache_enabled &&
-		       lhs.migration_check_enabled == rhs.migration_check_enabled &&
-		       lhs.profile_update_enabled == rhs.profile_update_enabled &&
-		       lhs.periodic_enabled == rhs.periodic_enabled && lhs.period_ms == rhs.period_ms &&
-		       lhs.process_attribution_required == rhs.process_attribution_required &&
-		       lhs.output_dir == rhs.output_dir && lhs.base_power_path == rhs.base_power_path &&
-		       lhs.counter_profile == rhs.counter_profile && lhs.fail_policy == rhs.fail_policy &&
-		       lhs.attribution_model == rhs.attribution_model;
+		return lhs.enabled == rhs.enabled && lhs.export_enabled == rhs.export_enabled &&
+		       lhs.debug_export_enabled == rhs.debug_export_enabled && lhs.period_ms == rhs.period_ms &&
+		       lhs.idle_period_ms == rhs.idle_period_ms &&
+		       lhs.output_dir == rhs.output_dir && lhs.base_power_path == rhs.base_power_path;
 	}
 
 	void StartLocked(DatabaseInstance &db, const EnergyAttributionSettings &settings_p) {
 		active_db = &db;
 		settings = settings_p;
 		period_ms = MaxValue<uint64_t>(1, settings.period_ms);
+		effective_idle_period_ms =
+		    settings.idle_period_ms == 0 ? period_ms : MaxValue(period_ms, settings.idle_period_ms);
+		adaptive_sampling_enabled = effective_idle_period_ms > period_ms;
 		run_start_ns = TimestampNs();
 		next_window_id = 1;
 		active_query_count.store(0, std::memory_order_relaxed);
+		activity_transition_generation = 0;
+		active_periodic_sample_count = 0;
+		idle_periodic_sample_count = 0;
+		activity_transition_sample_count = 0;
+		shutdown_sample_count = 0;
+		max_active_periodic_interval_ns = 0;
+		max_idle_periodic_interval_ns = 0;
 		stop_requested = false;
 		running = true;
 		finalized_window_count = 0;
 		attributed_segment_count = 0;
 		process_window_count = 0;
 		process_valid_window_count = 0;
+		process_checkpoint_timeout_generation_count = 0;
 		next_runtime_overhead_id.store(1, std::memory_order_relaxed);
 		total_active_conservation_error_j = 0;
 		total_base_conservation_error_j = 0;
@@ -3508,10 +2659,10 @@ private:
 		observed_query_activity.store(false, std::memory_order_relaxed);
 		queries.clear();
 		query_active.clear();
+		pipeline_signatures.clear();
 		pending_windows.clear();
 		pending_window_count.store(0, std::memory_order_relaxed);
 		pending_segment_records.clear();
-		closed_segment_records.clear();
 		{
 			lock_guard<mutex> queue_guard(queue_lock);
 			queued_segment_records.clear();
@@ -3520,19 +2671,16 @@ private:
 		scratch_worker_states.clear();
 		scratch_sampled_segments.clear();
 		scratch_closed_segments.clear();
-			scratch_queue_segments.clear();
-			scratch_queue_closed_segments.clear();
-			scratch_process_rows.clear();
-			scratch_process_segments.clear();
-			scratch_legacy_segments.clear();
-			scratch_attribution_windows.clear();
-			scratch_hardware_energy_observations.clear();
-			scratch_prepared_process_activity.source = nullptr;
-			scratch_process_thread_shares.clear();
-			scratch_process_tid_to_thread.clear();
-			scratch_process_tid_to_thread.reserve(64);
-			scratch_segment_thread_slots.clear();
-			scratch_prepared_process_activity.socket_to_index.reserve(8);
+		scratch_queue_segments.clear();
+		scratch_queue_closed_segments.clear();
+		scratch_process_rows.clear();
+		scratch_hardware_energy_observations.clear();
+		scratch_prepared_process_activity.source = nullptr;
+		scratch_process_thread_shares.clear();
+		scratch_process_tid_to_thread.clear();
+		scratch_process_tid_to_thread.reserve(64);
+		scratch_segment_thread_slots.clear();
+		scratch_prepared_process_activity.socket_to_index.reserve(8);
 		scratch_rapl_snapshots.clear();
 		scratch_pipeline_profile_updates.clear();
 		scratch_query_profile_updates.clear();
@@ -3559,55 +2707,72 @@ private:
 		process_energy_profiles.clear();
 		process_energy_profiles.reserve(512);
 		runtime_overhead.clear();
+		runtime_overhead_stats = PeriodicRuntimeOverheadStats();
+		periodic_runtime_overhead_stats = PeriodicRuntimeOverheadStats();
 		base_power_entries.clear();
-		base_power_loaded = false;
-		if (settings.rapl_enabled) {
-			base_power_loaded = LoadBasePowerCSVCached(settings.base_power_path, base_power_entries);
-		}
+		base_power_loaded = LoadBasePowerCSVCached(settings.base_power_path, base_power_entries);
 		uncore_freq_by_socket = BuildQueryUncoreFrequencyCache(true);
 		auto base_dir = settings.output_dir.empty() ? string(DEFAULT_OUTPUT_DIR) : settings.output_dir;
 		output_dir = base_dir + "/" + StringUtil::Format("periodic_run_%llu", run_start_ns);
-		process_collector.reset();
-		process_collector_status = "legacy";
-		if (settings.attribution_model != "legacy") {
-			process_collector = ProcessActivityCollector::Create();
-			if (!process_collector || !process_collector->Start(settings.process_attribution_required)) {
-				process_collector_status =
-				    process_collector ? process_collector->LastError() : "process attribution was not compiled";
-				process_collector.reset();
-				if (settings.attribution_model == "process" || settings.process_attribution_required) {
-					running = false;
-					stop_requested = false;
-					throw InvalidInputException("Process energy attribution is unavailable: %s",
-					                            process_collector_status);
-				}
-			} else {
-				process_collector_status = "ok";
-			}
+		process_collector = ProcessActivityCollector::Create();
+		if (!process_collector || !process_collector->Start(true)) {
+			process_collector_status =
+			    process_collector ? process_collector->LastError() : "process attribution was not compiled";
+			process_collector.reset();
+			running = false;
+			stop_requested = false;
+			throw InvalidInputException("Process energy attribution is unavailable: %s", process_collector_status);
 		}
+		process_collector_status = "ok";
 		runtime_generation.fetch_add(1, std::memory_order_acq_rel);
 		runtime_active.store(true, std::memory_order_release);
 		worker = std::thread([this]() { Run(); });
 	}
 
 	void Run() {
+		using SampleClock = std::chrono::steady_clock;
 		last_sample_ns = TimestampNs();
-		if (settings.rapl_enabled) {
-			rapl.Read(last_rapl);
+		rapl.Read(last_rapl);
+		uint64_t observed_transition_generation;
+		bool queries_active;
+		{
+			std::unique_lock<mutex> guard(lock);
+			observed_transition_generation = activity_transition_generation;
+			queries_active = active_query_count.load(std::memory_order_relaxed) > 0;
 		}
+		auto current_period_ms = queries_active ? period_ms : effective_idle_period_ms;
+		auto next_deadline = SampleClock::now() + std::chrono::milliseconds(current_period_ms);
 		while (true) {
 			bool should_stop = false;
+			bool activity_transition = false;
 			{
 				std::unique_lock<mutex> guard(lock);
-				cv.wait_for(guard, std::chrono::milliseconds(period_ms), [&]() { return stop_requested; });
+				cv.wait_until(guard, next_deadline, [&]() {
+					return stop_requested ||
+					       (adaptive_sampling_enabled &&
+					        activity_transition_generation != observed_transition_generation);
+				});
 				should_stop = stop_requested;
+				activity_transition = adaptive_sampling_enabled &&
+				                      activity_transition_generation != observed_transition_generation;
+				observed_transition_generation = activity_transition_generation;
+				queries_active = active_query_count.load(std::memory_order_relaxed) > 0;
 			}
+			auto sample_started = SampleClock::now();
+			auto previous_sample_ns = last_sample_ns;
+			auto sample_reason = should_stop
+			                         ? PeriodicSampleReason::SHUTDOWN
+			                         : activity_transition
+			                               ? PeriodicSampleReason::ACTIVITY_TRANSITION
+			                               : queries_active ? PeriodicSampleReason::ACTIVE_PERIODIC
+			                                                : PeriodicSampleReason::IDLE_PERIODIC;
 			if (active_db) {
 				EnergySystemSegmentScope energy_scope(*active_db, EnergySystemCategory::ENERGY_SAMPLER);
 				SampleOnce();
 			} else {
 				SampleOnce();
 			}
+			RecordSampleCadence(sample_reason, DurationNs(last_sample_ns, previous_sample_ns));
 			if (should_stop) {
 				ShutdownFinalize();
 				WriteFinalOutputs();
@@ -3615,10 +2780,10 @@ private:
 				CloseOutputFilesLocked();
 				queries.clear();
 				query_active.clear();
+				pipeline_signatures.clear();
 				pending_windows.clear();
 				pending_window_count.store(0, std::memory_order_relaxed);
 				pending_segment_records.clear();
-				closed_segment_records.clear();
 				{
 					lock_guard<mutex> queue_guard(queue_lock);
 					queued_segment_records.clear();
@@ -3630,9 +2795,6 @@ private:
 					scratch_queue_segments.clear();
 					scratch_queue_closed_segments.clear();
 					scratch_process_rows.clear();
-					scratch_process_segments.clear();
-					scratch_legacy_segments.clear();
-					scratch_attribution_windows.clear();
 					scratch_hardware_energy_observations.clear();
 					scratch_prepared_process_activity.source = nullptr;
 					scratch_process_thread_shares.clear();
@@ -3667,6 +2829,38 @@ private:
 				cv.notify_all();
 				break;
 			}
+			current_period_ms = queries_active ? period_ms : effective_idle_period_ms;
+			auto now = SampleClock::now();
+			if (activity_transition) {
+				next_deadline = sample_started + std::chrono::milliseconds(current_period_ms);
+				if (next_deadline <= now) {
+					next_deadline = now;
+				}
+			} else {
+				next_deadline += std::chrono::milliseconds(current_period_ms);
+				if (next_deadline <= now) {
+					next_deadline = now + std::chrono::milliseconds(current_period_ms);
+				}
+			}
+		}
+	}
+
+	void RecordSampleCadence(PeriodicSampleReason reason, uint64_t interval_ns) {
+		switch (reason) {
+		case PeriodicSampleReason::ACTIVE_PERIODIC:
+			active_periodic_sample_count++;
+			max_active_periodic_interval_ns = MaxValue(max_active_periodic_interval_ns, interval_ns);
+			break;
+		case PeriodicSampleReason::IDLE_PERIODIC:
+			idle_periodic_sample_count++;
+			max_idle_periodic_interval_ns = MaxValue(max_idle_periodic_interval_ns, interval_ns);
+			break;
+		case PeriodicSampleReason::ACTIVITY_TRANSITION:
+			activity_transition_sample_count++;
+			break;
+		case PeriodicSampleReason::SHUTDOWN:
+			shutdown_sample_count++;
+			break;
 		}
 	}
 
@@ -3693,14 +2887,21 @@ private:
 		record.end_ns = TimestampNs();
 		record.wall_ns = DurationNs(record.end_ns, record.start_ns);
 		record.lock_hold_ns += DurationNs(record.end_ns, lock_acquired_ns);
-		runtime_overhead.push_back(record);
+		AddRuntimeOverheadStats(runtime_overhead_stats, record);
+		if (record.event == "periodic_sample") {
+			AddRuntimeOverheadStats(periodic_runtime_overhead_stats, record);
+		}
+		if (settings.export_enabled && settings.debug_export_enabled) {
+			runtime_overhead.push_back(record);
+		}
 	}
 
-	void DecrementActiveQueryCount() {
+	bool DecrementActiveQueryCount() {
 		auto count = active_query_count.load(std::memory_order_relaxed);
 		while (count > 0 && !active_query_count.compare_exchange_weak(count, count - 1, std::memory_order_relaxed,
 		                                                              std::memory_order_relaxed)) {
 		}
+		return count == 1;
 	}
 
 	shared_ptr<PeriodicWorkerSegmentState> GetWorkerSegmentStateLocked(int64_t linux_tid) {
@@ -3780,7 +2981,7 @@ private:
 	}
 
 	PeriodicRuntimeOverheadRecord *DetailOverhead(PeriodicRuntimeOverheadRecord *overhead) const {
-		return settings.overhead_detail_enabled ? overhead : nullptr;
+		return settings.debug_export_enabled ? overhead : nullptr;
 	}
 
 	static uint64_t DetailTimestamp(PeriodicRuntimeOverheadRecord *overhead) {
@@ -3821,32 +3022,13 @@ private:
 		                       std::make_move_iterator(queue_closed_segments.end()));
 	}
 
-	EnergyPerfSnapshot ReadWorkerPerfSnapshotLocked(PeriodicWorkerSegmentState &worker_state,
-	                                                const EnergyAttributionSettings &segment_settings) {
+	EnergyPerfSnapshot ReadWorkerPerfSnapshotLocked(PeriodicWorkerSegmentState &worker_state) {
 		EnergyPerfSnapshot snapshot;
-		if (!segment_settings.perf_counters_enabled) {
-			snapshot.status = "perf disabled";
-			return snapshot;
-		}
-		auto process_counter_mode = segment_settings.attribution_model != "legacy";
-		auto include_kernel = process_counter_mode;
-		auto open_ref_cycles = !process_counter_mode;
-		if (worker_state.perf_open && worker_state.perf_profile == segment_settings.counter_profile &&
-		    worker_state.perf_include_kernel == include_kernel &&
-		    worker_state.perf_open_ref_cycles == open_ref_cycles) {
+		if (worker_state.perf_open) {
 			return worker_state.perf_group.ReadSnapshot();
 		}
-		if (worker_state.perf_open) {
-			worker_state.perf_group.Close();
-			worker_state.perf_open = false;
-		}
-		worker_state.perf_profile = segment_settings.counter_profile;
-		worker_state.perf_include_kernel = include_kernel;
-		worker_state.perf_open_ref_cycles = open_ref_cycles;
-		worker_state.perf_open = worker_state.perf_group.Open(
-		    worker_state.linux_tid, segment_settings.counter_profile, include_kernel, open_ref_cycles);
-		worker_state.perf_status =
-		    worker_state.perf_open ? segment_settings.counter_profile : worker_state.perf_group.ReadSnapshot().status;
+		worker_state.perf_open = worker_state.perf_group.Open(worker_state.linux_tid);
+		worker_state.perf_status = worker_state.perf_open ? "process" : worker_state.perf_group.ReadSnapshot().status;
 		if (!worker_state.perf_open) {
 			snapshot.status = worker_state.perf_status;
 			return snapshot;
@@ -3870,8 +3052,6 @@ private:
 		slice.scale_factor = base.scale_factor;
 		slice.pipeline_id = base.pipeline_id;
 		slice.pipeline_signature_hash = base.pipeline_signature_hash;
-		slice.pipeline_signature = base.pipeline_signature;
-		slice.role = base.role;
 		slice.phase = base.phase;
 		slice.system_category = base.system_category;
 		slice.lifecycle_group_id = base.lifecycle_group_id;
@@ -3912,20 +3092,16 @@ private:
 		if (!worker_state.active || end_ns <= worker_state.last_boundary_ns) {
 			return;
 		}
-		auto query = worker_state.query;
-		const auto &segment_settings = query ? query->settings : settings;
 		PerfCounters counters;
-		if (segment_settings.perf_counters_enabled && worker_state.last_perf.valid) {
+		if (worker_state.last_perf.valid) {
 			auto perf_start_ns = DetailTimestamp(detail_overhead);
-			auto end_perf = ReadWorkerPerfSnapshotLocked(worker_state, segment_settings);
+			auto end_perf = ReadWorkerPerfSnapshotLocked(worker_state);
 			DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::snapshot_perf_read_ns, perf_start_ns);
 			counters = DeltaPerfCounters(worker_state.last_perf, end_perf);
 			worker_state.last_perf = end_perf;
-		} else if (segment_settings.perf_counters_enabled) {
+		} else {
 			counters.status =
 			    worker_state.last_perf.status.empty() ? worker_state.perf_status : worker_state.last_perf.status;
-		} else {
-			counters.status = "perf disabled";
 		}
 
 		auto record_build_start_ns = DetailTimestamp(detail_overhead);
@@ -3986,9 +3162,10 @@ private:
 				continue;
 			}
 			auto pipeline_key = BuildPeriodicPipelineProfileKey(record);
-			AddThroughputObservationToEfficiencyAggregate(scratch_pipeline_profile_updates[pipeline_key], record, true);
+			AddThroughputObservationToEfficiencyAggregate(
+			    scratch_pipeline_profile_updates[pipeline_key], record, true, &pipeline_key);
 			AddThroughputObservationToEfficiencyAggregate(scratch_query_profile_updates[record.query_id], record,
-			                                              false);
+			                                              false, nullptr);
 			if (active_db && record.template_id != 0 && record.scale_factor != 0 && record.pipeline_id != 0 &&
 			    record.pipeline_signature_hash != 0 && record.target_core_frequency_khz != 0 &&
 			    record.target_uncore_frequency_khz != 0 && record.work_units > 0 && record.end_ns > record.start_ns) {
@@ -4007,11 +3184,6 @@ private:
 		DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_local_aggregate_ns,
 		               phase_start_ns);
 		phase_start_ns = DetailTimestamp(detail_overhead);
-		if (settings.closed_segments_export_enabled) {
-			closed_segment_records.reserve(closed_segment_records.size() + records.size());
-			closed_segment_records.insert(closed_segment_records.end(), std::make_move_iterator(records.begin()),
-			                              std::make_move_iterator(records.end()));
-		}
 		DetailAddSince(detail_overhead, &PeriodicRuntimeOverheadRecord::closed_segment_store_ns, phase_start_ns);
 		phase_start_ns = DetailTimestamp(detail_overhead);
 		for (auto entry = scratch_pipeline_profile_updates.begin(); entry != scratch_pipeline_profile_updates.end();
@@ -4074,7 +3246,7 @@ private:
 		InitializeRuntimeOverhead(overhead, "periodic_sample", wall_start_ns);
 		auto now_ns = TimestampNs();
 		shared_ptr<ProcessActivityWindow> process_activity;
-		if (settings.rapl_enabled) {
+		{
 			auto phase_start_ns = TimestampNs();
 			if (process_collector && process_collector->Available()) {
 				scratch_rapl_before.clear();
@@ -4083,10 +3255,16 @@ private:
 				rapl.Read(scratch_rapl_before);
 				auto maximum_skew_ns =
 				    MinValue<uint64_t>(5000000, MaxValue<uint64_t>(100000, period_ms * 100000));
+				auto completion_timeout_ns =
+				    MaxValue<uint64_t>(20000000, MinValue<uint64_t>(50000000, period_ms * 500000));
 				auto boundary_lead_ns =
 				    MinValue<uint64_t>(1000000, MaxValue<uint64_t>(100000, period_ms * 10000));
 				auto transition_ns = TimestampNs() + boundary_lead_ns;
-				auto captured = process_collector->RotateWindow(transition_ns, maximum_skew_ns);
+				auto captured =
+				    process_collector->RotateWindow(transition_ns, maximum_skew_ns, completion_timeout_ns);
+				if (captured.missing_helper_count > 0) {
+					process_checkpoint_timeout_generation_count++;
+				}
 				auto after_ns = TimestampNs();
 				rapl.Read(scratch_rapl_after);
 				auto boundary_ns = captured.transition_ns > before_ns && captured.transition_ns <= after_ns
@@ -4210,37 +3388,6 @@ private:
 		pending_window_count.store(pending_windows.size(), std::memory_order_relaxed);
 	}
 
-	void DrainSegmentsLocked(vector<EnergySegmentRecord> &drained) {
-		for (auto entry = queries.begin(); entry != queries.end(); ++entry) {
-			DrainQuerySegmentsLocked(entry->second, drained);
-		}
-	}
-
-	void DrainQuerySegmentsLocked(const shared_ptr<QueryEnergyState> &query, vector<EnergySegmentRecord> &drained) {
-		if (!query) {
-			return;
-		}
-		vector<EnergySegmentRecord> query_segments;
-		vector<shared_ptr<EnergyThreadSegmentBuffer>> buffers;
-		unordered_map<uint64_t, string> pipeline_signatures;
-		{
-			lock_guard<mutex> query_guard(query->lock);
-			query_segments.insert(query_segments.end(), std::make_move_iterator(query->segments.begin()),
-			                      std::make_move_iterator(query->segments.end()));
-			query->segments.clear();
-			buffers = query->segment_buffers;
-			pipeline_signatures = query->pipeline_signatures;
-		}
-		for (idx_t i = 0; i < buffers.size(); i++) {
-			if (buffers[i]) {
-				buffers[i]->Drain(query_segments);
-			}
-		}
-		FillPipelineSignatures(pipeline_signatures, query_segments, query->settings.pipeline_signatures_enabled);
-		drained.insert(drained.end(), std::make_move_iterator(query_segments.begin()),
-		               std::make_move_iterator(query_segments.end()));
-	}
-
 	void BuildPendingWindowSocketIndexLocked() {
 		for (auto &entry : scratch_pending_windows_by_socket) {
 			entry.second.clear();
@@ -4328,34 +3475,6 @@ private:
 		return added;
 	}
 
-	uint64_t MinOpenSegmentStartNsLocked() {
-		uint64_t result = 0;
-		for (auto entry = queries.begin(); entry != queries.end(); ++entry) {
-			auto query = entry->second;
-			if (!query) {
-				continue;
-			}
-			vector<shared_ptr<EnergyThreadSegmentBuffer>> buffers;
-			{
-				lock_guard<mutex> query_guard(query->lock);
-				buffers = query->segment_buffers;
-			}
-			for (idx_t i = 0; i < buffers.size(); i++) {
-				if (!buffers[i]) {
-					continue;
-				}
-				auto open_start = buffers[i]->OpenSegmentStartNs();
-				if (open_start == 0) {
-					continue;
-				}
-				if (result == 0 || open_start < result) {
-					result = open_start;
-				}
-			}
-		}
-		return result;
-	}
-
 	void FinalizeReadyWindows(bool force, PeriodicRuntimeOverheadRecord *overhead = nullptr) {
 		(void)force;
 		// Periodic sampling creates closed slices for active segments, so old query-buffer open segments do not gate
@@ -4409,37 +3528,9 @@ private:
 			window.status = "ok";
 		}
 		auto phase_start_ns = TimestampNs();
-		auto authoritative_process = settings.attribution_model == "process";
-		auto retain_legacy_shadow = authoritative_process && settings.debug_export_enabled;
-		bool legacy_result_available = false;
-		SocketEnergyWindow legacy_window;
-		if (authoritative_process) {
-			PrepareSegmentsForAttribution(pending.segments);
-			if (retain_legacy_shadow) {
-				scratch_legacy_segments = pending.segments;
-				scratch_attribution_windows.clear();
-				scratch_attribution_windows.push_back(window);
-				AttributeSegments(scratch_legacy_segments, scratch_attribution_windows);
-				legacy_window = scratch_attribution_windows[0];
-				legacy_result_available = true;
-				for (idx_t i = 0; i < pending.segments.size(); i++) {
-					pending.segments[i].legacy_active_energy_j =
-					    scratch_legacy_segments[i].attributed_active_energy_j;
-				}
-				window = legacy_window;
-			}
-		} else {
-			scratch_attribution_windows.clear();
-			scratch_attribution_windows.push_back(window);
-			AttributeSegments(pending.segments, scratch_attribution_windows);
-			window = scratch_attribution_windows[0];
-			for (auto &segment : pending.segments) {
-				segment.legacy_active_energy_j = segment.attributed_active_energy_j;
-			}
-		}
-		window.attribution_model = settings.attribution_model;
+		PrepareSegmentsForAttribution(pending.segments);
 		scratch_process_rows.clear();
-		bool process_profile_valid = !authoritative_process;
+		bool process_profile_valid = false;
 		if (pending.process_activity && process_collector) {
 			auto process_window = window;
 			process_window.process_attributed_active_energy_j = 0;
@@ -4464,83 +3555,33 @@ private:
 			process_window.duckdb_uninstrumented_base_energy_j = 0;
 			process_window.duckdb_hierarchy_error_j = 0;
 			process_window.duckdb_base_hierarchy_error_j = 0;
-			auto process_segments = &pending.segments;
-			if (!authoritative_process) {
-				scratch_process_segments = pending.segments;
-				process_segments = &scratch_process_segments;
-			}
 			auto materialize_process_rows = settings.export_enabled && settings.debug_export_enabled &&
 			                                observed_query_activity.load(std::memory_order_acquire);
 			AttributeSegmentsByProcess(
-			    *process_segments, *pending.process_activity, prepared_socket, process_collector->DuckDBProcessID(),
+			    pending.segments, *pending.process_activity, prepared_socket, process_collector->DuckDBProcessID(),
 			    process_window, scratch_process_rows, materialize_process_rows, scratch_process_thread_shares,
 			    scratch_process_tid_to_thread, scratch_segment_thread_slots, process_energy_profiles);
-			CopyProcessDiagnostics(window, process_window);
+			window = std::move(process_window);
 			process_window_count++;
-			if (process_window.process_attribution_valid) {
+			if (window.process_attribution_valid) {
 				process_valid_window_count++;
-			}
-			total_duckdb_hierarchy_error_j += process_window.duckdb_hierarchy_error_j;
-			total_duckdb_base_hierarchy_error_j += process_window.duckdb_base_hierarchy_error_j;
-			if (!authoritative_process) {
-				for (idx_t i = 0; i < pending.segments.size(); i++) {
-					pending.segments[i].process_active_energy_j = (*process_segments)[i].process_active_energy_j;
-					pending.segments[i].task_clock_coverage = (*process_segments)[i].task_clock_coverage;
-					pending.segments[i].process_attribution_valid =
-					    (*process_segments)[i].process_attribution_valid;
-					pending.segments[i].process_frequency_ratio = (*process_segments)[i].process_frequency_ratio;
-					pending.segments[i].process_corrected_cycles = (*process_segments)[i].process_corrected_cycles;
-					pending.segments[i].process_counter_source = (*process_segments)[i].process_counter_source;
-				}
-			}
-			if (authoritative_process && process_window.process_attribution_valid) {
 				process_profile_valid = true;
 				window.summed_attributed_active_energy_j = window.process_attributed_active_energy_j;
 				window.active_conservation_error_j = window.process_conservation_error_j;
 				window.summed_attributed_base_energy_j = window.process_attributed_base_energy_j;
 				window.base_conservation_error_j = window.process_base_conservation_error_j;
-			} else if (authoritative_process) {
-				if (!legacy_result_available) {
-					scratch_legacy_segments = pending.segments;
-					scratch_attribution_windows.clear();
-					scratch_attribution_windows.push_back(window);
-					scratch_attribution_windows[0].summed_attributed_active_energy_j = 0;
-					scratch_attribution_windows[0].active_conservation_error_j = 0;
-					scratch_attribution_windows[0].summed_attributed_base_energy_j = 0;
-					scratch_attribution_windows[0].base_conservation_error_j = 0;
-					AttributeSegments(scratch_legacy_segments, scratch_attribution_windows);
-					legacy_window = scratch_attribution_windows[0];
-				}
-				for (idx_t i = 0; i < scratch_legacy_segments.size(); i++) {
-					auto &legacy_segment = scratch_legacy_segments[i];
-					const auto &process_segment = pending.segments[i];
-					legacy_segment.legacy_active_energy_j = legacy_segment.attributed_active_energy_j;
-					legacy_segment.process_active_energy_j = process_segment.process_active_energy_j;
-					legacy_segment.task_clock_coverage = process_segment.task_clock_coverage;
-					legacy_segment.process_attribution_valid = process_segment.process_attribution_valid;
-					legacy_segment.process_frequency_ratio = process_segment.process_frequency_ratio;
-					legacy_segment.process_corrected_cycles = process_segment.process_corrected_cycles;
-					legacy_segment.process_counter_source = process_segment.process_counter_source;
-				}
-				pending.segments.swap(scratch_legacy_segments);
-				window = legacy_window;
-				window.attribution_model = settings.attribution_model;
-				CopyProcessDiagnostics(window, process_window);
+			} else {
 				window.status += "|process_window_invalid";
 			}
-		} else if (settings.attribution_model != "legacy") {
-			if (authoritative_process) {
-				scratch_attribution_windows.clear();
-				scratch_attribution_windows.push_back(window);
-				AttributeSegments(pending.segments, scratch_attribution_windows);
-				window = scratch_attribution_windows[0];
-				for (auto &segment : pending.segments) {
-					segment.legacy_active_energy_j = segment.attributed_active_energy_j;
-				}
-				window.attribution_model = settings.attribution_model;
-			}
+			total_duckdb_hierarchy_error_j += window.duckdb_hierarchy_error_j;
+			total_duckdb_base_hierarchy_error_j += window.duckdb_base_hierarchy_error_j;
+		} else {
+			window.process_attribution_valid = false;
 			window.process_status = process_collector_status;
 			window.status += "|process_backend_unavailable";
+			for (auto &segment : pending.segments) {
+				segment.process_attribution_valid = false;
+			}
 		}
 		if (overhead) {
 			overhead->attribute_segments_ns += DurationNs(TimestampNs(), phase_start_ns);
@@ -4558,21 +3599,19 @@ private:
 		phase_start_ns = TimestampNs();
 		if (process_profile_valid) {
 			UpdateProfilesLocked(pending.segments);
-			if (settings.attribution_model == "process") {
-				auto &uninstrumented = system_energy_profiles[EnergySystemCategory::DUCKDB_UNINSTRUMENTED];
-				uninstrumented.category = EnergySystemCategory::DUCKDB_UNINSTRUMENTED;
-				uninstrumented.sample_count++;
-				uninstrumented.duration_s += window.duration_s;
-				uninstrumented.attributed_active_energy_j += window.duckdb_uninstrumented_active_energy_j;
-				uninstrumented.base_time_share_energy_j += window.duckdb_uninstrumented_base_energy_j;
-				auto &sampler = system_energy_profiles[EnergySystemCategory::ENERGY_SAMPLER];
-				sampler.category = EnergySystemCategory::ENERGY_SAMPLER;
-				sampler.sample_count++;
-				sampler.duration_s += static_cast<double>(window.process_checkpoint_duration_ns) /
-				                      static_cast<double>(NSEC_PER_SEC);
-				sampler.attributed_active_energy_j += window.measurement_overhead_active_energy_j;
-				sampler.base_time_share_energy_j += window.measurement_overhead_base_energy_j;
-			}
+			auto &uninstrumented = system_energy_profiles[EnergySystemCategory::DUCKDB_UNINSTRUMENTED];
+			uninstrumented.category = EnergySystemCategory::DUCKDB_UNINSTRUMENTED;
+			uninstrumented.sample_count++;
+			uninstrumented.duration_s += window.duration_s;
+			uninstrumented.attributed_active_energy_j += window.duckdb_uninstrumented_active_energy_j;
+			uninstrumented.base_time_share_energy_j += window.duckdb_uninstrumented_base_energy_j;
+			auto &sampler = system_energy_profiles[EnergySystemCategory::ENERGY_SAMPLER];
+			sampler.category = EnergySystemCategory::ENERGY_SAMPLER;
+			sampler.sample_count++;
+			sampler.duration_s +=
+			    static_cast<double>(window.process_checkpoint_duration_ns) / static_cast<double>(NSEC_PER_SEC);
+			sampler.attributed_active_energy_j += window.measurement_overhead_active_energy_j;
+			sampler.base_time_share_energy_j += window.measurement_overhead_base_energy_j;
 		}
 		if (overhead) {
 			overhead->profile_update_ns += DurationNs(TimestampNs(), phase_start_ns);
@@ -4623,16 +3662,16 @@ private:
 				observation.hardware_state_stable = segment.record.hardware_state_stable;
 				scratch_hardware_energy_observations.push_back(std::move(observation));
 			}
-			AddSegmentToEfficiencyAggregate(query_profiles[segment.record.query_id], segment, false);
+			AddSegmentToEfficiencyAggregate(query_profiles[segment.record.query_id], segment, false, nullptr);
 			if (segment.record.phase == EnergySegmentPhase::EXECUTE ||
 			    segment.record.phase == EnergySegmentPhase::INTERNAL || segment.record.lifecycle_group_id == 0 ||
 			    segment.record.lifecycle_member_pipeline_ids.empty()) {
 				auto pipeline_key = BuildPeriodicPipelineProfileKey(segment.record);
-				AddSegmentToEfficiencyAggregate(pipeline_profiles[pipeline_key], segment, true);
+				AddSegmentToEfficiencyAggregate(pipeline_profiles[pipeline_key], segment, true, &pipeline_key);
 				continue;
 			}
 			auto lifecycle_key = BuildPeriodicLifecycleProfileKey(segment.record);
-			if (!AddLifecycleSegmentToProfile(lifecycle_phase_profiles[lifecycle_key], segment)) {
+			if (!AddLifecycleSegmentToProfile(lifecycle_phase_profiles[lifecycle_key], segment, lifecycle_key)) {
 				continue;
 			}
 			auto member_count = static_cast<double>(segment.record.lifecycle_member_pipeline_ids.size());
@@ -4645,7 +3684,7 @@ private:
 			for (auto member_pipeline_id : segment.record.lifecycle_member_pipeline_ids) {
 				auto member_key = BuildPeriodicPipelineProfileKeyForPipeline(segment.record, member_pipeline_id);
 				AddAllocatedLifecycleEnergy(pipeline_profiles[member_key], segment, member_pipeline_id,
-				                            allocated_active_energy, allocated_base_energy);
+				                            allocated_active_energy, allocated_base_energy, member_key);
 			}
 		}
 	}
@@ -4672,9 +3711,11 @@ private:
 		              "summed_attributed_active_energy_j,active_conservation_error_j,summed_attributed_base_energy_j,"
 		              "base_conservation_error_j,summed_charged_energy_j,package_conservation_error_j,rapl_valid,"
 		              "base_power_valid,used_time_fallback,status,segment_count,total_base_energy_j,busy_wall_time_s,"
-		              "idle_gap_wall_time_s,busy_base_energy_j,idle_gap_base_energy_j,attribution_model,"
+		              "idle_gap_wall_time_s,busy_base_energy_j,idle_gap_base_energy_j,"
 		              "process_generation,process_transition_ns,process_boundary_min_ns,process_boundary_max_ns,"
 		              "process_maximum_checkpoint_delay_ns,process_checkpoint_duration_ns,"
+		              "process_helper_count,process_helper_futex_wake_count,process_acknowledged_helper_count,"
+		              "process_missing_helper_count,process_missing_helper_cpus,process_slowest_helper_cpu,"
 		              "process_activity_map_insert_failure,process_missing_counter,"
 		              "process_invalid_counter_delta,process_interrupt_underflow,"
 		              "process_boundary_split_count,process_boundary_split_cpu_count,"
@@ -4701,9 +3742,9 @@ private:
 		               "corrected_cycles,activity_weight,weight_denominator,attributed_active_energy_j,"
 		               "base_time_weight,base_time_denominator_s,attributed_base_energy_j,charged_total_energy_j,"
 		               "throughput,corrected_cycles_per_work,active_power_w,charged_power_w,task_clock_ns,"
-		               "task_clock_coverage,legacy_active_energy_j,process_active_energy_j,"
+		               "task_clock_coverage,"
 		               "process_attribution_valid,counter_status,attribution_status,"
-		               "process_frequency_ratio,process_corrected_cycles,process_counter_source\n";
+		               "process_counter_source\n";
 		process_out << "window_id,generation,process_start_time_ns,tgid,tid,socket_id,kind,comm,runtime_ns,"
 		               "cycles,ref_cycles,time_enabled_ns,time_running_ns,ref_time_enabled_ns,ref_time_running_ns,"
 		               "pmu_running_ratio,ref_pmu_running_ratio,pmu_valid,"
@@ -4736,10 +3777,13 @@ private:
 		           << "," << w.rapl_valid << "," << w.base_power_valid << "," << w.used_time_fallback << ","
 		           << CsvEscape(w.status) << "," << w.segment_count << "," << w.total_base_energy_j << ","
 		           << w.busy_wall_time_s << "," << w.idle_gap_wall_time_s << "," << w.busy_base_energy_j << ","
-		           << w.idle_gap_base_energy_j << "," << CsvEscape(w.attribution_model) << ","
-		           << w.process_generation << "," << w.process_transition_ns << "," << w.process_boundary_min_ns
+		           << w.idle_gap_base_energy_j << "," << w.process_generation << "," << w.process_transition_ns << ","
+		           << w.process_boundary_min_ns
 		           << "," << w.process_boundary_max_ns << "," << w.process_maximum_checkpoint_delay_ns << ","
-		           << w.process_checkpoint_duration_ns << "," << w.process_activity_map_insert_failure << ","
+		           << w.process_checkpoint_duration_ns << "," << w.process_helper_count << ","
+		           << w.process_helper_futex_wake_count << "," << w.process_acknowledged_helper_count << ","
+		           << w.process_missing_helper_count << "," << CsvEscape(w.process_missing_helper_cpus) << ","
+		           << w.process_slowest_helper_cpu << "," << w.process_activity_map_insert_failure << ","
 		           << w.process_missing_counter << "," << w.process_invalid_counter_delta << ","
 		           << w.process_interrupt_underflow << "," << w.process_boundary_split_count << ","
 		           << w.process_boundary_split_cpu_count << "," << w.process_boundary_split_runtime_ns << ","
@@ -4770,6 +3814,8 @@ private:
 		}
 		for (idx_t i = 0; i < segments.size(); i++) {
 			const auto &s = segments[i];
+			auto pipeline_signature =
+			    PipelineSignatureLocked(s.record.query_id, s.record.pipeline_id, s.record.system_category);
 			auto duration = SegmentDuration(s.record);
 			double charged_total_energy = s.attributed_active_energy_j + s.attributed_base_energy_j;
 			double cycles_per_work =
@@ -4777,7 +3823,7 @@ private:
 			double active_power = duration > 0 ? s.attributed_active_energy_j / duration : 0;
 			double charged_power = duration > 0 ? charged_total_energy / duration : 0;
 			segment_out << s.window_id << "," << s.record.segment_id << "," << s.record.query_id << ","
-			            << s.record.pipeline_id << "," << CsvEscape(s.record.pipeline_signature) << ","
+			            << s.record.pipeline_id << "," << CsvEscape(pipeline_signature) << ","
 			            << EnergySegmentPhaseToString(s.record.phase) << ","
 			            << EnergySystemCategoryToString(s.record.system_category) << ","
 			            << s.record.lifecycle_group_id << ","
@@ -4790,10 +3836,9 @@ private:
 			            << "," << s.base_time_weight << "," << s.base_time_denominator_s << ","
 			            << s.attributed_base_energy_j << "," << charged_total_energy << "," << s.throughput << ","
 			            << cycles_per_work << "," << active_power << "," << charged_power << ","
-			            << s.record.task_clock_ns << "," << s.task_clock_coverage << "," << s.legacy_active_energy_j
-			            << "," << s.process_active_energy_j << "," << s.process_attribution_valid << ","
+			            << s.record.task_clock_ns << "," << s.task_clock_coverage << ","
+			            << s.process_attribution_valid << ","
 			            << CsvEscape(s.record.counter_status) << "," << CsvEscape(s.attribution_status) << ","
-			            << s.process_frequency_ratio << "," << s.process_corrected_cycles << ","
 			            << CsvEscape(s.process_counter_source) << "\n";
 		}
 	}
@@ -4855,6 +3900,14 @@ private:
 		}
 	}
 
+	void WritePipelineMetadataLocked() {
+		std::ofstream out((output_dir + "/period_pipeline_metadata.csv").c_str());
+		out << "query_id,pipeline_id,pipeline_signature\n";
+		for (const auto &entry : pipeline_signatures) {
+			out << entry.first.first << "," << entry.first.second << "," << CsvEscape(entry.second) << "\n";
+		}
+	}
+
 	void WriteFinalOutputs() {
 		std::unique_lock<mutex> guard(lock);
 		if (!settings.export_enabled) {
@@ -4862,7 +3915,7 @@ private:
 		}
 		auto saw_query_activity = observed_query_activity.load(std::memory_order_acquire);
 		auto has_attribution_output = attributed_segment_count > 0 || !pipeline_profiles.empty() ||
-		                              !query_profiles.empty() || !closed_segment_records.empty();
+		                              !query_profiles.empty();
 		if (!saw_query_activity && !has_attribution_output) {
 			return;
 		}
@@ -4894,13 +3947,14 @@ private:
 			          if (lhs.pipeline_id != rhs.pipeline_id) {
 				          return lhs.pipeline_id < rhs.pipeline_id;
 			          }
+			          if (lhs.hardware_mode != rhs.hardware_mode) {
+				          return static_cast<uint8_t>(lhs.hardware_mode) <
+				                 static_cast<uint8_t>(rhs.hardware_mode);
+			          }
 			          if (lhs.core_freq_hz != rhs.core_freq_hz) {
 				          return lhs.core_freq_hz < rhs.core_freq_hz;
 			          }
-			          if (lhs.uncore_freq_hz != rhs.uncore_freq_hz) {
-				          return lhs.uncore_freq_hz < rhs.uncore_freq_hz;
-			          }
-			          return lhs.pipeline_signature < rhs.pipeline_signature;
+			          return lhs.uncore_freq_hz < rhs.uncore_freq_hz;
 		          });
 		vector<PipelineEfficiencyAggregate> query_result;
 		for (auto entry = query_profiles.begin(); entry != query_profiles.end(); ++entry) {
@@ -4930,6 +3984,10 @@ private:
 			          if (lhs.phase != rhs.phase) {
 				          return static_cast<uint8_t>(lhs.phase) < static_cast<uint8_t>(rhs.phase);
 			          }
+			          if (lhs.hardware_mode != rhs.hardware_mode) {
+				          return static_cast<uint8_t>(lhs.hardware_mode) <
+				                 static_cast<uint8_t>(rhs.hardware_mode);
+			          }
 			          if (lhs.core_freq_hz != rhs.core_freq_hz) {
 				          return lhs.core_freq_hz < rhs.core_freq_hz;
 			          }
@@ -4937,35 +3995,15 @@ private:
 		          });
 		WriteEfficiencyProfilesCSV(output_dir + "/period_pipeline_profiles.csv", pipeline_result);
 		WriteEfficiencyProfilesCSV(output_dir + "/period_query_profiles.csv", query_result, true);
+		WritePipelineMetadataLocked();
 		WriteLifecyclePhaseProfilesCSV(output_dir + "/period_lifecycle_phase_profiles.csv", lifecycle_result);
 		WriteLifecycleGroupMembersCSV(output_dir + "/period_lifecycle_group_members.csv", lifecycle_result);
 		WriteSystemEnergyProfilesCSV(output_dir + "/period_system_energy_profiles.csv", system_energy_profiles);
 		WriteProcessEnergyProfilesLocked();
-		if (settings.closed_segments_export_enabled) {
-			WriteClosedSegmentsCSV(output_dir + "/period_closed_segments.csv", closed_segment_records);
+		if (settings.debug_export_enabled) {
+			WriteRuntimeOverheadCSVLocked();
 		}
-		WriteRuntimeOverheadCSVLocked();
 		WritePeriodicValidationSummaryLocked();
-	}
-
-	static void AddRuntimeOverheadStats(PeriodicRuntimeOverheadStats &stats,
-	                                    const PeriodicRuntimeOverheadRecord &record) {
-		stats.count++;
-		stats.total_wall_ns += record.wall_ns;
-		stats.max_wall_ns = MaxValue<uint64_t>(stats.max_wall_ns, record.wall_ns);
-		stats.total_cpu_ns += record.cpu_ns;
-		stats.max_cpu_ns = MaxValue<uint64_t>(stats.max_cpu_ns, record.cpu_ns);
-		stats.total_lock_wait_ns += record.lock_wait_ns;
-		stats.max_lock_wait_ns = MaxValue<uint64_t>(stats.max_lock_wait_ns, record.lock_wait_ns);
-		stats.total_lock_hold_ns += record.lock_hold_ns;
-		stats.max_lock_hold_ns = MaxValue<uint64_t>(stats.max_lock_hold_ns, record.lock_hold_ns);
-		stats.total_attribute_segments_ns += record.attribute_segments_ns;
-		stats.max_attribute_segments_ns =
-		    MaxValue<uint64_t>(stats.max_attribute_segments_ns, record.attribute_segments_ns);
-		stats.total_profile_update_ns += record.profile_update_ns;
-		stats.total_csv_append_ns += record.csv_append_ns;
-		stats.windows_finalized += record.windows_finalized;
-		stats.segments_attributed += record.segments_attributed;
 	}
 
 	void WriteRuntimeOverheadCSVLocked() {
@@ -4999,14 +4037,8 @@ private:
 	}
 
 	void WritePeriodicValidationSummaryLocked() {
-		PeriodicRuntimeOverheadStats all_overhead;
-		PeriodicRuntimeOverheadStats periodic_overhead;
-		for (idx_t i = 0; i < runtime_overhead.size(); i++) {
-			AddRuntimeOverheadStats(all_overhead, runtime_overhead[i]);
-			if (runtime_overhead[i].event == "periodic_sample") {
-				AddRuntimeOverheadStats(periodic_overhead, runtime_overhead[i]);
-			}
-		}
+		const auto &all_overhead = runtime_overhead_stats;
+		const auto &periodic_overhead = periodic_runtime_overhead_stats;
 		auto run_duration_ns = DurationNs(TimestampNs(), run_start_ns);
 		auto avg_wall_ns = all_overhead.count == 0 ? 0 : all_overhead.total_wall_ns / all_overhead.count;
 		auto avg_cpu_ns = all_overhead.count == 0 ? 0 : all_overhead.total_cpu_ns / all_overhead.count;
@@ -5028,6 +4060,7 @@ private:
 		}
 		std::ofstream out((output_dir + "/period_validation_summary.json").c_str());
 		out << "{\n";
+		out << "  \"attribution_schema_version\": 3,\n";
 		out << "  \"window_count\": " << finalized_window_count << ",\n";
 		out << "  \"attributed_segment_count\": " << attributed_segment_count << ",\n";
 		out << "  \"active_conservation_error_j\": " << total_active_conservation_error_j << ",\n";
@@ -5037,12 +4070,22 @@ private:
 		out << "  \"system_attributed_base_energy_j\": " << system_base_energy_j << ",\n";
 		out << "  \"base_power_loaded\": " << (base_power_loaded ? "true" : "false") << ",\n";
 		out << "  \"period_ms\": " << period_ms << ",\n";
-		out << "  \"attribution_model\": \"" << settings.attribution_model << "\",\n";
+		out << "  \"idle_period_ms\": " << settings.idle_period_ms << ",\n";
+		out << "  \"effective_idle_period_ms\": " << effective_idle_period_ms << ",\n";
+		out << "  \"adaptive_sampling_enabled\": " << (adaptive_sampling_enabled ? "true" : "false") << ",\n";
+		out << "  \"active_periodic_sample_count\": " << active_periodic_sample_count << ",\n";
+		out << "  \"idle_periodic_sample_count\": " << idle_periodic_sample_count << ",\n";
+		out << "  \"activity_transition_sample_count\": " << activity_transition_sample_count << ",\n";
+		out << "  \"shutdown_sample_count\": " << shutdown_sample_count << ",\n";
+		out << "  \"max_active_periodic_interval_ns\": " << max_active_periodic_interval_ns << ",\n";
+		out << "  \"max_idle_periodic_interval_ns\": " << max_idle_periodic_interval_ns << ",\n";
 		out << "  \"process_collector_compiled\": "
 		    << (ProcessActivityCollector::IsCompiled() ? "true" : "false") << ",\n";
 		out << "  \"process_collector_status\": \"" << process_collector_status << "\",\n";
 		out << "  \"process_window_count\": " << process_window_count << ",\n";
 		out << "  \"process_valid_window_count\": " << process_valid_window_count << ",\n";
+		out << "  \"process_checkpoint_timeout_generation_count\": "
+		    << process_checkpoint_timeout_generation_count << ",\n";
 		out << "  \"process_valid_window_fraction\": "
 		    << (process_window_count == 0
 		            ? 0
@@ -5052,9 +4095,6 @@ private:
 		out << "  \"duckdb_base_hierarchy_conservation_error_j\": "
 		    << total_duckdb_base_hierarchy_error_j << ",\n";
 		out << "  \"debug_export_enabled\": " << (settings.debug_export_enabled ? "true" : "false") << ",\n";
-		out << "  \"closed_segments_export_enabled\": " << (settings.closed_segments_export_enabled ? "true" : "false")
-		    << ",\n";
-		out << "  \"closed_segment_record_count\": " << closed_segment_records.size() << ",\n";
 		out << "  \"runtime_overhead_event_count\": " << all_overhead.count << ",\n";
 		out << "  \"runtime_overhead_periodic_sample_count\": " << periodic_overhead.count << ",\n";
 		out << "  \"runtime_overhead_total_wall_ns\": " << all_overhead.total_wall_ns << ",\n";
@@ -5102,6 +4142,15 @@ private:
 	std::atomic<uint64_t> runtime_generation {0};
 	EnergyAttributionSettings settings;
 	uint64_t period_ms = 100;
+	uint64_t effective_idle_period_ms = 100;
+	bool adaptive_sampling_enabled = false;
+	uint64_t activity_transition_generation = 0;
+	idx_t active_periodic_sample_count = 0;
+	idx_t idle_periodic_sample_count = 0;
+	idx_t activity_transition_sample_count = 0;
+	idx_t shutdown_sample_count = 0;
+	uint64_t max_active_periodic_interval_ns = 0;
+	uint64_t max_idle_periodic_interval_ns = 0;
 	uint64_t run_start_ns = 0;
 	std::atomic<uint64_t> next_runtime_overhead_id {1};
 	string output_dir;
@@ -5114,6 +4163,7 @@ private:
 	std::map<int, double> uncore_freq_by_socket;
 	std::map<QueryEnergyState *, shared_ptr<QueryEnergyState>> queries;
 	std::map<QueryEnergyState *, bool> query_active;
+	std::map<std::pair<uint64_t, uint64_t>, string> pipeline_signatures;
 	std::map<std::pair<DatabaseInstance *, uint64_t>, SchedulerWorkerRegistration> worker_registry;
 	std::unordered_map<int64_t, shared_ptr<PeriodicWorkerSegmentState>> worker_segment_states;
 	mutex active_worker_lock;
@@ -5127,9 +4177,6 @@ private:
 	vector<EnergySegmentRecord> scratch_queue_segments;
 	vector<EnergySegmentRecord> scratch_queue_closed_segments;
 	vector<AttributedProcessActivity> scratch_process_rows;
-	vector<AttributedSegment> scratch_process_segments;
-	vector<AttributedSegment> scratch_legacy_segments;
-	vector<SocketEnergyWindow> scratch_attribution_windows;
 	vector<PendingHardwareEnergyObservation> scratch_hardware_energy_observations;
 	PreparedProcessActivity scratch_prepared_process_activity;
 	vector<DuckDBThreadShare> scratch_process_thread_shares;
@@ -5147,7 +4194,6 @@ private:
 	std::atomic<idx_t> pending_window_count {0};
 	vector<EnergySegmentRecord> pending_segment_records;
 	vector<EnergySegmentRecord> scratch_remaining_segment_records;
-	vector<EnergySegmentRecord> closed_segment_records;
 	std::unordered_map<PeriodicPipelineProfileKey, PipelineEfficiencyAggregate, PeriodicPipelineProfileKeyHash>
 	    pipeline_profiles;
 	std::unordered_map<PeriodicLifecycleProfileKey, LifecyclePhaseProfileAggregate, PeriodicLifecycleProfileKeyHash>
@@ -5156,8 +4202,10 @@ private:
 	std::map<EnergySystemCategory, SystemEnergyAggregate> system_energy_profiles;
 	ProcessEnergyProfileMap process_energy_profiles;
 	unique_ptr<ProcessActivityCollector> process_collector;
-	string process_collector_status = "legacy";
+	string process_collector_status = "not_started";
 	vector<PeriodicRuntimeOverheadRecord> runtime_overhead;
+	PeriodicRuntimeOverheadStats runtime_overhead_stats;
+	PeriodicRuntimeOverheadStats periodic_runtime_overhead_stats;
 	std::ofstream window_out;
 	std::ofstream segment_out;
 	std::ofstream process_out;
@@ -5165,6 +4213,7 @@ private:
 	idx_t attributed_segment_count = 0;
 	idx_t process_window_count = 0;
 	idx_t process_valid_window_count = 0;
+	idx_t process_checkpoint_timeout_generation_count = 0;
 	double total_active_conservation_error_j = 0;
 	double total_base_conservation_error_j = 0;
 	double total_package_gap_j = 0;
@@ -5173,28 +4222,6 @@ private:
 };
 
 } // namespace
-
-const char *EnergySegmentRoleToString(EnergySegmentRole role) {
-	switch (role) {
-	case EnergySegmentRole::ASSIGNED_MANDATORY:
-		return "ASSIGNED_MANDATORY";
-	case EnergySegmentRole::ASSIGNED_OPTIONAL:
-		return "ASSIGNED_OPTIONAL";
-	case EnergySegmentRole::SAME_QUERY_SUCCESSOR:
-		return "SAME_QUERY_SUCCESSOR";
-	case EnergySegmentRole::FALLBACK_SIBLING:
-		return "FALLBACK_SIBLING";
-	case EnergySegmentRole::FALLBACK_SOCKET:
-		return "FALLBACK_SOCKET";
-	case EnergySegmentRole::FALLBACK_GLOBAL:
-		return "FALLBACK_GLOBAL";
-	case EnergySegmentRole::EXPLORATION_PROBE:
-		return "EXPLORATION_PROBE";
-	case EnergySegmentRole::UNKNOWN:
-	default:
-		return "UNKNOWN";
-	}
-}
 
 const char *EnergySegmentPhaseToString(EnergySegmentPhase phase) {
 	switch (phase) {
@@ -5262,13 +4289,7 @@ bool EnergyAttributionManager::Enabled(const ClientContext &context) {
 }
 
 bool EnergyAttributionManager::LifecyclePhasesEnabled(const ClientContext &context) {
-	const auto &local_settings = ClientConfig::GetConfig(context).energy_attribution;
-	if (local_settings.enabled) {
-		return local_settings.lifecycle_phases_enabled;
-	}
-	EnergyAttributionSettings settings;
-	return TryGetDatabaseEnergySettings(DatabaseInstance::GetDatabase(context), settings) &&
-	       settings.lifecycle_phases_enabled;
+	return EnergyAttributionManager::Enabled(context);
 }
 
 uint64_t EnergyAttributionManager::GetPipelineAttributionId(Pipeline &pipeline) {
@@ -5322,25 +4343,13 @@ void EnergyAttributionManager::BeginQuery(ClientContext &context, uint64_t query
 		state->template_id = request_metadata.template_id;
 		state->scale_factor = request_metadata.scale_factor;
 	}
-	state->query = query;
 	state->start_ns = TimestampNs();
-	if (state->settings.metadata_cache_enabled) {
-		state->uncore_freq_by_socket = BuildQueryUncoreFrequencyCache(true);
-	}
-	if (state->settings.rapl_enabled && !state->settings.periodic_enabled) {
-		state->rapl_available = state->rapl.HasDomains();
-		state->rapl_start = state->rapl.Read();
-		state->base_power_loaded = LoadBasePowerCSVCached(state->settings.base_power_path, state->base_power_entries);
-	}
-	auto base_dir = state->settings.output_dir.empty() ? string(DEFAULT_OUTPUT_DIR) : state->settings.output_dir;
-	state->output_dir = base_dir + "/" + StringUtil::Format("query_%llu_%llu", query_id, state->start_ns);
+	state->uncore_freq_by_socket = BuildQueryUncoreFrequencyCache(true);
 	{
 		lock_guard<mutex> guard(g_query_lock);
 		g_queries[&context] = state;
 	}
-	if (state->settings.periodic_enabled) {
-		PeriodicEnergyRuntime::Get().RegisterQuery(state);
-	}
+	PeriodicEnergyRuntime::Get().RegisterQuery(state);
 }
 
 void EnergyAttributionManager::EndQuery(ClientContext &context) {
@@ -5354,10 +4363,8 @@ void EnergyAttributionManager::EndQuery(ClientContext &context) {
 		state = entry->second;
 		g_queries.erase(entry);
 	}
-	if (state && state->settings.periodic_enabled) {
+	if (state) {
 		PeriodicEnergyRuntime::Get().MarkQueryEnded(state);
-	} else if (state) {
-		FinalizeAndWrite(*state);
 	}
 }
 
@@ -5380,9 +4387,7 @@ void EnergyAttributionManager::AttachPipeline(ClientContext &context, Pipeline &
 	}
 	auto pipeline_id =
 	    profiler_pipeline_id ? profiler_pipeline_id : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&pipeline));
-	if (query->settings.pipeline_signatures_enabled) {
-		RegisterPipelineSignature(*query, pipeline_id, pipeline.ToString());
-	}
+	PeriodicEnergyRuntime::Get().RegisterPipelineMetadata(query->query_id, pipeline_id, pipeline.ToString());
 	pipeline.SetEnergyAttributionPipeline(query, pipeline_id);
 }
 
@@ -5393,21 +4398,19 @@ static const vector<uint64_t> &EmptyLifecycleMemberPipelineIds() {
 
 EnergySystemSegmentScope::EnergySystemSegmentScope(DatabaseInstance &db, EnergySystemCategory category) {
 	EnergyAttributionSettings settings;
-	if (category == EnergySystemCategory::NONE || !TryGetDatabaseEnergySettings(db, settings) ||
-	    !settings.periodic_enabled) {
+	if (category == EnergySystemCategory::NONE || !TryGetDatabaseEnergySettings(db, settings)) {
 		return;
 	}
 	auto &thread_state = g_thread_energy_state;
-	thread_state.InitializeHardware(settings);
+	thread_state.InitializeHardware();
 	auto tid = thread_state.GetTID();
 	record.segment_id = g_system_segment_id.fetch_add(1, std::memory_order_relaxed);
 	record.worker_id = static_cast<uint64_t>(tid);
 	record.linux_tid = tid;
 	record.system_category = category;
-	record.pipeline_signature = EnergySystemCategoryToString(category);
 	record.start_ns = TimestampNs();
 	record.logical_cpu_id = CurrentCPU();
-	auto topology = LookupCpuTopology(record.logical_cpu_id, settings.metadata_cache_enabled);
+	auto topology = LookupCpuTopology(record.logical_cpu_id, true);
 	record.socket_id = topology.socket_id;
 	record.physical_core_id = topology.physical_core_id;
 	record.core_freq_hz = topology.core_freq_hz;
@@ -5456,7 +4459,7 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase ph
 	auto query = query_ref.get();
 	query_state = query;
 	auto &thread_state = g_thread_energy_state;
-	thread_state.InitializeHardware(query->settings);
+	thread_state.InitializeHardware();
 	auto tid = thread_state.GetTID();
 	record = EnergySegmentRecord();
 	record.segment_id = thread_state.NextSegmentId(*query);
@@ -5464,12 +4467,10 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase ph
 	record.template_id = query->template_id;
 	record.scale_factor = query->scale_factor;
 	record.pipeline_id = EnergyAttributionManager::GetPipelineAttributionId(pipeline);
-	record.pipeline_signature = LookupPipelineSignature(*query, record.pipeline_id);
 	PipelineWorkSnapshot work_snapshot;
 	if (pipeline.GetWorkSnapshot(work_snapshot) && work_snapshot.profile_identity.valid) {
 		record.pipeline_signature_hash = work_snapshot.profile_identity.pipeline_signature_hash;
 	}
-	record.role = EnergySegmentRole::UNKNOWN;
 	record.phase = phase;
 	record.owner_pipeline_id = record.pipeline_id;
 	record.lifecycle_group_id = lifecycle_group_id;
@@ -5478,14 +4479,14 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase ph
 	record.worker_id = static_cast<uint64_t>(tid);
 	record.linux_tid = tid;
 	record.start_ns = TimestampNs();
-	if (query->settings.metadata_cache_enabled && thread_state.pinned) {
+	if (thread_state.pinned) {
 		record.logical_cpu_id = thread_state.pinned_cpu;
 		record.socket_id = thread_state.pinned_socket_id;
 		record.physical_core_id = thread_state.pinned_physical_core_id;
 		record.core_freq_hz = thread_state.pinned_core_freq_hz;
 	} else {
 		record.logical_cpu_id = start_cpu_hint >= 0 ? start_cpu_hint : CurrentCPU();
-		auto topology = LookupCpuTopology(record.logical_cpu_id, query->settings.metadata_cache_enabled);
+		auto topology = LookupCpuTopology(record.logical_cpu_id, true);
 		record.socket_id = topology.socket_id;
 		record.physical_core_id = topology.physical_core_id;
 		record.core_freq_hz = topology.core_freq_hz;
@@ -5499,21 +4500,7 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase ph
 		record.target_core_frequency_khz = target.core_frequency_khz;
 		record.target_uncore_frequency_khz = target.uncore_frequency_khz;
 	}
-	if (query->settings.periodic_enabled) {
-		active = PeriodicEnergyRuntime::Get().BeginSegment(query_ref, record);
-		return;
-	}
-	segment_buffer = GetThreadSegmentBuffer(*query, tid);
-	if (segment_buffer) {
-		static_cast<EnergyThreadSegmentBuffer *>(segment_buffer)->MarkSegmentOpen(record.start_ns);
-	}
-	if (query->settings.perf_counters_enabled) {
-		start_perf = thread_state.ReadPerfSnapshot(record.linux_tid, query->settings);
-		perf_started = start_perf.valid;
-	} else {
-		start_perf.status = "perf disabled";
-	}
-	active = true;
+	active = PeriodicEnergyRuntime::Get().BeginSegment(query_ref, record);
 }
 
 EnergySegmentScope::~EnergySegmentScope() {
@@ -5522,43 +4509,19 @@ EnergySegmentScope::~EnergySegmentScope() {
 	}
 	finished = true;
 	auto query = static_cast<QueryEnergyState *>(query_state);
-	auto buffer = static_cast<EnergyThreadSegmentBuffer *>(segment_buffer);
-	bool periodic = query && query->settings.periodic_enabled;
-	PerfCounters counters;
-	if (!periodic && query && query->settings.perf_counters_enabled) {
-		if (perf_started) {
-			auto end_perf = g_thread_energy_state.ReadPerfSnapshot(record.linux_tid, query->settings);
-			counters = DeltaPerfCounters(start_perf, end_perf);
-		} else {
-			counters.status = start_perf.status.empty() ? "perf unavailable" : start_perf.status;
-		}
-	} else if (!periodic) {
-		counters.status = "perf disabled";
-	}
 	record.end_ns = TimestampNs();
-	bool end_metadata_set = false;
-	if (query && !query->settings.migration_check_enabled && g_thread_energy_state.pinned) {
-		record.end_logical_cpu_id = record.logical_cpu_id;
-		record.end_socket_id = record.socket_id;
-		record.end_physical_core_id = record.physical_core_id;
-		end_metadata_set = true;
+	record.end_logical_cpu_id = end_cpu_hint >= 0 ? end_cpu_hint : CurrentCPU();
+	if (query && g_thread_energy_state.pinned && record.end_logical_cpu_id == g_thread_energy_state.pinned_cpu) {
+		record.end_socket_id = g_thread_energy_state.pinned_socket_id;
+		record.end_physical_core_id = g_thread_energy_state.pinned_physical_core_id;
+	} else if (query) {
+		auto topology = LookupCpuTopology(record.end_logical_cpu_id, true);
+		record.end_socket_id = topology.socket_id;
+		record.end_physical_core_id = topology.physical_core_id;
 	} else {
-		record.end_logical_cpu_id = end_cpu_hint >= 0 ? end_cpu_hint : CurrentCPU();
-	}
-	if (!end_metadata_set) {
-		if (query && query->settings.migration_check_enabled && query->settings.metadata_cache_enabled &&
-		    g_thread_energy_state.pinned && record.end_logical_cpu_id == g_thread_energy_state.pinned_cpu) {
-			record.end_socket_id = g_thread_energy_state.pinned_socket_id;
-			record.end_physical_core_id = g_thread_energy_state.pinned_physical_core_id;
-		} else if (query) {
-			auto topology = LookupCpuTopology(record.end_logical_cpu_id, query->settings.metadata_cache_enabled);
-			record.end_socket_id = topology.socket_id;
-			record.end_physical_core_id = topology.physical_core_id;
-		} else {
-			auto topology = LookupCpuTopology(record.end_logical_cpu_id, false);
-			record.end_socket_id = topology.socket_id;
-			record.end_physical_core_id = topology.physical_core_id;
-		}
+		auto topology = LookupCpuTopology(record.end_logical_cpu_id, false);
+		record.end_socket_id = topology.socket_id;
+		record.end_physical_core_id = topology.physical_core_id;
 	}
 	record.duration_s = record.end_ns > record.start_ns
 	                        ? static_cast<double>(record.end_ns - record.start_ns) / static_cast<double>(NSEC_PER_SEC)
@@ -5576,18 +4539,7 @@ EnergySegmentScope::~EnergySegmentScope() {
 		record.hardware_state_stable = end_target.core_frequency_khz == record.target_core_frequency_khz &&
 		                               end_target.uncore_frequency_khz == record.target_uncore_frequency_khz;
 	}
-	if (periodic) {
-		PeriodicEnergyRuntime::Get().EndSegment(record);
-	} else {
-		ApplyPerfCounters(record, counters);
-		if (buffer) {
-			buffer->Append(std::move(record));
-			buffer->MarkSegmentClosed();
-		} else if (query) {
-			lock_guard<mutex> guard(query->lock);
-			query->segments.push_back(std::move(record));
-		}
-	}
+	PeriodicEnergyRuntime::Get().EndSegment(record);
 	active = false;
 }
 

@@ -151,6 +151,27 @@ TEST_CASE("SLA model accepts an explicit non-linear aggregate service curve", "[
 	REQUIRE(incomplete.error == "active pipeline event has an incomplete worker service-rate curve");
 }
 
+TEST_CASE("SLA model rejects a missing downstream suffix", "[api][sla][model]") {
+	auto input = BaseModelInput();
+	input.suffix = DownstreamSuffixEstimate();
+	auto model = BuildQuerySLAModel(input);
+	REQUIRE_FALSE(model.valid);
+	REQUIRE(model.error == "active data pipeline has no trained downstream-suffix histogram");
+	REQUIRE(model.mandatory_gain.empty());
+	REQUIRE(model.optional_gain.empty());
+}
+
+TEST_CASE("SLA allocator ignores malformed empty gain vectors", "[api][sla][model]") {
+	QuerySLAModel malformed;
+	malformed.valid = true;
+	malformed.demand_cap = 1;
+	auto allocation = AllocateQuerySLAWorkers({malformed}, 1, false);
+	REQUIRE(allocation.tokens.empty());
+	REQUIRE(allocation.mandatory == vector<idx_t> {0});
+	REQUIRE(allocation.optional == vector<idx_t> {0});
+	REQUIRE(allocation.unassigned_workers == 1);
+}
+
 TEST_CASE("SLA allocator separates mandatory optional and residual capacity", "[api][sla][model]") {
 	vector<QuerySLAModel> models;
 	models.push_back(AllocationModel(10, {9, 2, -1}, {4, 1, 1}));

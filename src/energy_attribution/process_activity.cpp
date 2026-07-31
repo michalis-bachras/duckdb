@@ -166,19 +166,41 @@ public:
 			                              std::strerror(errno)));
 		}
 		available = true;
-		auto initial = RotateWindow(MonotonicNs() + 1000000, 5000000);
-		if (!initial.valid && required_mode) {
-			return Fail("could not establish initial process-attribution generation: " + initial.status);
+		auto initial = RotateWindow(MonotonicNs() + 1000000, 5000000, 50000000);
+		if ((!initial.valid || initial.missing_helper_count > 0) && required_mode) {
+			auto initial_status = initial.status;
+			if (initial.missing_helper_count > 0) {
+				initial_status = StringUtil::Format("checkpoint_timeout:%llu/%llu",
+				                                        static_cast<unsigned long long>(initial.acknowledged_helper_count),
+				                                        static_cast<unsigned long long>(initial.helper_count));
+			}
+			return Fail("could not establish initial process-attribution generation: " + initial_status);
 		}
 		return true;
 	}
 
-	ProcessActivityWindow RotateWindow(uint64_t requested_boundary_ns, uint64_t maximum_skew_ns) override {
+	ProcessActivityWindow RotateWindow(uint64_t requested_boundary_ns, uint64_t maximum_skew_ns,
+	                                   uint64_t completion_timeout_ns) override {
 		ProcessActivityWindow result;
 		result.generation = generation;
 		result.requested_boundary_ns = requested_boundary_ns;
 		result.transition_ns = requested_boundary_ns;
 		result.socket_topology = socket_topology;
+		result.socket_checkpoints.reserve(socket_topology.size());
+		for (const auto &topology : socket_topology) {
+			ProcessActivitySocketCheckpoint checkpoint;
+			checkpoint.socket_id = topology.socket_id;
+			checkpoint.helper_count = topology.monitored_cpu_count;
+			checkpoint.boundary_min_ns = std::numeric_limits<uint64_t>::max();
+			result.socket_checkpoints.push_back(std::move(checkpoint));
+		}
+		auto find_socket_checkpoint = [&](int socket_id) -> ProcessActivitySocketCheckpoint * {
+			auto entry = std::find_if(result.socket_checkpoints.begin(), result.socket_checkpoints.end(),
+			                          [&](const ProcessActivitySocketCheckpoint &checkpoint) {
+				                          return checkpoint.socket_id == socket_id;
+			                          });
+			return entry == result.socket_checkpoints.end() ? nullptr : &*entry;
+		};
 		if (!available && generation == 1) {
 			result.status = last_error.empty() ? "collector_not_available" : last_error;
 			return result;
@@ -203,8 +225,9 @@ public:
 		}
 		AtomicStore(&helper_ack_count, 0);
 		auto requested_helper_generation = AtomicIncrement(&helper_generation);
-		FutexWake(&helper_generation, INT_MAX);
-		auto hard_timeout_ns = std::max<uint64_t>(20000000, maximum_skew_ns * 4);
+		result.helper_count = helper_threads.size();
+		result.helper_futex_wake_count = FutexWake(&helper_generation, INT_MAX);
+		auto hard_timeout_ns = std::max(completion_timeout_ns, maximum_skew_ns);
 		auto deadline_ns = MonotonicNs() + hard_timeout_ns;
 		while (AtomicLoad(&helper_ack_count) < helper_threads.size() &&
 		       !stop_helpers.load(std::memory_order_acquire)) {
@@ -223,28 +246,63 @@ public:
 		result.boundary_min_ns = std::numeric_limits<uint64_t>::max();
 		result.boundary_max_ns = 0;
 		for (idx_t i = 0; i < helper_threads.size(); i++) {
+			auto socket_id = i < cpu_socket_ids.size() ? static_cast<int>(cpu_socket_ids[i]) : -1;
+			auto socket_checkpoint = find_socket_checkpoint(socket_id);
 			if (helper_checkpoints[i].generation.load(std::memory_order_acquire) !=
 			    requested_helper_generation) {
+				result.missing_helper_count++;
+				if (!result.missing_helper_cpus.empty()) {
+					result.missing_helper_cpus += ";";
+				}
+				result.missing_helper_cpus += std::to_string(i);
+				if (socket_checkpoint) {
+					socket_checkpoint->missing_helper_count++;
+					if (!socket_checkpoint->missing_helper_cpus.empty()) {
+						socket_checkpoint->missing_helper_cpus += ";";
+					}
+					socket_checkpoint->missing_helper_cpus += std::to_string(i);
+				}
 				continue;
 			}
 			auto boundary_ns = helper_checkpoints[i].boundary_ns.load(std::memory_order_relaxed);
 			result.boundary_min_ns = std::min(result.boundary_min_ns, boundary_ns);
-			result.boundary_max_ns = std::max(result.boundary_max_ns, boundary_ns);
+			if (boundary_ns >= result.boundary_max_ns) {
+				result.boundary_max_ns = boundary_ns;
+				result.slowest_helper_cpu = static_cast<int32_t>(i);
+			}
 			if (boundary_ns > requested_boundary_ns + maximum_skew_ns) {
 				result.late_helper_count++;
 			}
+			if (socket_checkpoint) {
+				socket_checkpoint->acknowledged_helper_count++;
+				socket_checkpoint->boundary_min_ns = std::min(socket_checkpoint->boundary_min_ns, boundary_ns);
+				if (boundary_ns >= socket_checkpoint->boundary_max_ns) {
+					socket_checkpoint->boundary_max_ns = boundary_ns;
+					socket_checkpoint->slowest_helper_cpu = static_cast<int32_t>(i);
+				}
+				if (boundary_ns > requested_boundary_ns + maximum_skew_ns) {
+					socket_checkpoint->late_helper_count++;
+				}
+			}
 			acknowledged++;
+		}
+		result.acknowledged_helper_count = acknowledged;
+		for (auto &socket_checkpoint : result.socket_checkpoints) {
+			if (socket_checkpoint.boundary_min_ns == std::numeric_limits<uint64_t>::max()) {
+				socket_checkpoint.boundary_min_ns = 0;
+			}
+			if (socket_checkpoint.boundary_max_ns > requested_boundary_ns) {
+				socket_checkpoint.maximum_checkpoint_delay_ns =
+				    socket_checkpoint.boundary_max_ns - requested_boundary_ns;
+			}
+			socket_checkpoint.valid = socket_checkpoint.helper_count > 0 &&
+			                          socket_checkpoint.acknowledged_helper_count == socket_checkpoint.helper_count;
 		}
 		if (result.boundary_min_ns == std::numeric_limits<uint64_t>::max()) {
 			result.boundary_min_ns = 0;
 		}
 		if (result.boundary_max_ns > requested_boundary_ns) {
 			result.maximum_checkpoint_delay_ns = result.boundary_max_ns - requested_boundary_ns;
-		}
-		if (acknowledged != helper_threads.size()) {
-			result.status = StringUtil::Format("checkpoint_timeout:%llu/%llu",
-			                                  static_cast<unsigned long long>(acknowledged),
-			                                  static_cast<unsigned long long>(helper_threads.size()));
 		}
 		DrainGeneration(completed_generation, result);
 		ReadDiagnostics(result);

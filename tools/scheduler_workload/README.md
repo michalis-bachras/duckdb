@@ -131,7 +131,9 @@ sudo scheduler_workload run \
   --output-dir results/sla_energy_evaluation
 ```
 
-Periodic RAPL attribution is enabled explicitly with `--energy-attribution on`, independently of the selected scheduler. Before exporting a snapshot, the driver synchronously stops attribution and flushes the final partial window. Aggregate attribution output is written below `OUTPUT_DIR/energy_attribution`; disable only the files, not profile updates, with `--energy-attribution-export off`. Use `--energy-attribution-debug-export on` only for attribution diagnosis; it additionally exports per-socket windows and attributed segments.
+Periodic RAPL attribution is enabled explicitly with `--energy-attribution on`, independently of the selected scheduler. Before exporting a snapshot, the driver synchronously stops attribution and flushes the final partial window. Attribution updates the in-memory scheduler profile store even when CSV export is disabled. Use `--energy-attribution-export on` to materialize aggregate files below `OUTPUT_DIR/energy_attribution`. Use `--energy-attribution-debug-export on` together with aggregate export only for attribution diagnosis; it additionally exports per-socket windows, attributed segments, process activity, and individual runtime-overhead samples.
+
+Default and pure-SLA runs aggregate pipeline energy by logical `(query_id, pipeline_id)` identity. SLA-energy runs create hardware-specific aggregate rows only when a segment carries a stable explicit core/uncore target; those rows use the controlled target rather than sampled per-CPU frequency. Pipeline signatures are exported once in `period_pipeline_metadata.csv` instead of being repeated in every aggregate row. Query aggregates are always logical.
 
 For a fair energy baseline, run the identical schedule and profile snapshot with `--scheduler sla`, the same `--energy-power-model`, and `--energy-attribution on`. The driver pins the common worker pool whenever attribution is enabled, so DEFAULT, STRIDE, SLA, and SLA-energy measurements use stable worker-to-hardware topology. Only SLA-energy enables direct frequency control; the other policies leave frequency selection to the configured OS governor.
 
@@ -163,9 +165,9 @@ The OS-frequency statement applies to the `default`, `stride`, and pure `sla` co
 Use `--pin-threads auto|on|off` to control policy-neutral worker pinning. Energy attribution and SLA-energy promote
 `auto` to `on` and reject an explicit `off`. To measure total process-attribution overhead, replay the same schedule
 under DEFAULT twice with `--pin-threads on`: once with `--energy-attribution off`, and once with
-`--energy-attribution on --energy-attribution-model process --energy-process-required on`. Keep debug export disabled
-for both measured runs. This two-arm comparison holds scheduler policy and worker topology fixed while measuring the
-complete process-attribution mechanism.
+`--energy-attribution on`. Keep debug export disabled for both measured runs. Enabling attribution selects the
+authoritative process-hierarchical model and requires its collector to start successfully. This two-arm comparison
+holds scheduler policy and worker topology fixed while measuring the complete process-attribution mechanism.
 
 ## Event-Driven Execution
 

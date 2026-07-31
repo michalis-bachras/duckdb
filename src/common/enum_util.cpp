@@ -1594,30 +1594,6 @@ DistinctType EnumUtil::FromString<DistinctType>(const char *value) {
 	return static_cast<DistinctType>(StringUtil::StringToEnum(GetDistinctTypeValues(), 2, "DistinctType", value));
 }
 
-const StringUtil::EnumStringLiteral *GetEnergySegmentRoleValues() {
-	static constexpr StringUtil::EnumStringLiteral values[] {
-		{ static_cast<uint32_t>(EnergySegmentRole::ASSIGNED_MANDATORY), "ASSIGNED_MANDATORY" },
-		{ static_cast<uint32_t>(EnergySegmentRole::ASSIGNED_OPTIONAL), "ASSIGNED_OPTIONAL" },
-		{ static_cast<uint32_t>(EnergySegmentRole::SAME_QUERY_SUCCESSOR), "SAME_QUERY_SUCCESSOR" },
-		{ static_cast<uint32_t>(EnergySegmentRole::FALLBACK_SIBLING), "FALLBACK_SIBLING" },
-		{ static_cast<uint32_t>(EnergySegmentRole::FALLBACK_SOCKET), "FALLBACK_SOCKET" },
-		{ static_cast<uint32_t>(EnergySegmentRole::FALLBACK_GLOBAL), "FALLBACK_GLOBAL" },
-		{ static_cast<uint32_t>(EnergySegmentRole::EXPLORATION_PROBE), "EXPLORATION_PROBE" },
-		{ static_cast<uint32_t>(EnergySegmentRole::UNKNOWN), "UNKNOWN" }
-	};
-	return values;
-}
-
-template<>
-const char* EnumUtil::ToChars<EnergySegmentRole>(EnergySegmentRole value) {
-	return StringUtil::EnumToString(GetEnergySegmentRoleValues(), 8, "EnergySegmentRole", static_cast<uint32_t>(value));
-}
-
-template<>
-EnergySegmentRole EnumUtil::FromString<EnergySegmentRole>(const char *value) {
-	return static_cast<EnergySegmentRole>(StringUtil::StringToEnum(GetEnergySegmentRoleValues(), 8, "EnergySegmentRole", value));
-}
-
 const StringUtil::EnumStringLiteral *GetErrorTypeValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(ErrorType::UNSIGNED_EXTENSION), "UNSIGNED_EXTENSION" },
@@ -5738,4 +5714,3 @@ WindowMergeSortStage EnumUtil::FromString<WindowMergeSortStage>(const char *valu
 }
 
 }
-

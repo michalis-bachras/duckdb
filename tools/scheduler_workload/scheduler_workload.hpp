@@ -70,14 +70,13 @@ struct WorkloadConfig {
 	bool sla_residual_workers_enabled = false;
 	uint64_t sla_energy_exploration_seed = 1;
 	idx_t energy_attribution_period_ms = 100;
+	idx_t energy_attribution_idle_period_ms = 0;
 	string energy_power_model_path;
-	string energy_attribution_model = "legacy";
 	bool sla_energy_exploration = false;
 	bool sla_energy_hardware_control = true;
 	bool energy_attribution_enabled = false;
-	bool energy_attribution_export = true;
+	bool energy_attribution_export = false;
 	bool energy_attribution_debug_export = false;
-	bool energy_process_required = false;
 	bool fail_on_invalid = true;
 };
 

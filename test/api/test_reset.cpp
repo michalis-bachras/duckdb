@@ -121,16 +121,11 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"wal_autocheckpoint", {"4.0 GiB"}},
 	    {"force_bitpacking_mode", {"constant"}},
 	    {"energy_attribution_base_power_path", {"/tmp/base_power.csv"}},
-	    {"energy_attribution_counter_profile", {"minimal"}},
-	    {"energy_attribution_fail_policy", {"silent"}},
+	    {"energy_attribution_debug_export_enable", {true}},
 	    {"energy_attribution_output_dir", {"/tmp/energy_attribution"}},
-	    {"energy_attribution_export_enable", {false}},
-	    {"energy_attribution_metadata_cache_enable", {false}},
-	    {"energy_attribution_migration_check_enable", {false}},
-	    {"energy_attribution_perf_counters_enable", {false}},
-	    {"energy_attribution_pipeline_signatures_enable", {false}},
-	    {"energy_attribution_profile_update_enable", {false}},
-	    {"energy_attribution_rapl_enable", {false}},
+	    {"energy_attribution_export_enable", {true}},
+	    {"energy_attribution_period_ms", {Value::BIGINT(50)}},
+	    {"energy_attribution_idle_period_ms", {Value::BIGINT(500)}},
 	    {"query_sla_energy_exploration_enable", {true}},
 	    {"query_sla_energy_exploration_seed", {Value::UBIGINT(17)}},
 	    {"query_sla_energy_hardware_control_enable", {false}},
@@ -209,6 +204,7 @@ bool OptionIsExcludedFromTest(const string &name) {
 	    "index_scan_percentage",
 	    "scheduler_policy", // requires coordinated worker-only and external-thread configuration
 	    "scheduler_process_partial",
+	    "energy_attribution_enable", // requires the privileged process-attribution backend
 	    "http_logging_output",
 	    "enable_profiling",
 	    "enable_progress_bar",
@@ -323,4 +319,26 @@ TEST_CASE("Test RESET statement for ClientConfig options", "[api]") {
 			REQUIRE_VALUE_EQUAL(option.name, reset_value, original_value);
 		}
 	}
+}
+
+TEST_CASE("Test adaptive energy attribution period settings", "[api][energy-attribution]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto get_setting = [&](const string &name) {
+		return con.Query(StringUtil::Format("SELECT current_setting('%s')", name))->GetValue(0, 0);
+	};
+
+	REQUIRE(get_setting("energy_attribution_period_ms") == Value::BIGINT(100));
+	REQUIRE(get_setting("energy_attribution_idle_period_ms") == Value::BIGINT(0));
+
+	REQUIRE_NO_FAIL(con.Query("SET energy_attribution_idle_period_ms = 500"));
+	REQUIRE(get_setting("energy_attribution_idle_period_ms") == Value::BIGINT(500));
+	REQUIRE_FAIL(con.Query("SET energy_attribution_idle_period_ms = 50"));
+	REQUIRE_FAIL(con.Query("SET energy_attribution_period_ms = 600"));
+
+	REQUIRE_NO_FAIL(con.Query("RESET energy_attribution_idle_period_ms"));
+	REQUIRE(get_setting("energy_attribution_idle_period_ms") == Value::BIGINT(0));
+	REQUIRE_NO_FAIL(con.Query("SET energy_attribution_period_ms = 600"));
+	REQUIRE(get_setting("energy_attribution_period_ms") == Value::BIGINT(600));
 }

@@ -186,6 +186,15 @@ static void ValidateConfig(WorkloadConfig &config) {
 		if (config.energy_attribution_period_ms == 0) {
 			throw InvalidInputException("--energy-attribution-period-ms must be positive");
 		}
+		if (config.energy_attribution_idle_period_ms != 0 &&
+		    config.energy_attribution_idle_period_ms < config.energy_attribution_period_ms) {
+			throw InvalidInputException(
+			    "--energy-attribution-idle-period-ms must be zero or at least --energy-attribution-period-ms");
+		}
+	}
+	if (config.energy_attribution_debug_export && !config.energy_attribution_export) {
+		throw InvalidInputException(
+		    "--energy-attribution-debug-export on requires --energy-attribution-export on");
 	}
 	if ((config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled) &&
 	    config.pin_threads == "off") {
@@ -263,12 +272,10 @@ Run options:
 	                              Enable periodic RAPL attribution independently of policy (default: off).
 	  --energy-attribution-period-ms N
 	                              Periodic RAPL attribution interval (default: 100).
-	  --energy-attribution-model legacy|process_shadow|process
-	                              Select direct, shadow, or authoritative process attribution.
-	  --energy-process-required on|off
-	                              Fail if the embedded eBPF/PMU backend is unavailable (default: off).
+	  --energy-attribution-idle-period-ms N
+	                              Interval with no active queries; zero disables adaptive sampling (default: 0).
 	  --energy-attribution-export on|off
-	                              Export aggregate attribution diagnostics (default: on).
+	                              Export aggregate attribution diagnostics (default: off).
 	  --energy-attribution-debug-export on|off
 	                              Export per-window attribution diagnostics (default: off).
   --allow-invalid             Write diagnostics but return success for invalid runs.
@@ -415,16 +422,8 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.energy_attribution_enabled = ParseBool(value, name);
 		} else if (name == "energy-attribution-period-ms") {
 			config.energy_attribution_period_ms = ParseUint(value, name);
-		} else if (name == "energy-attribution-model") {
-			config.energy_attribution_model = StringUtil::Lower(value);
-			if (config.energy_attribution_model != "legacy" &&
-			    config.energy_attribution_model != "process_shadow" &&
-			    config.energy_attribution_model != "process") {
-				throw InvalidInputException(
-				    "--energy-attribution-model must be one of: legacy, process_shadow, process");
-			}
-		} else if (name == "energy-process-required") {
-			config.energy_process_required = ParseBool(value, name);
+		} else if (name == "energy-attribution-idle-period-ms") {
+			config.energy_attribution_idle_period_ms = ParseUint(value, name);
 		} else if (name == "energy-attribution-export") {
 			config.energy_attribution_export = ParseBool(value, name);
 		} else if (name == "energy-attribution-debug-export") {

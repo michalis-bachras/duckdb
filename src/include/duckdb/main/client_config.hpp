@@ -46,25 +46,12 @@ struct PipelineProfilingSettings {
 
 struct EnergyAttributionSettings {
 	bool enabled = false;
-	bool rapl_enabled = true;
-	bool perf_counters_enabled = true;
-	bool export_enabled = true;
+	bool export_enabled = false;
 	bool debug_export_enabled = false;
-	bool closed_segments_export_enabled = false;
-	bool overhead_detail_enabled = false;
-	bool lifecycle_phases_enabled = false;
-	bool pipeline_signatures_enabled = true;
-	bool metadata_cache_enabled = true;
-	bool migration_check_enabled = true;
-	bool profile_update_enabled = true;
-	bool periodic_enabled = false;
-	bool process_attribution_required = false;
 	uint64_t period_ms = 100;
+	uint64_t idle_period_ms = 0;
 	string output_dir;
 	string base_power_path;
-	string counter_profile = "generic";
-	string fail_policy = "warn";
-	string attribution_model = "legacy";
 };
 
 struct ClientConfig {

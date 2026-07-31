@@ -48,6 +48,20 @@ struct ProcessActivitySocketTopology {
 	uint32_t monitored_cpu_count = 0;
 };
 
+struct ProcessActivitySocketCheckpoint {
+	int socket_id = -1;
+	uint32_t helper_count = 0;
+	uint32_t acknowledged_helper_count = 0;
+	uint32_t missing_helper_count = 0;
+	uint64_t boundary_min_ns = 0;
+	uint64_t boundary_max_ns = 0;
+	uint64_t maximum_checkpoint_delay_ns = 0;
+	uint64_t late_helper_count = 0;
+	int32_t slowest_helper_cpu = -1;
+	string missing_helper_cpus;
+	bool valid = false;
+};
+
 struct ProcessActivityWindow {
 	uint64_t generation = 0;
 	uint64_t requested_boundary_ns = 0;
@@ -56,6 +70,12 @@ struct ProcessActivityWindow {
 	uint64_t boundary_max_ns = 0;
 	uint64_t maximum_checkpoint_delay_ns = 0;
 	uint64_t checkpoint_duration_ns = 0;
+	uint64_t helper_count = 0;
+	int64_t helper_futex_wake_count = -1;
+	uint64_t acknowledged_helper_count = 0;
+	uint64_t missing_helper_count = 0;
+	int32_t slowest_helper_cpu = -1;
+	string missing_helper_cpus;
 	uint64_t activity_map_insert_failure = 0;
 	uint64_t missing_counter = 0;
 	uint64_t invalid_counter_delta = 0;
@@ -69,6 +89,7 @@ struct ProcessActivityWindow {
 	uint64_t lost_records = 0;
 	uint64_t lookup_failures = 0;
 	vector<ProcessActivitySocketTopology> socket_topology;
+	vector<ProcessActivitySocketCheckpoint> socket_checkpoints;
 	vector<ProcessActivityRecord> records;
 	bool boundary_corrected = false;
 	bool valid = false;
@@ -83,7 +104,8 @@ public:
 	static bool IsCompiled();
 
 	virtual bool Start(bool required) = 0;
-	virtual ProcessActivityWindow RotateWindow(uint64_t requested_boundary_ns, uint64_t maximum_skew_ns) = 0;
+	virtual ProcessActivityWindow RotateWindow(uint64_t requested_boundary_ns, uint64_t maximum_skew_ns,
+	                                           uint64_t completion_timeout_ns) = 0;
 	virtual void Stop() = 0;
 	virtual bool Available() const = 0;
 	virtual uint32_t DuckDBProcessID() const = 0;

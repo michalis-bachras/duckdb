@@ -74,25 +74,14 @@ static void ConfigureEnergyAttribution(Connection &root, const WorkloadConfig &c
 	ExecuteSetting(root, "SET energy_attribution_output_dir=" + QuoteSQLString(output_dir));
 	ExecuteSetting(root, "SET energy_attribution_base_power_path=" +
 	                         QuoteSQLString(config.energy_power_model_path));
-	ExecuteSetting(root, "SET energy_attribution_rapl_enable=true");
-	ExecuteSetting(root, "SET energy_attribution_perf_counters_enable=true");
 	ExecuteSetting(root, string("SET energy_attribution_export_enable=") +
 	                         (config.energy_attribution_export ? "true" : "false"));
 	ExecuteSetting(root, string("SET energy_attribution_debug_export_enable=") +
 	                         (config.energy_attribution_debug_export ? "true" : "false"));
-	ExecuteSetting(root, "SET energy_attribution_closed_segments_export_enable=false");
-	ExecuteSetting(root, "SET energy_attribution_overhead_detail_enable=false");
-	ExecuteSetting(root, "SET energy_attribution_pipeline_signatures_enable=false");
-	ExecuteSetting(root, "SET energy_attribution_metadata_cache_enable=true");
-	ExecuteSetting(root, "SET energy_attribution_lifecycle_phases_enable=true");
-	ExecuteSetting(root, "SET energy_attribution_migration_check_enable=true");
-	ExecuteSetting(root, "SET energy_attribution_profile_update_enable=true");
 	ExecuteSetting(root, "SET energy_attribution_period_ms=" +
 	                         std::to_string(config.energy_attribution_period_ms));
-	ExecuteSetting(root, "SET energy_attribution_model=" + QuoteSQLString(config.energy_attribution_model));
-	ExecuteSetting(root, string("SET energy_attribution_process_required=") +
-	                         (config.energy_process_required ? "true" : "false"));
-	ExecuteSetting(root, "SET energy_attribution_periodic_enable=true");
+	ExecuteSetting(root, "SET energy_attribution_idle_period_ms=" +
+	                         std::to_string(config.energy_attribution_idle_period_ms));
 	// Enable last so the runtime starts once with its complete immutable configuration.
 	ExecuteSetting(root, "SET energy_attribution_enable=true");
 }
@@ -133,7 +122,6 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 		ExecuteSetting(root, "SET query_sla_energy_power_model_path=" +
 		                         QuoteSQLString(config.energy_power_model_path));
 	}
-	ConfigureEnergyAttribution(root, config);
 	ExecuteSetting(root, "SET scheduler_policy='" + SchedulerName(policy) + "'");
 	for (const auto &database : config.databases) {
 		ExecuteSetting(root, "ATTACH " + QuoteSQLString(database.path) + " AS sf" +
@@ -433,6 +421,7 @@ vector<CalibrationEntry> Calibrate(const WorkloadConfig &config) {
 	DuckDB db;
 	Connection root(db);
 	ConfigureDatabase(root, config, QuerySchedulerPolicy::DEFAULT);
+	ConfigureEnergyAttribution(root, config);
 	vector<CalibrationEntry> calibration;
 	uint64_t request_id = 1;
 	for (const auto &database : config.databases) {
@@ -472,6 +461,7 @@ void TrainProfiles(const WorkloadConfig &config) {
 	DuckDB db;
 	Connection root(db);
 	ConfigureDatabase(root, config, QuerySchedulerPolicy::DEFAULT);
+	ConfigureEnergyAttribution(root, config);
 	ImportProfiles(db, config);
 	uint64_t request_id = 1;
 	for (idx_t repetition = 0; repetition < config.repetitions; repetition++) {
@@ -541,6 +531,8 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 		token_to_request[i] = i;
 		requests.push_back(std::move(state));
 	}
+	// Keep database setup and request preparation outside the measured workload.
+	ConfigureEnergyAttribution(root, config);
 
 	BlockingQueue<idx_t> submissions;
 	std::atomic<idx_t> done_count(0);

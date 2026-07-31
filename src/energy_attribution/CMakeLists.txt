@@ -1,4 +1,5 @@
 set(DUCKDB_ENERGY_ATTRIBUTION_SOURCES energy_attribution.cpp
+                                      energy_attribution_base_power.cpp
                                       process_activity.cpp)
 
 if(BUILD_EBPF_PROCESS_ATTRIBUTION)

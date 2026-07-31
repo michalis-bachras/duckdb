@@ -29,33 +29,13 @@ struct EnergyPerfSnapshot {
 	uint64_t task_clock_time_enabled = 0;
 	uint64_t task_clock_time_running = 0;
 	uint64_t cycles = 0;
-	uint64_t instructions = 0;
-	uint64_t ref_cycles = 0;
-	uint64_t cache_refs = 0;
-	uint64_t cache_misses = 0;
-	uint64_t llc_misses = 0;
-	uint64_t offcore_responses = 0;
 	uint64_t cycles_time_enabled = 0;
 	uint64_t cycles_time_running = 0;
-	uint64_t ref_cycles_time_enabled = 0;
-	uint64_t ref_cycles_time_running = 0;
 	bool task_clock_valid = false;
 	bool cycles_valid = false;
-	bool ref_cycles_valid = false;
 	bool valid = false;
 	bool scaled = false;
 	string status;
-};
-
-enum class EnergySegmentRole : uint8_t {
-	ASSIGNED_MANDATORY,
-	ASSIGNED_OPTIONAL,
-	SAME_QUERY_SUCCESSOR,
-	FALLBACK_SIBLING,
-	FALLBACK_SOCKET,
-	FALLBACK_GLOBAL,
-	EXPLORATION_PROBE,
-	UNKNOWN
 };
 
 enum class EnergySegmentPhase : uint8_t {
@@ -90,8 +70,6 @@ struct EnergySegmentRecord {
 	uint64_t scale_factor = 0;
 	uint64_t pipeline_id = 0;
 	uint64_t pipeline_signature_hash = 0;
-	string pipeline_signature;
-	EnergySegmentRole role = EnergySegmentRole::UNKNOWN;
 	EnergySegmentPhase phase = EnergySegmentPhase::EXECUTE;
 	EnergySystemCategory system_category = EnergySystemCategory::NONE;
 	uint64_t lifecycle_group_id = 0;
@@ -111,12 +89,6 @@ struct EnergySegmentRecord {
 	uint32_t target_uncore_frequency_khz = 0;
 	int smt_occupancy = 1;
 	uint64_t cycles = 0;
-	uint64_t instructions = 0;
-	uint64_t ref_cycles = 0;
-	uint64_t cache_refs = 0;
-	uint64_t cache_misses = 0;
-	uint64_t llc_misses = 0;
-	uint64_t offcore_responses = 0;
 	bool counters_valid = false;
 	bool counters_scaled = false;
 	bool hardware_state_stable = false;
@@ -155,12 +127,9 @@ public:
 private:
 	shared_ptr<EnergyAttributionQueryHandle> query_handle;
 	void *query_state = nullptr;
-	void *segment_buffer = nullptr;
 	EnergySegmentRecord record;
-	EnergyPerfSnapshot start_perf;
 	int end_cpu_hint = -1;
 	bool active = false;
-	bool perf_started = false;
 	bool finished = false;
 };
 
@@ -178,7 +147,6 @@ private:
 	bool active = false;
 };
 
-const char *EnergySegmentRoleToString(EnergySegmentRole role);
 const char *EnergySegmentPhaseToString(EnergySegmentPhase phase);
 const char *EnergySystemCategoryToString(EnergySystemCategory category);
 

@@ -70,29 +70,24 @@ int main() {
 		const char *arguments[] = {
 		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
 		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla_energy",
-			    "--pin-threads", "on",
-			    "--energy-power-model", "/tmp/power.csv", "--energy-hardware-control", "off",
-			    "--energy-exploration", "on", "--energy-exploration-seed", "17",
-			    "--sla-residual-policy", "park",
-			    "--no-progress-diagnostic-s", "15",
-			    "--sla-epoch-ms", "50",
-			    "--energy-attribution-period-ms", "50",
-			    "--energy-attribution-model", "process_shadow", "--energy-process-required", "on",
-			    "--energy-attribution-export", "off", "--energy-attribution-debug-export", "on"};
+		    "--pin-threads", "on", "--energy-power-model", "/tmp/power.csv", "--energy-hardware-control", "off",
+		    "--energy-exploration", "on", "--energy-exploration-seed", "17", "--sla-residual-policy", "park",
+		    "--no-progress-diagnostic-s", "15", "--sla-epoch-ms", "50", "--energy-attribution-period-ms", "50",
+		    "--energy-attribution-idle-period-ms", "500", "--energy-attribution-export", "on",
+		    "--energy-attribution-debug-export", "on"};
 		auto parsed = ParseConfig(sizeof(arguments) / sizeof(arguments[0]), const_cast<char **>(arguments));
 		Require(parsed.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY, "SLA-energy scheduler parsing");
 		Require(parsed.pin_threads == "on", "worker pinning mode parsing");
 		Require(!parsed.sla_energy_hardware_control, "dry-run hardware mode parsing");
 		Require(parsed.sla_energy_exploration, "exploration mode parsing");
 		Require(parsed.sla_energy_exploration_seed == 17, "exploration seed parsing");
-			Require(!parsed.sla_residual_workers_enabled, "parked residual-worker policy parsing");
-			Require(parsed.no_progress_diagnostic_s == 15, "no-progress diagnostic interval parsing");
+		Require(!parsed.sla_residual_workers_enabled, "parked residual-worker policy parsing");
+		Require(parsed.no_progress_diagnostic_s == 15, "no-progress diagnostic interval parsing");
 		Require(parsed.sla_epoch_ms == 50, "SLA epoch duration parsing");
 		Require(!parsed.energy_attribution_enabled, "attribution is explicit and defaults off");
 		Require(parsed.energy_attribution_period_ms == 50, "attribution period parsing");
-		Require(parsed.energy_attribution_model == "process_shadow", "process attribution model parsing");
-		Require(parsed.energy_process_required, "required process collector parsing");
-		Require(!parsed.energy_attribution_export, "attribution export parsing");
+		Require(parsed.energy_attribution_idle_period_ms == 500, "idle attribution period parsing");
+		Require(parsed.energy_attribution_export, "attribution export parsing");
 		Require(parsed.energy_attribution_debug_export, "attribution debug export parsing");
 
 		const char *sla_attribution_arguments[] = {
@@ -105,6 +100,7 @@ int main() {
 		        "SLA baseline scheduler parsing");
 		Require(!sla_attribution.sla_residual_workers_enabled, "residual workers default to parked");
 		Require(sla_attribution.energy_attribution_enabled, "policy-independent attribution parsing");
+		Require(!sla_attribution.energy_attribution_export, "attribution export defaults off");
 		Require(sla_attribution.energy_power_model_path == "/tmp/power.csv", "attribution power model parsing");
 
 		const char *unsafe_dry_run_arguments[] = {
@@ -147,18 +143,19 @@ int main() {
 		}
 		Require(rejected_zero_epoch, "zero SLA epoch duration is rejected");
 
-		const char *invalid_attribution_model_arguments[] = {
+		const char *obsolete_attribution_model_arguments[] = {
 		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
 		    "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/output", "--scheduler", "sla",
-		    "--energy-attribution-model", "unknown"};
-		bool rejected_invalid_attribution_model = false;
+		    "--energy-attribution-model", "process"};
+		bool rejected_obsolete_attribution_model = false;
 		try {
-			ParseConfig(sizeof(invalid_attribution_model_arguments) / sizeof(invalid_attribution_model_arguments[0]),
-			            const_cast<char **>(invalid_attribution_model_arguments));
+			ParseConfig(sizeof(obsolete_attribution_model_arguments) /
+			                sizeof(obsolete_attribution_model_arguments[0]),
+			            const_cast<char **>(obsolete_attribution_model_arguments));
 		} catch (InvalidInputException &) {
-			rejected_invalid_attribution_model = true;
+			rejected_obsolete_attribution_model = true;
 		}
-		Require(rejected_invalid_attribution_model, "unknown process attribution model is rejected");
+		Require(rejected_obsolete_attribution_model, "obsolete attribution model option is rejected");
 
 		const char *invalid_pin_threads_arguments[] = {
 		    "scheduler_workload", "run",         "--database",   "10=/tmp/sf10.duckdb",
