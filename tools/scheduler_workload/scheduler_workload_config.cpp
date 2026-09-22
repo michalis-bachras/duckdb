@@ -260,6 +260,7 @@ Run options:
   --sla-suffix-bootstrap on|off  Train both predictors in fresh DEFAULT train-profiles.
   --sla-suffix-bootstrap-observations N  Exact-key target, 1-100 (default: 15).
   --profile-input PATH        Optional version-11 scheduler profile snapshot.
+  --hardware-profile-input PATH  Load hardware calibration only, after --profile-input.
   --profile-output PATH       Export updated profile state after training/run.
   --output-dir PATH           Run timeline and summary directory.
   --submitter-threads N       Fixed native submission pool size (default: 2).
@@ -375,6 +376,8 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.output_path = value;
 		} else if (name == "output-dir") {
 			config.output_dir = value;
+		} else if (name == "hardware-profile-input") {
+			config.hardware_profile_snapshot_in = value;
 		} else if (name == "profile-input") {
 			config.profile_snapshot_in = value;
 		} else if (name == "profile-output") {

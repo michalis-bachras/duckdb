@@ -1840,3 +1840,35 @@ TEST_CASE("Point feedback excludes the final inserted-event lifecycle tail", "[a
  REQUIRE(store.GetSuffixModelProfilesSnapshot()[0].prediction_ns == Approx(140));
  REQUIRE(store.GetSuffixModelRuntimeSnapshot().resolved_count == 1);
 }
+
+TEST_CASE("Hardware calibration import cannot contaminate suffix bootstrap", "[api][sla][point_suffix]") {
+ DuckDB db(nullptr);
+ auto &fs = db.instance->GetFileSystem();
+ QueryRequestProfileStore calibrated;
+ QueryRequestProfileStore target;
+ auto profile = PipelineProfile(1000);
+ auto metadata = Metadata(1, 919, 10, 1, 1000000000);
+ for (auto store : {&calibrated, &target}) {
+  store->SetSuffixBootstrapMode(true, 1);
+  store->RecordQueryCompletion(metadata, profile.finish_done_ns + (store == &calibrated ? 10000 : 100), {profile});
+  store->SetSuffixBootstrapMode(false);
+ }
+ QueryRequestHardwareConfiguration hardware;
+ hardware.core_frequency_khz = 1200000;
+ hardware.uncore_frequency_khz = 1800000;
+ calibrated.RecordPipelineHardwareThroughput(919, 10, PipelineIdentity(profile), hardware, 10, 1000000, true);
+ const auto path = TestCreatePath("sla_point_hardware_bank.bin");
+ if (fs.FileExists(path)) { fs.RemoveFile(path); }
+ calibrated.ExportSnapshot(fs, path);
+ auto generation = target.GetPipelineHardwareProfileGeneration();
+ target.ImportHardwareProfiles(fs, path);
+ REQUIRE(target.GetPipelineHardwareProfiles(919, 10, PipelineIdentity(profile)).size() == 1);
+ REQUIRE(target.GetPipelineHardwareProfileGeneration() > generation);
+ REQUIRE(target.GetSuffixModelProfilesSnapshot()[0].prediction_ns == Approx(100));
+ REQUIRE(target.GetSuffixModelProfilesSnapshot()[0].observation_count == 1);
+ REQUIRE(target.GetSuffixModelProfilesSnapshot()[0].histogram_sample_count == 1);
+ DownstreamSuffixEpochRequest request(919, 10, profile.pipeline_id, profile.pipeline_signature_hash, 1);
+ target.PrepareDownstreamSuffixActivation(99200, request, QuerySLASuffixModel::POINT);
+ REQUIRE_THROWS(target.ImportHardwareProfiles(fs, path));
+ fs.RemoveFile(path);
+}

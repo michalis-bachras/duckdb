@@ -52,6 +52,7 @@ struct WorkloadConfig {
 	string output_path;
 	string output_dir;
 	string profile_snapshot_in;
+	string hardware_profile_snapshot_in;
 	string profile_snapshot_out;
 	QuerySchedulerPolicy scheduler_policy = QuerySchedulerPolicy::DEFAULT;
 	QuerySLASuffixModel sla_suffix_model = QuerySLASuffixModel::MODEL_DEFAULT;

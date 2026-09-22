@@ -51,6 +51,11 @@ switching predictors. On-policy warmup uses `train-profiles --scheduler sla` or
 output snapshot. Hardware-control-off is only for correctness tests; it is not a
 physical energy comparison.
 
+Use `--hardware-profile-input` to import calibrated hardware pairs without importing
+the exploration run's suffix observations or execution-time estimates. Each pilot
+policy starts from the same suffix bootstrap plus the same hardware calibration,
+then performs its own on-policy warmup.
+
 The runner exports `query_request_suffix_models.csv`,
 `query_request_suffix_model_runtime.csv`, and `run_metadata.json`. Epoch traces add
 `suffix_model` and `suffix_generation`; existing exact-sample counts describe the

@@ -373,6 +373,8 @@ public:
 	void ExportSnapshot(FileSystem &fs, const string &path) const;
 	//! Replace the current store atomically after fully validating and rebuilding derived state.
 	void ImportSnapshot(FileSystem &fs, const string &path);
+	//! Import only hardware calibration, leaving suffix and execution-time training untouched.
+	void ImportHardwareProfiles(FileSystem &fs, const string &path);
 	void Clear();
 
 private:

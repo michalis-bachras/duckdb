@@ -155,6 +155,10 @@ static void ImportProfiles(DuckDB &db, const WorkloadConfig &config) {
 		db.instance->GetQueryRequestProfileStore().ImportSnapshot(db.instance->GetFileSystem(),
 		                                                          config.profile_snapshot_in);
 	}
+	if (!config.hardware_profile_snapshot_in.empty()) {
+		db.instance->GetQueryRequestProfileStore().ImportHardwareProfiles(db.instance->GetFileSystem(),
+		                                                                 config.hardware_profile_snapshot_in);
+	}
 }
 
 static void ExportProfiles(DuckDB &db, const WorkloadConfig &config) {

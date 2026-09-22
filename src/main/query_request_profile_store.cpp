@@ -2983,6 +2983,17 @@ void QueryRequestProfileStore::ImportSnapshot(FileSystem &fs, const string &path
 	InstallSnapshotState(*state, std::move(snapshot));
 }
 
+void QueryRequestProfileStore::ImportHardwareProfiles(FileSystem &fs, const string &path) {
+	QueryRequestProfileStore calibration;
+	calibration.ImportSnapshot(fs, path);
+	lock_guard<std::mutex> guard(state->lock);
+	if (!state->issued_suffix.empty()) {
+		throw InvalidInputException("Hardware profiles cannot be imported while suffix forecasts are outstanding");
+	}
+	state->pipeline_hardware_profiles = std::move(calibration.state->pipeline_hardware_profiles);
+	state->pipeline_hardware_profile_generation.fetch_add(1);
+}
+
 void QueryRequestProfileStore::Clear() {
 	lock_guard<std::mutex> guard(state->lock);
 	state->suffix_bootstrap_mode = false;
