@@ -128,6 +128,14 @@ static void ValidateConfig(WorkloadConfig &config) {
 	if (config.sla_epoch_ms == 0) {
 		throw InvalidInputException("--sla-epoch-ms must be positive");
 	}
+ if (config.sla_suffix_bootstrap_observations < 1 || config.sla_suffix_bootstrap_observations > 100) {
+  throw InvalidInputException("--sla-suffix-bootstrap-observations must be in [1, 100]");
+ }
+ if (config.sla_suffix_bootstrap && (config.command != WorkloadCommand::TRAIN_PROFILES ||
+     !config.profile_snapshot_in.empty() || config.repetitions != config.sla_suffix_bootstrap_observations ||
+     config.scheduler_policy != QuerySchedulerPolicy::DEFAULT)) {
+  throw InvalidInputException("Suffix bootstrap requires fresh DEFAULT train-profiles with repetitions equal to its observation target");
+ }
 	if (config.repetitions == 0) {
 		throw InvalidInputException("--repetitions must be positive");
 	}
@@ -248,7 +256,10 @@ Run options:
   --schedule PATH             Saved schedule CSV.
 	  --scheduler default|stride|sla|sla_energy
 	  --pin-threads auto|on|off  Worker pinning mode (default: auto; attribution forces on).
-  --profile-input PATH        Optional scheduler profile snapshot.
+  --sla-suffix-model MODEL    model_default, point, histogram (energy default: point; SLA default: histogram).
+  --sla-suffix-bootstrap on|off  Train both predictors in fresh DEFAULT train-profiles.
+  --sla-suffix-bootstrap-observations N  Exact-key target, 1-100 (default: 15).
+  --profile-input PATH        Optional version-11 scheduler profile snapshot.
   --profile-output PATH       Export updated profile state after training/run.
   --output-dir PATH           Run timeline and summary directory.
   --submitter-threads N       Fixed native submission pool size (default: 2).
@@ -399,6 +410,16 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.max_driver_lag_ms = ParseDouble(value, name);
 		} else if (name == "no-progress-diagnostic-s") {
 			config.no_progress_diagnostic_s = ParseDouble(value, name);
+  } else if (name == "sla-suffix-model") {
+   if (value == "point") { config.sla_suffix_model = QuerySLASuffixModel::POINT; }
+   else if (value == "histogram") { config.sla_suffix_model = QuerySLASuffixModel::HISTOGRAM; }
+   else if (value == "model_default") { config.sla_suffix_model = QuerySLASuffixModel::MODEL_DEFAULT; }
+   else { throw InvalidInputException("--sla-suffix-model must be model_default, point, or histogram"); }
+  } else if (name == "sla-suffix-bootstrap") {
+   if (value != "on" && value != "off") { throw InvalidInputException("--sla-suffix-bootstrap must be on or off"); }
+   config.sla_suffix_bootstrap = value == "on";
+  } else if (name == "sla-suffix-bootstrap-observations") {
+   config.sla_suffix_bootstrap_observations = ParseUint(value, name);
 		} else if (name == "sla-epoch-ms") {
 			config.sla_epoch_ms = ParseUint(value, name);
 		} else if (name == "sla-residual-policy") {

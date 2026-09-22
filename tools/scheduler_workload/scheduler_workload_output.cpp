@@ -65,14 +65,14 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 		}
 		output << "request_id,template_id,scale_factor,scheduled_offset_ns,deadline_offset_ns,sla_tag,"
 		          "sla_penalty_per_s,arrival_ns,"
-		          "submit_begin_ns,submit_end_ns,admitted_ns,execution_started_ns,execution_ready_ns,"
+		          "submit_begin_ns,submit_end_ns,database_registration_cpu_ns,admitted_ns,execution_started_ns,execution_ready_ns,"
 		          "admission_released_ns,result_ready_ns,status,error\n";
 		for (const auto &result : results) {
 			output << result.request.request_id << ',' << result.request.template_id << ','
 			       << result.request.scale_factor << ',' << result.request.scheduled_offset_ns << ','
 			       << result.request.deadline_offset_ns << ',' << result.request.sla_tag << ','
 			       << result.request.sla_penalty_per_s << ',' << result.arrival_ns << ','
-			       << result.submit_begin_ns << ',' << result.submit_end_ns << ',' << result.admitted_ns << ','
+			       << result.submit_begin_ns << ',' << result.submit_end_ns << ',' << result.database_registration_cpu_ns << ',' << result.admitted_ns << ','
 			       << result.execution_started_ns << ',' << result.execution_ready_ns << ','
 			       << result.admission_released_ns << ',' << result.result_ready_ns << ','
 			       << CSVString(result.status) << ',' << CSVString(result.error) << '\n';
@@ -104,6 +104,14 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 		output << "  \"p99_response_s\": " << summary.p99_response_s << ",\n";
 		output << "  \"mean_arrival_dispatch_lag_ms\": " << summary.mean_arrival_dispatch_lag_ms << ",\n";
 		output << "  \"p99_arrival_dispatch_lag_ms\": " << summary.p99_arrival_dispatch_lag_ms << ",\n";
+		output << "  \"mean_driver_handoff_lag_ms\": " << summary.mean_driver_handoff_lag_ms << ",\n";
+		output << "  \"p99_driver_handoff_lag_ms\": " << summary.p99_driver_handoff_lag_ms << ",\n";
+		output << "  \"mean_submitter_queue_lag_ms\": " << summary.mean_submitter_queue_lag_ms << ",\n";
+		output << "  \"p99_submitter_queue_lag_ms\": " << summary.p99_submitter_queue_lag_ms << ",\n";
+		output << "  \"mean_database_registration_latency_ms\": " << summary.mean_database_registration_latency_ms << ",\n";
+		output << "  \"p99_database_registration_latency_ms\": " << summary.p99_database_registration_latency_ms << ",\n";
+		output << "  \"mean_database_registration_cpu_ms\": " << summary.mean_database_registration_cpu_ms << ",\n";
+		output << "  \"p99_database_registration_cpu_ms\": " << summary.p99_database_registration_cpu_ms << ",\n";
 		output << "  \"mean_submission_lag_ms\": " << summary.mean_submission_lag_ms << ",\n";
 		output << "  \"p99_submission_lag_ms\": " << summary.p99_submission_lag_ms << ",\n";
 		output << "  \"p99_admission_resume_lag_ms\": " << summary.p99_admission_resume_lag_ms << ",\n";

@@ -13,6 +13,7 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 
 #include <cerrno>
@@ -183,14 +184,21 @@ void QueryRequestMetadataManager::EndQuery(ClientContext &context, bool success)
 		metadata = entry->second;
 		g_active_request_metadata.erase(entry);
 	}
+	auto &db = DatabaseInstance::GetDatabase(context);
+	auto &store = db.GetQueryRequestProfileStore();
 	if (!success || !ProfilingEnabled(context)) {
+		store.DiscardDownstreamSuffixForecasts(metadata.db_query_id);
 		return;
 	}
 	auto query_end_ns = TimestampNs();
 	auto pipeline_profiles = QueryProfiler::Get(context).GetPipelineProfilesSnapshot();
 	auto internal_event_profiles = QueryProfiler::Get(context).GetInternalEventProfilesSnapshot();
-	DatabaseInstance::GetDatabase(context).GetQueryRequestProfileStore().RecordQueryCompletion(
-	    metadata, query_end_ns, pipeline_profiles, internal_event_profiles);
+ auto mode = QuerySLASuffixUpdateMode::HISTOGRAM;
+ if (db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA || db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY) {
+  auto model = ResolveQuerySLASuffixModel(db.config.options.query_sla_suffix_model, db.GetQuerySchedulerPolicy());
+  mode = model == QuerySLASuffixModel::POINT ? QuerySLASuffixUpdateMode::POINT : QuerySLASuffixUpdateMode::HISTOGRAM;
+ }
+ store.RecordQueryCompletion(metadata, query_end_ns, pipeline_profiles, internal_event_profiles, mode);
 }
 
 bool QueryRequestMetadataManager::HasActiveMetadata(ClientContext &context) {

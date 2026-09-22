@@ -130,6 +130,8 @@ struct QuerySLASchedulerEpochSnapshot {
 	idx_t continuation_sample_count = 0;
 	double continuation_p90 = 0;
 	string suffix_primary_level;
+	string suffix_model;
+	uint64_t suffix_generation = 0;
 	idx_t suffix_exact_sample_count = 0;
 	idx_t suffix_scale_sample_count = 0;
 	idx_t suffix_global_sample_count = 0;

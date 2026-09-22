@@ -183,6 +183,37 @@ int main() {
 			rejected_unpinned_attribution = true;
 		}
 		Require(rejected_unpinned_attribution, "energy attribution rejects explicitly unpinned workers");
+        const char *point_args[] = {"scheduler_workload", "run", "--database", "10=/tmp/db", "--queries-dir", "/tmp/q",
+            "--schedule", "/tmp/s.csv", "--output-dir", "/tmp/out", "--sla-suffix-model", "histogram",
+            "--scheduler", "sla_energy", "--energy-power-model", "/tmp/power.csv"};
+        auto energy_histogram = ParseConfig(sizeof(point_args)/sizeof(point_args[0]), const_cast<char **>(point_args));
+        Require(ResolveQuerySLASuffixModel(energy_histogram.sla_suffix_model, energy_histogram.scheduler_policy) == QuerySLASuffixModel::HISTOGRAM,
+                "explicit predictor survives later scheduler option");
+        energy_histogram.sla_suffix_model = QuerySLASuffixModel::MODEL_DEFAULT;
+        Require(ResolveQuerySLASuffixModel(energy_histogram.sla_suffix_model, energy_histogram.scheduler_policy) == QuerySLASuffixModel::POINT,
+                "energy model_default resolves to Point");
+        const char *bootstrap_args[] = {"scheduler_workload", "train-profiles", "--database", "10=/tmp/db", "--queries-dir", "/tmp/q",
+            "--profile-output", "/tmp/fresh.bin", "--sla-suffix-bootstrap", "on", "--repetitions", "15"};
+        auto bootstrap = ParseConfig(sizeof(bootstrap_args)/sizeof(bootstrap_args[0]), const_cast<char **>(bootstrap_args));
+        Require(bootstrap.sla_suffix_bootstrap && bootstrap.sla_suffix_bootstrap_observations == 15, "balanced bootstrap configuration");
+        WorkloadConfig lag_config;
+        lag_config.max_driver_lag_ms = 10;
+        RequestResult lag_result;
+        lag_result.status = "ok";
+        lag_result.request.deadline_offset_ns = 1000000000;
+        lag_result.arrival_ns = 1001000000;
+        lag_result.submit_begin_ns = 1002000000;
+        lag_result.submit_end_ns = 1202000000;
+        lag_result.database_registration_cpu_ns = 150000000;
+        lag_result.result_ready_ns = 1300000000;
+        auto lag_summary = SummarizeRun(lag_config, {lag_result.request}, {lag_result}, 1000000000, 0, 0);
+        Require(lag_summary.valid, "database registration latency is not driver lag");
+        Require(lag_summary.p99_driver_handoff_lag_ms == 2 && lag_summary.p99_submission_lag_ms == 202,
+                "handoff and registration are measured separately");
+        Require(lag_summary.p99_database_registration_cpu_ms == 150, "registration CPU time is preserved");
+        lag_result.submit_begin_ns = 1020000000;
+        Require(!SummarizeRun(lag_config, {lag_result.request}, {lag_result}, 1000000000, 0, 0).valid,
+                "actual driver lag invalidates the run");
 		std::cout << "scheduler_workload tests passed\n";
 		return 0;
 	} catch (std::exception &ex) {

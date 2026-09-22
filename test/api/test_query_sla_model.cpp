@@ -9,6 +9,13 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <chrono>
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/parallel/event.hpp"
+#include "duckdb/execution/executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 
 using namespace duckdb;
 
@@ -119,6 +126,77 @@ static void SetLogicalAllocation(QuerySLAEnergyPlannerInput &input) {
 	}
 	input.logical_allocation = AllocateQuerySLAWorkers(models, input.worker_budget, false);
 }
+
+static uint64_t LifecycleNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+static PipelineProfilingInfo LifecycleProfile(idx_t pipeline_id, uint64_t start_ns = 1000) {
+	PipelineProfilingInfo profile;
+	profile.pipeline_id = pipeline_id;
+	profile.pipeline_signature_hash = 100 + pipeline_id;
+	profile.pipeline_structure_hash = 200 + pipeline_id;
+	profile.start_ns = start_ns;
+	profile.tasks_done_ns = start_ns + 100;
+	profile.finish_done_ns = start_ns + 200;
+	profile.planned_input_chunks_equiv = 1;
+	profile.planned_input_native_unit = "row";
+	profile.task_count = 1;
+	profile.worker_task_count = 1;
+	profile.worker_task_duration_ns = 100;
+	return profile;
+}
+
+static DownstreamSuffixEpochRequest LifecycleSuffixRequest(const PipelineProfilingInfo &profile) {
+	return DownstreamSuffixEpochRequest(919, 10, profile.pipeline_id, profile.pipeline_signature_hash, 2,
+	                                    profile.pipeline_structure_hash);
+}
+
+static void SeedLifecycleSuffix(QueryRequestProfileStore &store, const PipelineProfilingInfo &profile,
+                                uint64_t suffix_ns) {
+	for (idx_t i = 0; i < 15; i++) {
+		auto metadata = BaseModelInput().metadata;
+		metadata.db_query_id = 1000 * profile.pipeline_id + i;
+		metadata.template_id = 919;
+		metadata.scale_factor = 10;
+		metadata.query_start_ns = profile.start_ns;
+		store.RecordQueryCompletion(metadata, profile.finish_done_ns + suffix_ns, {profile}, {},
+		                            QuerySLASuffixUpdateMode::BOOTSTRAP_ALL);
+	}
+	REQUIRE(store.SuffixBootstrapComplete());
+}
+
+// No tasks are queued. The test thread drives real scheduler activation/epochs against fixed work snapshots.
+class LifecycleTestEvent : public Event {
+public:
+	LifecycleTestEvent(Executor &executor, QueryActivationEventKind kind, const PipelineProfilingInfo &profile)
+	    : Event(executor) {
+		SetQueryActivationInfo(1, kind, profile.pipeline_id);
+		total_tasks = 1;
+		work.valid = true;
+		work.pipeline_id = profile.pipeline_id;
+		work.profile_identity.valid = true;
+		work.profile_identity.pipeline_id = profile.pipeline_id;
+		work.profile_identity.pipeline_signature_hash = profile.pipeline_signature_hash;
+		work.profile_identity.pipeline_structure_hash = profile.pipeline_structure_hash;
+		work.parallelism_valid = true;
+		work.preferred_parallelism = 1;
+		work.scheduled_tasks = 1;
+		work.remaining_tasks = 1;
+		work.lifecycle_tail_estimate.valid = true;
+		work.lifecycle_tail_estimate.p90_ns = 1000000;
+	}
+	void Schedule() override {
+	}
+	bool GetPipelineWorkSnapshot(PipelineWorkSnapshot &result) const override {
+		result = work;
+		return true;
+	}
+
+private:
+	PipelineWorkSnapshot work;
+};
 
 } // namespace
 
@@ -1141,4 +1219,110 @@ TEST_CASE("SLA energy hardware diagnostics classify worker target transitions",
 	REQUIRE(trace[3].uncore_changed);
 
 	manager.Deactivate();
+}
+
+TEST_CASE("Finishing events reuse the owner's suffix in SLA and energy epochs", "[api][sla][point_suffix][lifecycle_suffix]") {
+ for (auto model : {QuerySLASuffixModel::HISTOGRAM, QuerySLASuffixModel::POINT}) {
+  for (auto policy : {QuerySchedulerPolicy::SLA, QuerySchedulerPolicy::SLA_ENERGY}) {
+   DBConfig config;
+   config.options.maximum_threads = 1;
+   config.options.query_sla_energy_hardware_control_enabled = false;
+   DuckDB db(nullptr, &config);
+   Connection con(db);
+   Executor executor(*con.context);
+   auto producer = db.instance->GetScheduler().CreateProducer();
+   auto &store = db.instance->GetQueryRequestProfileStore();
+   auto owner = LifecycleProfile(7);
+   auto child = LifecycleProfile(8);
+   store.SetSuffixBootstrapMode(true, 15);
+   SeedLifecycleSuffix(store, owner, 600000000000ULL);
+   SeedLifecycleSuffix(store, child, 1000000);
+   store.SetSuffixBootstrapMode(false);
+   db.instance->config.options.query_sla_suffix_model = model;
+   db.instance->config.options.query_sla_scheduler_epoch_ms = 50;
+   db.instance->SetQuerySchedulerPolicy(policy);
+   auto &scheduler = db.instance->GetQuerySLAScheduler();
+   if (policy == QuerySchedulerPolicy::SLA_ENERGY) { scheduler.RegisterWorker(0, 0); }
+   auto metadata = BaseModelInput().metadata;
+   metadata.db_query_id = 9900;
+   metadata.template_id = 919;
+   metadata.scale_factor = 10;
+   metadata.query_start_ns = LifecycleNowNs();
+   metadata.deadline_ns = LifecycleNowNs() + 60000000000ULL;
+   scheduler.RegisterQuery(metadata, *producer, true);
+   REQUIRE_THROWS(QuerySLASuffixModelSetting::SetGlobal(db.instance.get(), db.instance->config, Value("point")));
+   for (const auto &profile : {owner, child}) {
+    auto event = make_shared_ptr<LifecycleTestEvent>(executor, QueryActivationEventKind::PIPELINE, profile);
+    scheduler.OnEventScheduled(metadata.db_query_id, event, 2);
+    scheduler.OnEventFinished(metadata.db_query_id, *event);
+   }
+   auto issued_count = store.GetSuffixModelRuntimeSnapshot().issued_count;
+   REQUIRE(issued_count == 2);
+   for (auto kind : {QueryActivationEventKind::PREPARE_FINISH, QueryActivationEventKind::FINISH}) {
+    auto event = make_shared_ptr<LifecycleTestEvent>(executor, kind, owner);
+    scheduler.OnEventScheduled(metadata.db_query_id, event, 2);
+    REQUIRE(scheduler.GetSnapshot()[0].first_mandatory_gain > 0);
+    scheduler.RequestInitialEpoch();
+    shared_ptr<Task> task;
+    REQUIRE(scheduler.TryDequeueTask(0, task) == QuerySLADequeueResult::NO_TASK);
+    auto trace = scheduler.GetEpochTrace();
+    REQUIRE_FALSE(trace.empty());
+    REQUIRE(trace.back().suffix_p90_ns > 60000000000.0);
+    REQUIRE(trace.back().mandatory_workers == 1);
+    REQUIRE(trace.back().demand_cap == 1);
+    scheduler.OnEventFinished(metadata.db_query_id, *event);
+   }
+   REQUIRE(store.GetSuffixModelRuntimeSnapshot().issued_count == issued_count);
+   REQUIRE(store.GetSuffixModelRuntimeSnapshot().resolved_count == 0);
+   scheduler.UnregisterQuery(metadata.db_query_id);
+   if (policy == QuerySchedulerPolicy::SLA_ENERGY) { scheduler.UnregisterWorker(0); }
+  }
+ }
+}
+
+TEST_CASE("Point defaults resolve by policy and explicit choices survive ordering", "[api][sla][point_suffix]") {
+ for (bool model_first : {false, true}) {
+  DBConfig config;
+  config.options.query_worker_only_execution_enabled = true;
+  auto resolve = [&]() { return ResolveQuerySLASuffixModel(config.options.query_sla_suffix_model, config.options.query_scheduler_policy); };
+  REQUIRE(resolve() == QuerySLASuffixModel::HISTOGRAM);
+  if (model_first) { QuerySLASuffixModelSetting::SetGlobal(nullptr, config, Value("histogram")); }
+  QuerySchedulerPolicySetting::SetGlobal(nullptr, config, Value("sla_energy"));
+  if (!model_first) {
+   REQUIRE(resolve() == QuerySLASuffixModel::POINT);
+   QuerySLASuffixModelSetting::SetGlobal(nullptr, config, Value("histogram"));
+  }
+  REQUIRE(resolve() == QuerySLASuffixModel::HISTOGRAM);
+  QuerySLASuffixModelSetting::ResetGlobal(nullptr, config);
+  REQUIRE(resolve() == QuerySLASuffixModel::POINT);
+  QuerySchedulerPolicySetting::SetGlobal(nullptr, config, Value("sla"));
+  REQUIRE(resolve() == QuerySLASuffixModel::HISTOGRAM);
+  QuerySLASuffixModelSetting::SetGlobal(nullptr, config, Value("point"));
+  REQUIRE(resolve() == QuerySLASuffixModel::POINT);
+  REQUIRE_THROWS(QuerySLASuffixModelSetting::SetGlobal(nullptr, config, Value("multiqt")));
+ }
+}
+
+TEST_CASE("Point and a matching point mass drive identical energy allocations", "[api][sla][energy_planner][point_suffix]") {
+ auto histogram = PlannerQuery(555, 2500000000ULL);
+ histogram.sla_input.suffix.bucket_count = 1;
+ histogram.sla_input.suffix.buckets[0].lower_ns = 100000000;
+ histogram.sla_input.suffix.buckets[0].upper_ns = 100000000;
+ histogram.sla_input.suffix.buckets[0].probability = 1;
+ histogram.reference_model = BuildQuerySLAModel(histogram.sla_input);
+ auto point = histogram;
+ point.sla_input.suffix.model = QuerySLASuffixModel::POINT;
+ point.reference_model = BuildQuerySLAModel(point.sla_input);
+ auto topology = vector<QueryHardwareWorkerTopology> {TestWorker(0, 0, 0, 0), TestWorker(1, 1, 0, 1)};
+ auto a = PlanQuerySLAEnergyEpoch(PlannerInput(histogram, 2, topology));
+ auto b = PlanQuerySLAEnergyEpoch(PlannerInput(point, 2, topology));
+ REQUIRE(a.valid);
+ REQUIRE(b.valid);
+ REQUIRE(a.workers.size() == b.workers.size());
+ REQUIRE(a.queries[0].predicted_sla_cost == Approx(b.queries[0].predicted_sla_cost));
+ for (idx_t i = 0; i < a.workers.size(); i++) {
+  REQUIRE(a.workers[i].execution_hardware == b.workers[i].execution_hardware);
+ }
+ REQUIRE(a.queries[0].dynamic_mandatory_workers.size() == b.queries[0].dynamic_mandatory_workers.size());
+ REQUIRE(a.queries[0].dynamic_optional_workers.size() == b.queries[0].dynamic_optional_workers.size());
 }

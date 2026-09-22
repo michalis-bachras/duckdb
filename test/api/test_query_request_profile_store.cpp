@@ -11,6 +11,8 @@
 #include "test_helpers.hpp"
 
 #include <chrono>
+#include <fstream>
+#include "duckdb/common/file_system.hpp"
 #include <mutex>
 #include <thread>
 
@@ -1124,9 +1126,9 @@ TEST_CASE("SLA energy policy is independent and requires pinned workers", "[api]
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_hardware_control_enable=false"));
 	REQUIRE_NO_FAIL(con.Query("SET external_threads=0"));
 	REQUIRE_NO_FAIL(con.Query("SET query_worker_only_execution_enable=true"));
-	REQUIRE_FAIL(con.Query("SET scheduler_policy='sla_energy'"));
+	REQUIRE_FAIL(con.Query("SET query_sla_suffix_model='histogram'; SET scheduler_policy='sla_energy'"));
 	REQUIRE_NO_FAIL(con.Query("SET pin_threads='on'"));
-	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla_energy'"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_suffix_model='histogram'; SET scheduler_policy='sla_energy'"));
 	auto policy = con.Query("SELECT current_setting('scheduler_policy')");
 	REQUIRE(CHECK_COLUMN(policy, 0, {"sla_energy"}));
 	REQUIRE_FAIL(con.Query("SET pin_threads='off'"));
@@ -1156,7 +1158,7 @@ TEST_CASE("SLA energy scheduler executes a trained tagged query in dry-run hardw
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_hardware_control_enable=false"));
 	REQUIRE_NO_FAIL(con.Query("SET query_sla_energy_exploration_enable=false"));
 	REQUIRE_NO_FAIL(con.Query("SET pin_threads='on'"));
-	REQUIRE_NO_FAIL(con.Query("SET scheduler_policy='sla_energy'"));
+	REQUIRE_NO_FAIL(con.Query("SET query_sla_suffix_model='histogram'; SET scheduler_policy='sla_energy'"));
 	auto &scheduler = db.instance->GetQuerySLAScheduler();
 	scheduler.ClearEpochTrace();
 	REQUIRE_NO_FAIL(con.Query(MetadataQueryWithDeadlineOffset(9160, 97, 10, 1.0, 1000000000ULL, body)));
@@ -1589,7 +1591,7 @@ TEST_CASE("SLA energy scheduler releases task leases before redispatch", "[api][
 	}
 	REQUIRE_NO_FAIL(setup.Query("SET query_sla_scheduler_epoch_ms=5"));
 	REQUIRE_NO_FAIL(setup.Query("SET pin_threads='on'"));
-	REQUIRE_NO_FAIL(setup.Query("SET scheduler_policy='sla_energy'"));
+	REQUIRE_NO_FAIL(setup.Query("SET query_sla_suffix_model='histogram'; SET scheduler_policy='sla_energy'"));
 
 	static constexpr idx_t QUERY_COUNT = 8;
 	atomic<bool> start(false);
@@ -1713,4 +1715,128 @@ TEST_CASE("Query request profile store records concurrent metadata queries", "[a
 	REQUIRE(store.PipelineProfileCount() >= 2);
 
 	store.Clear();
+}
+
+TEST_CASE("Point uses all-history Stage state with immutable out-of-order feedback", "[api][sla][point_suffix]") {
+ QueryRequestProfileStore store;
+ store.SetSuffixBootstrapMode(true, 3);
+ auto profile = PipelineProfile(1000);
+ auto metadata = Metadata(1, 919, 10, 1, 1000000000);
+ for (auto suffix : {100ULL, 200ULL, 900ULL}) {
+  store.RecordQueryCompletion(metadata, profile.finish_done_ns + suffix, {profile});
+ }
+ REQUIRE(store.SuffixBootstrapComplete());
+ store.SetSuffixBootstrapMode(false);
+ DownstreamSuffixEpochRequest request(919, 10, profile.pipeline_id, profile.pipeline_signature_hash, 1);
+ auto first = store.PrepareDownstreamSuffixActivation(9001, request, QuerySLASuffixModel::POINT);
+ auto second = store.PrepareDownstreamSuffixActivation(9002, request, QuerySLASuffixModel::POINT);
+ REQUIRE(first.buckets[0].lower_ns == Approx(500));
+ REQUIRE(first.buckets[0].upper_ns == Approx(500));
+ REQUIRE(first.buckets[0].probability == Approx(1));
+ metadata.db_query_id = 9002;
+ store.RecordQueryCompletion(metadata, profile.finish_done_ns + 1000, {profile}, {}, QuerySLASuffixUpdateMode::POINT);
+ REQUIRE(store.GetSuffixModelProfilesSnapshot()[0].prediction_ns == Approx(640));
+ REQUIRE(store.ReadIssuedDownstreamSuffixForecast(9001, request).buckets[0].lower_ns == Approx(500));
+ REQUIRE(store.PrepareDownstreamSuffixActivation(9001, request, QuerySLASuffixModel::POINT).generation == first.generation);
+ metadata.db_query_id = 9001;
+ store.RecordQueryCompletion(metadata, profile.finish_done_ns + 200, {profile}, {}, QuerySLASuffixUpdateMode::POINT);
+ auto state = store.GetSuffixModelProfilesSnapshot()[0];
+ REQUIRE(state.observation_count == 5);
+ REQUIRE(state.prediction_ns == Approx(424));
+ REQUIRE(state.histogram_sample_count == 3);
+ store.RecordQueryCompletion(metadata, profile.finish_done_ns + 700, {profile}, {}, QuerySLASuffixUpdateMode::POINT);
+ REQUIRE(store.GetSuffixModelProfilesSnapshot()[0].observation_count == 5);
+ auto runtime = store.GetSuffixModelRuntimeSnapshot();
+ REQUIRE(runtime.issued_count == 2);
+ REQUIRE(runtime.resolved_count == 2);
+ REQUIRE(runtime.outstanding_count == 0);
+ REQUIRE(runtime.duplicate_feedback_count == 1);
+ auto wrong = request;
+ wrong.template_id++;
+ REQUIRE_THROWS(store.PrepareDownstreamSuffixActivation(9003, wrong, QuerySLASuffixModel::POINT));
+ REQUIRE(store.GetSuffixModelRuntimeSnapshot().missing_key_count == 1);
+ store.PrepareDownstreamSuffixActivation(9004, request, QuerySLASuffixModel::POINT);
+ store.DiscardDownstreamSuffixForecasts(9004);
+ REQUIRE_FALSE(store.ReadIssuedDownstreamSuffixForecast(9004, request).valid);
+ REQUIRE(store.GetSuffixModelRuntimeSnapshot().discarded_count == 1);
+}
+
+TEST_CASE("Point retains its running mean beyond the histogram window and round trips", "[api][sla][point_suffix]") {
+ DuckDB db(nullptr);
+ auto &fs = db.instance->GetFileSystem();
+ QueryRequestProfileStore store;
+ store.SetSuffixBootstrapMode(true, 1);
+ auto profile = PipelineProfile(1000);
+ auto metadata = Metadata(1, 919, 10, 1, 1000000000);
+ store.RecordQueryCompletion(metadata, profile.finish_done_ns + 1, {profile});
+ store.SetSuffixBootstrapMode(false);
+ DownstreamSuffixEpochRequest request(919, 10, profile.pipeline_id, profile.pipeline_signature_hash, 1);
+ for (idx_t i = 2; i <= 115; i++) {
+  metadata.db_query_id = i + 5000;
+  store.PrepareDownstreamSuffixActivation(metadata.db_query_id, request, QuerySLASuffixModel::POINT);
+  store.RecordQueryCompletion(metadata, profile.finish_done_ns + i, {profile}, {}, QuerySLASuffixUpdateMode::POINT);
+ }
+ auto state = store.GetSuffixModelProfilesSnapshot()[0];
+ REQUIRE(state.observation_count == 115);
+ REQUIRE(state.running_mean_ns == Approx(58));
+ REQUIRE(state.prediction_ns == Approx(69.4));
+ const auto path = TestCreatePath("sla_point_v11.bin");
+ if (fs.FileExists(path)) { fs.RemoveFile(path); }
+ store.ExportSnapshot(fs, path);
+ QueryRequestProfileStore imported;
+ imported.ImportSnapshot(fs, path);
+ auto issued = imported.PrepareDownstreamSuffixActivation(9900, request, QuerySLASuffixModel::POINT);
+ REQUIRE(issued.buckets[0].lower_ns == Approx(69.4));
+ REQUIRE(issued.generation == 115);
+ REQUIRE(imported.GetSuffixModelRuntimeSnapshot().bootstrap_target == 1);
+ REQUIRE(imported.GetSuffixModelRuntimeSnapshot().resolved_count == 0);
+ std::fstream corrupt(path, std::ios::in | std::ios::out | std::ios::binary);
+ corrupt.seekp(sizeof(uint64_t) + std::string("DUCKDB_QUERY_REQUEST_PROFILE").size());
+ uint32_t old_version = 6;
+ corrupt.write(reinterpret_cast<const char *>(&old_version), sizeof(old_version));
+ corrupt.close();
+ REQUIRE_THROWS(imported.ImportSnapshot(fs, path));
+ fs.RemoveFile(path);
+}
+
+TEST_CASE("Cardinality growth preserves trained physical pipeline keys", "[api][sla][suffix_identity]") {
+ DuckDB db(nullptr);
+ Connection con(db);
+ REQUIRE_NO_FAIL(con.Query("SET query_request_profiling_enable=true"));
+ REQUIRE_NO_FAIL(con.Query("CREATE TABLE stable_identity AS SELECT i FROM range(100) t(i)"));
+ const string body = "SELECT sum(i) FROM stable_identity";
+ REQUIRE_NO_FAIL(con.Query(MetadataQuery(99001, 919, 10, body)));
+ auto &store = db.instance->GetQueryRequestProfileStore();
+ auto before = store.GetPipelineProfilesSnapshot();
+ REQUIRE_FALSE(before.empty());
+ REQUIRE_NO_FAIL(con.Query("INSERT INTO stable_identity SELECT i FROM range(100, 200) t(i)"));
+ REQUIRE_NO_FAIL(con.Query(MetadataQuery(99002, 919, 10, body)));
+ auto after = store.GetPipelineProfilesSnapshot();
+ REQUIRE(after.size() == before.size());
+ bool changed_cardinality = false;
+ for (idx_t i = 0; i < before.size(); i++) {
+  REQUIRE(before[i].estimate.pipeline_signature_hash == after[i].estimate.pipeline_signature_hash);
+  changed_cardinality = changed_cardinality || before[i].estimate.mean_planned_input_rows != after[i].estimate.mean_planned_input_rows;
+ }
+ REQUIRE(changed_cardinality);
+}
+
+TEST_CASE("Point feedback excludes the final inserted-event lifecycle tail", "[api][sla][point_suffix]") {
+ QueryRequestProfileStore store;
+ store.SetSuffixBootstrapMode(true, 1);
+ auto profile = PipelineProfile(1000);
+ auto metadata = Metadata(1, 919, 10, 1, 1000000000);
+ store.RecordQueryCompletion(metadata, profile.finish_done_ns + 200, {profile});
+ store.SetSuffixBootstrapMode(false);
+ DownstreamSuffixEpochRequest request(919, 10, profile.pipeline_id, profile.pipeline_signature_hash, 1);
+ metadata.db_query_id = 99100;
+ store.PrepareDownstreamSuffixActivation(metadata.db_query_id, request, QuerySLASuffixModel::POINT);
+ // Finalization inserted internal work: the profiler advances finish_done to the final event.
+ profile.finish_done_ns += 10000;
+ REQUIRE(store.ReadIssuedDownstreamSuffixForecast(metadata.db_query_id, request).buckets[0].lower_ns == Approx(200));
+ REQUIRE(store.GetSuffixModelRuntimeSnapshot().resolved_count == 0);
+ store.RecordQueryCompletion(metadata, profile.finish_done_ns + 100, {profile}, {}, QuerySLASuffixUpdateMode::POINT);
+ REQUIRE(store.GetSuffixModelProfilesSnapshot()[0].latest_ns == Approx(100));
+ REQUIRE(store.GetSuffixModelProfilesSnapshot()[0].prediction_ns == Approx(140));
+ REQUIRE(store.GetSuffixModelRuntimeSnapshot().resolved_count == 1);
 }

@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "duckdb/common/enums/query_sla_suffix_model.hpp"
+
 #include "duckdb/common/common.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
@@ -80,6 +82,8 @@ struct DownstreamSuffixHistogram {
 };
 
 struct DownstreamSuffixEstimate {
+	QuerySLASuffixModel model = QuerySLASuffixModel::HISTOGRAM;
+	uint64_t generation = 0;
 	bool valid = false;
 	DownstreamSuffixProfileLevel primary_level = DownstreamSuffixProfileLevel::NONE;
 	idx_t exact_sample_count = 0;
@@ -290,6 +294,19 @@ struct QueryRequestInternalEventInstanceSnapshot : public InternalEventProfiling
 	uint64_t tail_to_pipeline_end_ns = 0;
 };
 
+struct QueryRequestSuffixModelSnapshot {
+ uint64_t template_id = 0, scale_factor = 0, pipeline_id = 0, pipeline_structure_hash = 0;
+ uint64_t observation_count = 0, generation = 0;
+ double running_mean_ns = 0, latest_ns = 0, prediction_ns = 0;
+ idx_t histogram_sample_count = 0;
+};
+
+struct QueryRequestSuffixRuntimeSnapshot {
+ uint64_t issued_count = 0, resolved_count = 0, discarded_count = 0;
+ uint64_t missing_key_count = 0, duplicate_feedback_count = 0, unmatched_feedback_count = 0;
+ idx_t outstanding_count = 0, bootstrap_target = 15;
+};
+
 class QueryRequestProfileStore {
 public:
 	QueryRequestProfileStore();
@@ -300,7 +317,17 @@ public:
 
 	void RecordQueryCompletion(const QueryRequestMetadata &metadata, uint64_t query_end_ns,
 	                           const vector<PipelineProfilingInfo> &pipeline_profiles,
-	                           const vector<InternalEventProfilingInfo> &internal_event_profiles = {});
+	                           const vector<InternalEventProfilingInfo> &internal_event_profiles = {},
+	                           QuerySLASuffixUpdateMode suffix_update_mode = QuerySLASuffixUpdateMode::HISTOGRAM);
+ void SetSuffixBootstrapMode(bool enabled, idx_t target = 15);
+ bool SuffixBootstrapComplete() const;
+ DownstreamSuffixEstimate PrepareDownstreamSuffixActivation(uint64_t db_query_id,
+     const DownstreamSuffixEpochRequest &request, QuerySLASuffixModel model);
+ DownstreamSuffixEstimate ReadIssuedDownstreamSuffixForecast(uint64_t db_query_id,
+     const DownstreamSuffixEpochRequest &request) const;
+ void DiscardDownstreamSuffixForecasts(uint64_t db_query_id);
+ vector<QueryRequestSuffixModelSnapshot> GetSuffixModelProfilesSnapshot() const;
+ QueryRequestSuffixRuntimeSnapshot GetSuffixModelRuntimeSnapshot() const;
 	bool TryGetQueryEstimate(uint64_t template_id, uint64_t scale_factor, QueryRequestProfileEstimate &estimate) const;
 	bool TryGetPipelineEstimate(uint64_t template_id, uint64_t scale_factor, idx_t pipeline_id,
 	                            uint64_t pipeline_signature_hash, QueryRequestPipelineProfileEstimate &estimate) const;

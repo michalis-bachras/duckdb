@@ -50,6 +50,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	static unordered_map<string, OptionValueSet> value_map = {
 	    {"threads", {Value::BIGINT(42), Value::BIGINT(42)}},
 	    {"checkpoint_threshold", {"4.0 GiB"}},
+	    {"query_sla_suffix_model", {"point"}},
 	    {"debug_checkpoint_abort", {{"none", "before_truncate", "before_header", "after_free_list_write"}}},
 	    {"default_collation", {"nocase"}},
 	    {"default_order", {"DESC"}},
@@ -130,7 +131,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"query_sla_energy_exploration_seed", {Value::UBIGINT(17)}},
 	    {"query_sla_energy_hardware_control_enable", {false}},
 	    {"query_sla_energy_power_model_path", {"/tmp/base_power.csv"}},
-	    {"query_sla_residual_policy", {"park"}},
+	    {"query_sla_residual_policy", {"work_conserving"}},
 	    {"stride_user_priority", {Value::DOUBLE(2.0)}},
 	    {"enable_http_logging", {false}},
 	    {"http_proxy", {"localhost:80"}},

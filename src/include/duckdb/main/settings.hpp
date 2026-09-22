@@ -1004,6 +1004,16 @@ struct QuerySLASchedulerEpochMsSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct QuerySLASuffixModelSetting {
+ using RETURN_TYPE = string;
+ static constexpr const char *Name = "query_sla_suffix_model";
+ static constexpr const char *Description = "Downstream predictor: model_default (Point for SLA-energy, Histogram for SLA), point, histogram";
+ static constexpr const char *InputType = "VARCHAR";
+ static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input);
+ static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+ static Value GetSetting(const ClientContext &context);
+};
+
 struct QuerySLAResidualPolicySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "query_sla_residual_policy";

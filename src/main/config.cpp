@@ -149,6 +149,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_GLOBAL(QuerySchedulerPolicySetting),
     DUCKDB_GLOBAL(QuerySLASchedulerEpochMsSetting),
 	DUCKDB_GLOBAL(QuerySLAResidualPolicySetting),
+    DUCKDB_GLOBAL(QuerySLASuffixModelSetting),
 	DUCKDB_GLOBAL(QuerySLAEnergyHardwareControlEnableSetting),
 	DUCKDB_GLOBAL(QuerySLAEnergyExplorationEnableSetting),
 	DUCKDB_GLOBAL(QuerySLAEnergyExplorationSeedSetting),

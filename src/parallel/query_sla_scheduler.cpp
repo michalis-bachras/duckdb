@@ -122,6 +122,7 @@ static const char *SLAEventKindName(QueryActivationEventKind kind) {
 }
 
 struct QueryCapture {
+	DownstreamSuffixEstimate activation_suffix;
 	QueryRequestMetadata metadata;
 	ProducerToken *producer = nullptr;
 	shared_ptr<Event> event;
@@ -173,6 +174,7 @@ struct EpochTraceInput {
 };
 
 struct ActivatedPipelinePlan {
+	DownstreamSuffixEstimate suffix;
 	QuerySLAModel model;
 	vector<QuerySLAEnergyWorkerAssignment> dynamic_mandatory_workers;
 	vector<QuerySLAEnergyWorkerAssignment> dynamic_optional_workers;
@@ -198,14 +200,20 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 		if (!work.profile_identity.valid) {
 			throw InvalidInputException("SLA scheduler requires a stable profile identity for modeled work");
 		}
-		vector<DownstreamSuffixEpochRequest> requests;
-		requests.emplace_back(capture.metadata.template_id, capture.metadata.scale_factor,
-		                      work.profile_identity.pipeline_id, work.profile_identity.pipeline_signature_hash,
-		                      capture.remaining_suffix_stages, work.profile_identity.pipeline_structure_hash);
-		auto estimates = db.GetQueryRequestProfileStore().PrepareDownstreamSuffixEpoch(requests);
-		if (!estimates.empty()) {
-			suffix = estimates[0];
-		}
+  DownstreamSuffixEpochRequest request(capture.metadata.template_id, capture.metadata.scale_factor,
+      work.profile_identity.pipeline_id, work.profile_identity.pipeline_signature_hash,
+      capture.remaining_suffix_stages, work.profile_identity.pipeline_structure_hash);
+  auto model = ResolveQuerySLASuffixModel(db.config.options.query_sla_suffix_model, db.GetQuerySchedulerPolicy());
+  auto &store = db.GetQueryRequestProfileStore();
+  if (event_kind == QueryActivationEventKind::PREPARE_FINISH || event_kind == QueryActivationEventKind::FINISH) {
+   auto issued = store.ReadIssuedDownstreamSuffixForecast(capture.metadata.db_query_id, request);
+   if (!issued.valid || issued.model != model) {
+    throw InvalidInputException("Finishing event has no matching owning-pipeline suffix forecast");
+   }
+   suffix = model == QuerySLASuffixModel::POINT ? issued : store.PrepareDownstreamSuffixEpoch({request})[0];
+  } else {
+   suffix = store.PrepareDownstreamSuffixActivation(capture.metadata.db_query_id, request, model);
+  }
 	} else {
 		suffix = QuerySLALifecycleSuffixPointMass();
 	}
@@ -218,6 +226,7 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 	model_input.generation = capture.generation;
 	model_input.now_ns = now_ns;
 	model_input.epoch_ns = epoch_ns;
+	result.suffix = suffix;
 	result.model = BuildQuerySLAModel(model_input);
 	if (!result.model.valid) {
 		throw InvalidInputException("SLA scheduler cannot model query %llu pipeline %llu: %s",
@@ -329,6 +338,7 @@ struct QuerySLASchedulerState {
 	};
 
 	struct QueryState {
+		DownstreamSuffixEstimate activation_suffix;
 		QueryRequestMetadata metadata;
 		ProducerToken *producer = nullptr;
 		shared_ptr<Event> event;
@@ -743,6 +753,7 @@ void QuerySLAScheduler::OnEventScheduled(uint64_t db_query_id, shared_ptr<Event>
 			return;
 		}
 		auto &query = entry->second;
+		query.activation_suffix = activated.suffix;
 		query.model = std::move(activated.model);
 		query.mandatory_workers = 0;
 		query.optional_workers = 0;
@@ -922,6 +933,7 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			capture.event = entry.second.event;
 			capture.generation = entry.second.pipeline_generation;
 			capture.remaining_suffix_stages = entry.second.remaining_suffix_stages;
+			capture.activation_suffix = entry.second.activation_suffix;
 			capture.debug_trace_enabled = entry.second.debug_trace_enabled;
 			captures.push_back(std::move(capture));
 		}
@@ -935,6 +947,7 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 
 	const auto work_snapshot_start_ns = collect_diagnostics ? SLATimestampNs() : 0;
 	vector<PipelineWorkSnapshot> work(captures.size());
+	auto suffix_model = ResolveQuerySLASuffixModel(db.config.options.query_sla_suffix_model, db.GetQuerySchedulerPolicy());
 	vector<DownstreamSuffixEpochRequest> suffix_requests;
 	vector<idx_t> suffix_indexes(captures.size(), DConstants::INVALID_INDEX);
 	for (idx_t i = 0; i < captures.size(); i++) {
@@ -942,7 +955,7 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			continue;
 		}
 		auto event_kind = captures[i].event->GetQueryActivationKind();
-		if (!UsesPipelineSuffix(event_kind) ||
+		if (suffix_model == QuerySLASuffixModel::POINT || !UsesPipelineSuffix(event_kind) ||
 		    !work[i].profile_identity.valid) {
 			continue;
 		}
@@ -967,7 +980,9 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		DownstreamSuffixEstimate suffix;
 		auto event_kind = captures[i].event->GetQueryActivationKind();
 		if (UsesPipelineSuffix(event_kind)) {
-			if (suffix_indexes[i] != DConstants::INVALID_INDEX && suffix_indexes[i] < suffix_estimates.size()) {
+			if (suffix_model == QuerySLASuffixModel::POINT) {
+				suffix = captures[i].activation_suffix;
+			} else if (suffix_indexes[i] != DConstants::INVALID_INDEX && suffix_indexes[i] < suffix_estimates.size()) {
 				suffix = suffix_estimates[suffix_indexes[i]];
 			}
 		} else {
@@ -1419,6 +1434,8 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		trace.continuation_sample_count = work[i].continuation_estimate.sample_count;
 		trace.continuation_p90 = work[i].continuation_estimate.p90;
 		trace.suffix_primary_level = SLASuffixLevelName(suffix.primary_level);
+		trace.suffix_model = QuerySLASuffixModelName(suffix.model);
+		trace.suffix_generation = suffix.generation;
 		trace.suffix_exact_sample_count = suffix.exact_sample_count;
 		trace.suffix_scale_sample_count = suffix.scale_sample_count;
 		trace.suffix_global_sample_count = suffix.global_sample_count;

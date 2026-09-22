@@ -20,6 +20,8 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
+#include <tuple>
 
 namespace duckdb {
 
@@ -674,7 +676,32 @@ struct QueryProfileAggregate {
 	BoundedSamples sla_cost;
 };
 
+struct StagePointAggregate {
+ uint64_t count = 0;
+ double mean_ns = 0, latest_ns = 0;
+ void Add(double value) {
+  count++;
+  mean_ns += (value - mean_ns) / static_cast<double>(count);
+  latest_ns = value;
+ }
+ double Prediction() const { return 0.8 * mean_ns + 0.2 * latest_ns; }
+};
+
+struct IssuedSuffixKey {
+ uint64_t query_id = 0;
+ SuffixProfileKey pipeline;
+ bool operator==(const IssuedSuffixKey &other) const {
+  return query_id == other.query_id && pipeline == other.pipeline;
+ }
+};
+struct IssuedSuffixKeyHash {
+ size_t operator()(const IssuedSuffixKey &key) const {
+  return SuffixProfileKeyHash {}(key.pipeline) ^ std::hash<uint64_t> {}(key.query_id);
+ }
+};
+
 struct PipelineProfileAggregate {
+ StagePointAggregate suffix_point;
 	uint64_t pipeline_structure_hash = 0;
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
@@ -713,6 +740,11 @@ struct InternalEventProfileAggregate {
 using namespace query_request_profile_store_internal;
 
 struct QueryRequestProfileStoreState {
+ bool suffix_bootstrap_mode = false;
+ idx_t suffix_bootstrap_target = 15;
+ QueryRequestSuffixRuntimeSnapshot suffix_runtime;
+ std::unordered_map<IssuedSuffixKey, DownstreamSuffixEstimate, IssuedSuffixKeyHash> issued_suffix;
+ std::unordered_set<IssuedSuffixKey, IssuedSuffixKeyHash> resolved_suffix;
 	std::unordered_map<SuffixProfileKey, PipelineProfileKey, SuffixProfileKeyHash> suffix_profile_index;
 	std::mutex lock;
 	std::atomic<uint64_t> pipeline_hardware_profile_generation {1};
@@ -780,7 +812,7 @@ static SuffixProfileKey BuildStoredSuffixProfileKey(const PipelineProfileKey &ke
 }
 
 static bool HasSuffixProfileState(const PipelineProfileAggregate &profile) {
-	return profile.downstream_suffix_ns.samples.Count() > 0;
+	return profile.downstream_suffix_ns.samples.Count() > 0 || profile.suffix_point.count > 0;
 }
 
 static PipelineProfileAggregate *FindSuffixProfile(QueryRequestProfileStoreState &state,
@@ -818,6 +850,7 @@ static void RebuildSuffixProfileIndex(QueryRequestProfileStoreState &state) {
 }
 
 struct ProfileSnapshotState {
+ idx_t suffix_bootstrap_target = 15;
 	std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> query_profiles;
 	std::unordered_map<PipelineProfileKey, PipelineProfileAggregate, PipelineProfileKeyHash> pipeline_profiles;
 	std::unordered_map<uint64_t, SuffixHistogramAggregate> scale_downstream_suffix_profiles;
@@ -969,6 +1002,9 @@ static void WritePipelineProfile(ProfileSnapshotWriter &writer, const PipelinePr
 	WriteContinuation(writer, profile.lifecycle_runtime_ns);
 	WriteContinuation(writer, profile.finish_tail_ns);
 	WriteSuffix(writer, profile.downstream_suffix_ns);
+	writer.Write<uint64_t>(profile.suffix_point.count);
+	writer.Write<double>(profile.suffix_point.mean_ns);
+	writer.Write<double>(profile.suffix_point.latest_ns);
 	WriteBoundedSamples(writer, profile.single_worker_chunks_per_s);
 	WriteContinuation(writer, profile.continuation);
 	writer.Write<double>(profile.ewma_single_worker_chunks_per_s);
@@ -997,6 +1033,14 @@ static PipelineProfileAggregate ReadPipelineProfile(ProfileSnapshotReader &reade
 	result.lifecycle_runtime_ns = ReadContinuation(reader);
 	result.finish_tail_ns = ReadContinuation(reader);
 	result.downstream_suffix_ns = ReadSuffix(reader);
+ result.suffix_point.count = reader.Read<uint64_t>();
+ result.suffix_point.mean_ns = reader.Read<double>();
+ result.suffix_point.latest_ns = reader.Read<double>();
+ if (!std::isfinite(result.suffix_point.mean_ns) || result.suffix_point.mean_ns < 0 ||
+     !std::isfinite(result.suffix_point.latest_ns) || result.suffix_point.latest_ns < 0 ||
+     (!result.suffix_point.count && (result.suffix_point.mean_ns != 0 || result.suffix_point.latest_ns != 0))) {
+  throw SerializationException("Invalid Stage Point state in query profile snapshot");
+ }
 	result.single_worker_chunks_per_s = ReadBoundedSamples(reader);
 	result.continuation = ReadContinuation(reader);
 	result.ewma_single_worker_chunks_per_s = reader.Read<double>();
@@ -1101,6 +1145,7 @@ static PipelineHardwareProfileAggregate ReadPipelineHardwareProfile(ProfileSnaps
 static ProfileSnapshotState CaptureSnapshotState(QueryRequestProfileStoreState &state) {
 	ProfileSnapshotState result;
 	lock_guard<std::mutex> guard(state.lock);
+	result.suffix_bootstrap_target = state.suffix_bootstrap_target;
 	result.query_profiles = state.query_profiles;
 	result.pipeline_profiles = state.pipeline_profiles;
 	result.scale_downstream_suffix_profiles = state.scale_downstream_suffix_profiles;
@@ -1120,6 +1165,7 @@ static ProfileSnapshotState CaptureSnapshotState(QueryRequestProfileStoreState &
 }
 
 static void WriteSnapshotState(ProfileSnapshotWriter &writer, const ProfileSnapshotState &snapshot) {
+	writer.Write<uint64_t>(snapshot.suffix_bootstrap_target);
 	writer.Write<uint64_t>(snapshot.query_profiles.size());
 	for (const auto &entry : snapshot.query_profiles) {
 		WriteQueryProfile(writer, entry.second);
@@ -1201,6 +1247,8 @@ static void WriteSnapshotState(ProfileSnapshotWriter &writer, const ProfileSnaps
 
 static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader, uint32_t snapshot_version) {
 	ProfileSnapshotState result;
+	result.suffix_bootstrap_target = reader.ReadCount(PROFILE_SAMPLE_LIMIT, "suffix bootstrap target");
+	if (!result.suffix_bootstrap_target) { throw SerializationException("Invalid suffix bootstrap target"); }
 	auto query_count = reader.ReadCount(PROFILE_SNAPSHOT_MAX_ENTRIES, "query profile");
 	for (idx_t i = 0; i < query_count; i++) {
 		auto profile = ReadQueryProfile(reader);
@@ -1330,6 +1378,11 @@ static ProfileSnapshotState ReadSnapshotState(ProfileSnapshotReader &reader, uin
 
 static void InstallSnapshotState(QueryRequestProfileStoreState &state, ProfileSnapshotState snapshot) {
 	lock_guard<std::mutex> guard(state.lock);
+	state.suffix_bootstrap_mode = false;
+	state.suffix_bootstrap_target = snapshot.suffix_bootstrap_target;
+	state.suffix_runtime = QueryRequestSuffixRuntimeSnapshot();
+	state.issued_suffix.clear();
+	state.resolved_suffix.clear();
 	state.query_profiles = std::move(snapshot.query_profiles);
 	state.pipeline_profiles = std::move(snapshot.pipeline_profiles);
 	RebuildSuffixProfileIndex(state);
@@ -1581,6 +1634,7 @@ static DownstreamSuffixEstimate BuildDownstreamSuffixEstimate(const DownstreamSu
                                                               const DownstreamSuffixHistogram &global,
                                                               idx_t remaining_suffix_stages) {
 	DownstreamSuffixEstimate result;
+	result.generation = exact.generation;
 	result.exact_sample_count = exact.sample_count;
 	result.scale_sample_count = scale.sample_count;
 	result.global_sample_count = global.sample_count;
@@ -1644,7 +1698,8 @@ QueryRequestProfileStore::~QueryRequestProfileStore() {
 
 void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata &metadata, uint64_t query_end_ns,
                                                       const vector<PipelineProfilingInfo> &pipeline_profiles,
-                                                      const vector<InternalEventProfilingInfo> &internal_event_profiles) {
+                                                      const vector<InternalEventProfilingInfo> &internal_event_profiles,
+                                                      QuerySLASuffixUpdateMode suffix_update_mode) {
 	if (!metadata.valid || metadata.query_start_ns == 0 || query_end_ns <= metadata.query_start_ns) {
 		return;
 	}
@@ -1687,6 +1742,7 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 	}
 
 	lock_guard<std::mutex> guard(state->lock);
+	if (state->suffix_bootstrap_mode) { suffix_update_mode = QuerySLASuffixUpdateMode::BOOTSTRAP_ALL; }
 	QueryRequestSampleSnapshot query_sample;
 	query_sample.db_query_id = metadata.db_query_id;
 	query_sample.request_id = metadata.request_id;
@@ -1836,10 +1892,40 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		const auto &suffix_observation = suffix_observations[i];
 		if (suffix_observation.valid) {
 			auto &suffix_profile = GetOrCreateSuffixProfile(*state, BuildSuffixProfileKey(metadata, profile), pipeline_key);
-			suffix_profile.downstream_suffix_ns.Add(static_cast<double>(suffix_observation.suffix_ns));
-			state->scale_downstream_suffix_profiles[metadata.scale_factor].Add(
-			    suffix_observation.normalized_suffix_ns);
-			state->global_downstream_suffix_profile.Add(suffix_observation.normalized_suffix_ns);
+   IssuedSuffixKey issued_key;
+   issued_key.query_id = metadata.db_query_id;
+   issued_key.pipeline = BuildSuffixProfileKey(metadata, profile);
+   auto issued = state->issued_suffix.find(issued_key);
+   bool update = suffix_update_mode != QuerySLASuffixUpdateMode::NONE;
+   if (suffix_update_mode != QuerySLASuffixUpdateMode::BOOTSTRAP_ALL) {
+    if (state->resolved_suffix.count(issued_key)) {
+     state->suffix_runtime.duplicate_feedback_count++;
+     update = false;
+    } else if (issued != state->issued_suffix.end()) {
+     auto expected = issued->second.model == QuerySLASuffixModel::POINT ? QuerySLASuffixUpdateMode::POINT : QuerySLASuffixUpdateMode::HISTOGRAM;
+     if (suffix_update_mode != expected) {
+      state->suffix_runtime.unmatched_feedback_count++;
+      update = false;
+     } else {
+      state->suffix_runtime.resolved_count++;
+      state->resolved_suffix.insert(issued_key);
+      state->issued_suffix.erase(issued);
+     }
+    } else if (suffix_update_mode == QuerySLASuffixUpdateMode::POINT) {
+     state->suffix_runtime.unmatched_feedback_count++;
+     update = false;
+    }
+   }
+   if (update && (suffix_update_mode == QuerySLASuffixUpdateMode::HISTOGRAM ||
+                  suffix_update_mode == QuerySLASuffixUpdateMode::BOOTSTRAP_ALL)) {
+    suffix_profile.downstream_suffix_ns.Add(static_cast<double>(suffix_observation.suffix_ns));
+    state->scale_downstream_suffix_profiles[metadata.scale_factor].Add(suffix_observation.normalized_suffix_ns);
+    state->global_downstream_suffix_profile.Add(suffix_observation.normalized_suffix_ns);
+   }
+   if (update && (suffix_update_mode == QuerySLASuffixUpdateMode::POINT ||
+                  suffix_update_mode == QuerySLASuffixUpdateMode::BOOTSTRAP_ALL)) {
+    suffix_profile.suffix_point.Add(static_cast<double>(suffix_observation.suffix_ns));
+   }
 			pipeline_instance.downstream_suffix_ns = suffix_observation.suffix_ns;
 			pipeline_instance.pipeline_completion_ordinal = suffix_observation.completion_ordinal;
 			pipeline_instance.total_pipeline_count = suffix_observation.total_pipeline_count;
@@ -2738,6 +2824,124 @@ idx_t QueryRequestProfileStore::PipelineProfileCount() const {
 	return state->pipeline_profiles.size();
 }
 
+
+void QueryRequestProfileStore::SetSuffixBootstrapMode(bool enabled, idx_t target) {
+ lock_guard<std::mutex> guard(state->lock);
+ if (target < 1 || target > PROFILE_SAMPLE_LIMIT) { throw InvalidInputException("Suffix bootstrap target must be between 1 and 100"); }
+ if (enabled && (!state->pipeline_profiles.empty() || !state->issued_suffix.empty())) {
+  throw InvalidInputException("Suffix bootstrap requires a fresh profile store");
+ }
+ state->suffix_bootstrap_mode = enabled;
+ if (enabled) { state->suffix_bootstrap_target = target; }
+}
+
+bool QueryRequestProfileStore::SuffixBootstrapComplete() const {
+ lock_guard<std::mutex> guard(state->lock);
+ if (state->suffix_profile_index.empty()) { return false; }
+ for (const auto &entry : state->suffix_profile_index) {
+  const auto &profile = state->pipeline_profiles.at(entry.second);
+  if (profile.suffix_point.count < state->suffix_bootstrap_target ||
+      profile.downstream_suffix_ns.samples.Count() < state->suffix_bootstrap_target) { return false; }
+ }
+ return true;
+}
+
+DownstreamSuffixEstimate QueryRequestProfileStore::PrepareDownstreamSuffixActivation(
+    uint64_t db_query_id, const DownstreamSuffixEpochRequest &request, QuerySLASuffixModel model) {
+ if (!db_query_id || !request.pipeline_id || !request.pipeline_signature_hash || !request.remaining_suffix_stages ||
+     model == QuerySLASuffixModel::MODEL_DEFAULT) {
+  throw InvalidInputException("Invalid downstream suffix activation identity or unresolved model");
+ }
+ DownstreamSuffixEstimate forecast;
+ if (model == QuerySLASuffixModel::HISTOGRAM) { forecast = PrepareDownstreamSuffixEpoch({request})[0]; }
+ IssuedSuffixKey key;
+ key.query_id = db_query_id;
+ key.pipeline = BuildSuffixProfileKey(request);
+ lock_guard<std::mutex> guard(state->lock);
+ auto existing = state->issued_suffix.find(key);
+ if (existing != state->issued_suffix.end()) {
+  if (existing->second.model != model) { throw InvalidInputException("Downstream suffix model changed during execution"); }
+  return model == QuerySLASuffixModel::HISTOGRAM ? forecast : existing->second;
+ }
+ if (state->resolved_suffix.count(key)) { throw InvalidInputException("Downstream suffix occurrence already completed"); }
+ if (model == QuerySLASuffixModel::POINT) {
+  auto profile = FindSuffixProfile(*state, key.pipeline);
+  if (!profile || profile->suffix_point.count < state->suffix_bootstrap_target) {
+   state->suffix_runtime.missing_key_count++;
+   throw InvalidInputException("Point suffix has no trained exact key; regenerate bootstrap profiles with at least %llu observations per key",
+                               static_cast<unsigned long long>(state->suffix_bootstrap_target));
+  }
+  forecast.valid = true;
+  forecast.model = model;
+  forecast.primary_level = DownstreamSuffixProfileLevel::EXACT;
+  forecast.exact_sample_count = profile->suffix_point.count;
+  forecast.generation = profile->suffix_point.count;
+  forecast.exact_weight = 1;
+  forecast.bucket_count = 1;
+  forecast.buckets[0].lower_ns = forecast.buckets[0].upper_ns = profile->suffix_point.Prediction();
+  forecast.buckets[0].probability = 1;
+ }
+ if (!forecast.valid) {
+  state->suffix_runtime.missing_key_count++;
+  throw InvalidInputException("Histogram suffix has no trained profile; regenerate bootstrap profiles");
+ }
+ state->issued_suffix.emplace(key, forecast);
+ state->suffix_runtime.issued_count++;
+ return forecast;
+}
+
+DownstreamSuffixEstimate QueryRequestProfileStore::ReadIssuedDownstreamSuffixForecast(
+    uint64_t db_query_id, const DownstreamSuffixEpochRequest &request) const {
+ IssuedSuffixKey key;
+ key.query_id = db_query_id;
+ key.pipeline = BuildSuffixProfileKey(request);
+ lock_guard<std::mutex> guard(state->lock);
+ auto entry = state->issued_suffix.find(key);
+ return entry == state->issued_suffix.end() ? DownstreamSuffixEstimate() : entry->second;
+}
+
+void QueryRequestProfileStore::DiscardDownstreamSuffixForecasts(uint64_t db_query_id) {
+ lock_guard<std::mutex> guard(state->lock);
+ for (auto it = state->issued_suffix.begin(); it != state->issued_suffix.end();) {
+  if (it->first.query_id == db_query_id) {
+   it = state->issued_suffix.erase(it);
+   state->suffix_runtime.discarded_count++;
+  } else { ++it; }
+ }
+}
+
+vector<QueryRequestSuffixModelSnapshot> QueryRequestProfileStore::GetSuffixModelProfilesSnapshot() const {
+ lock_guard<std::mutex> guard(state->lock);
+ vector<QueryRequestSuffixModelSnapshot> result;
+ for (const auto &entry : state->suffix_profile_index) {
+  const auto &profile = state->pipeline_profiles.at(entry.second);
+  QueryRequestSuffixModelSnapshot row;
+  row.template_id = entry.first.template_id;
+  row.scale_factor = entry.first.scale_factor;
+  row.pipeline_id = entry.first.pipeline_id;
+  row.pipeline_structure_hash = entry.first.pipeline_structure_hash;
+  row.observation_count = row.generation = profile.suffix_point.count;
+  row.running_mean_ns = profile.suffix_point.mean_ns;
+  row.latest_ns = profile.suffix_point.latest_ns;
+  row.prediction_ns = profile.suffix_point.Prediction();
+  row.histogram_sample_count = profile.downstream_suffix_ns.samples.Count();
+  result.push_back(row);
+ }
+ std::sort(result.begin(), result.end(), [](const QueryRequestSuffixModelSnapshot &a, const QueryRequestSuffixModelSnapshot &b) {
+  return std::tie(a.template_id, a.scale_factor, a.pipeline_id, a.pipeline_structure_hash) <
+         std::tie(b.template_id, b.scale_factor, b.pipeline_id, b.pipeline_structure_hash);
+ });
+ return result;
+}
+
+QueryRequestSuffixRuntimeSnapshot QueryRequestProfileStore::GetSuffixModelRuntimeSnapshot() const {
+ lock_guard<std::mutex> guard(state->lock);
+ auto result = state->suffix_runtime;
+ result.outstanding_count = state->issued_suffix.size();
+ result.bootstrap_target = state->suffix_bootstrap_target;
+ return result;
+}
+
 void QueryRequestProfileStore::ExportSnapshot(FileSystem &fs, const string &path) const {
 	auto snapshot = CaptureSnapshotState(*state);
 	ProfileSnapshotWriter writer(fs, path);
@@ -2781,6 +2985,11 @@ void QueryRequestProfileStore::ImportSnapshot(FileSystem &fs, const string &path
 
 void QueryRequestProfileStore::Clear() {
 	lock_guard<std::mutex> guard(state->lock);
+	state->suffix_bootstrap_mode = false;
+	state->suffix_bootstrap_target = 15;
+	state->suffix_runtime = QueryRequestSuffixRuntimeSnapshot();
+	state->issued_suffix.clear();
+	state->resolved_suffix.clear();
 	state->query_profiles.clear();
 	state->pipeline_profiles.clear();
 	state->suffix_profile_index.clear();

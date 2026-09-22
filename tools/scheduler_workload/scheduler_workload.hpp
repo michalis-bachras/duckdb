@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/query_sla_suffix_model.hpp"
 #include "duckdb/common/enums/query_scheduler_policy.hpp"
 
 #include <map>
@@ -53,6 +54,9 @@ struct WorkloadConfig {
 	string profile_snapshot_in;
 	string profile_snapshot_out;
 	QuerySchedulerPolicy scheduler_policy = QuerySchedulerPolicy::DEFAULT;
+	QuerySLASuffixModel sla_suffix_model = QuerySLASuffixModel::MODEL_DEFAULT;
+	bool sla_suffix_bootstrap = false;
+	idx_t sla_suffix_bootstrap_observations = 15;
 	string pin_threads = "auto";
 	idx_t threads = 1;
 	idx_t submitter_threads = 2;
@@ -85,6 +89,7 @@ struct RequestResult {
 	uint64_t arrival_ns = 0;
 	uint64_t submit_begin_ns = 0;
 	uint64_t submit_end_ns = 0;
+	uint64_t database_registration_cpu_ns = 0;
 	uint64_t admitted_ns = 0;
 	uint64_t execution_started_ns = 0;
 	uint64_t execution_ready_ns = 0;
@@ -112,6 +117,10 @@ struct RunSummary {
 	double p99_response_s = 0;
 	double mean_arrival_dispatch_lag_ms = 0;
 	double p99_arrival_dispatch_lag_ms = 0;
+		double mean_driver_handoff_lag_ms = 0, p99_driver_handoff_lag_ms = 0;
+	double mean_submitter_queue_lag_ms = 0, p99_submitter_queue_lag_ms = 0;
+	double mean_database_registration_latency_ms = 0, p99_database_registration_latency_ms = 0;
+	double mean_database_registration_cpu_ms = 0, p99_database_registration_cpu_ms = 0;
 	double mean_submission_lag_ms = 0;
 	double p99_submission_lag_ms = 0;
 	double p99_admission_resume_lag_ms = 0;
@@ -132,6 +141,9 @@ vector<ScheduleEntry> GenerateSchedule(const WorkloadConfig &config, const vecto
 vector<ScheduleEntry> ReadSchedule(const string &path);
 void WriteSchedule(const string &path, const vector<ScheduleEntry> &schedule);
 string ScheduleHash(const vector<ScheduleEntry> &schedule);
+
+RunSummary SummarizeRun(const WorkloadConfig &config, const vector<ScheduleEntry> &schedule,
+ const vector<RequestResult> &results, uint64_t run_start_ns, idx_t queue_high_water, idx_t max_waiters);
 
 vector<CalibrationEntry> Calibrate(const WorkloadConfig &config);
 void TrainProfiles(const WorkloadConfig &config);

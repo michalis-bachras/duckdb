@@ -14,6 +14,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <ctime>
+#include <random>
+#include <numeric>
+#include <iomanip>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
@@ -29,6 +33,12 @@ namespace {
 
 static uint64_t TimestampNs() {
 	return PendingQueryNotification::TimestampNs();
+}
+
+static uint64_t ThreadCpuNs() {
+ timespec value;
+ if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) { return 0; }
+ return static_cast<uint64_t>(value.tv_sec) * 1000000000ULL + value.tv_nsec;
 }
 
 static string QuoteSQLString(const string &value) {
@@ -103,6 +113,7 @@ static void ExportRelation(Connection &root, const string &query, const string &
 static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, QuerySchedulerPolicy policy) {
 	ExecuteSetting(root, "SET threads=" + std::to_string(config.threads));
 	ExecuteSetting(root, "SET external_threads=0");
+	ExecuteSetting(root, "SET query_sla_suffix_model=" + QuoteSQLString(QuerySLASuffixModelName(config.sla_suffix_model)));
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
 	ExecuteSetting(root, string("SET query_sla_residual_policy=") +
 	                         QuoteSQLString(config.sla_residual_workers_enabled ? "work_conserving" : "park"));
@@ -147,6 +158,29 @@ static void ImportProfiles(DuckDB &db, const WorkloadConfig &config) {
 }
 
 static void ExportProfiles(DuckDB &db, const WorkloadConfig &config) {
+ if (!config.output_dir.empty()) {
+  db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
+  auto &store = db.instance->GetQueryRequestProfileStore();
+  std::ofstream models(config.output_dir + "/query_request_suffix_models.csv");
+  std::ofstream runtime(config.output_dir + "/query_request_suffix_model_runtime.csv");
+  std::ofstream metadata(config.output_dir + "/run_metadata.json");
+  if (!models || !runtime || !metadata) { throw IOException("Could not write suffix diagnostics"); }
+  models << std::setprecision(17) << "template_id,scale_factor,pipeline_id,pipeline_structure_hash,observation_count,generation,running_mean_ns,latest_ns,prediction_ns,histogram_sample_count\n";
+  for (const auto &row : store.GetSuffixModelProfilesSnapshot()) {
+   models << row.template_id << ',' << row.scale_factor << ',' << row.pipeline_id << ',' << row.pipeline_structure_hash << ','
+          << row.observation_count << ',' << row.generation << ',' << row.running_mean_ns << ',' << row.latest_ns << ','
+          << row.prediction_ns << ',' << row.histogram_sample_count << '\n';
+  }
+  auto r = store.GetSuffixModelRuntimeSnapshot();
+  runtime << "issued_count,resolved_count,discarded_count,outstanding_count,missing_key_count,duplicate_feedback_count,unmatched_feedback_count,bootstrap_target\n"
+          << r.issued_count << ',' << r.resolved_count << ',' << r.discarded_count << ',' << r.outstanding_count << ','
+          << r.missing_key_count << ',' << r.duplicate_feedback_count << ',' << r.unmatched_feedback_count << ',' << r.bootstrap_target << '\n';
+  metadata << "{\n  \"snapshot_version\": 11,\n  \"scheduler\": \"" << SchedulerName(config.scheduler_policy)
+           << "\",\n  \"suffix_model_requested\": \"" << QuerySLASuffixModelName(config.sla_suffix_model)
+           << "\",\n  \"suffix_model\": \"" << QuerySLASuffixModelName(ResolveQuerySLASuffixModel(config.sla_suffix_model, config.scheduler_policy))
+           << "\",\n  \"bootstrap_target\": " << r.bootstrap_target << ",\n  \"seed\": " << config.seed << "\n}\n";
+ }
+
 	if (!config.profile_snapshot_out.empty()) {
 		db.instance->GetQueryRequestProfileStore().ExportSnapshot(db.instance->GetFileSystem(),
 		                                                          config.profile_snapshot_out);
@@ -317,7 +351,7 @@ static double Percentile(vector<double> values, double quantile) {
 	return values[lower] * (1.0 - fraction) + values[upper] * fraction;
 }
 
-static RunSummary Summarize(const WorkloadConfig &config, const vector<ScheduleEntry> &schedule,
+static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<ScheduleEntry> &schedule,
 	                        const vector<RequestResult> &results, uint64_t run_start_ns, idx_t queue_high_water,
 	                        idx_t max_waiters) {
 	RunSummary summary;
@@ -329,6 +363,10 @@ static RunSummary Summarize(const WorkloadConfig &config, const vector<ScheduleE
 	summary.notification_queue_high_water_mark = queue_high_water;
 	vector<double> response_s;
 	vector<double> arrival_dispatch_lag_ms;
+	vector<double> driver_handoff_lag_ms;
+	vector<double> submitter_queue_lag_ms;
+	vector<double> database_registration_latency_ms;
+	vector<double> database_registration_cpu_ms;
 	vector<double> submission_lag_ms;
 	vector<double> admission_resume_lag_ms;
 	double response_total = 0;
@@ -355,6 +393,11 @@ static RunSummary Summarize(const WorkloadConfig &config, const vector<ScheduleE
 		auto submission_lag = result.submit_end_ns > scheduled_ns
 		                          ? static_cast<double>(result.submit_end_ns - scheduled_ns) / 1000000.0
 		                          : 0;
+  auto elapsed_ms = [](uint64_t end, uint64_t start) { return end > start ? static_cast<double>(end - start) / 1000000.0 : 0.0; };
+  driver_handoff_lag_ms.push_back(elapsed_ms(result.submit_begin_ns, scheduled_ns));
+  submitter_queue_lag_ms.push_back(elapsed_ms(result.submit_begin_ns, result.arrival_ns));
+  database_registration_latency_ms.push_back(elapsed_ms(result.submit_end_ns, result.submit_begin_ns));
+  database_registration_cpu_ms.push_back(static_cast<double>(result.database_registration_cpu_ns) / 1000000.0);
 		response_s.push_back(response);
 		arrival_dispatch_lag_ms.push_back(arrival_lag);
 		submission_lag_ms.push_back(submission_lag);
@@ -385,6 +428,15 @@ static RunSummary Summarize(const WorkloadConfig &config, const vector<ScheduleE
 	summary.mean_submission_lag_ms =
 	    submission_lag_ms.empty() ? 0 : submission_lag_total / submission_lag_ms.size();
 	summary.p99_submission_lag_ms = Percentile(submission_lag_ms, 0.99);
+	summary.mean_driver_handoff_lag_ms = driver_handoff_lag_ms.empty() ? 0 : std::accumulate(driver_handoff_lag_ms.begin(), driver_handoff_lag_ms.end(), 0.0) / driver_handoff_lag_ms.size();
+	summary.p99_driver_handoff_lag_ms = Percentile(driver_handoff_lag_ms, 0.99);
+	summary.mean_submitter_queue_lag_ms = submitter_queue_lag_ms.empty() ? 0 : std::accumulate(submitter_queue_lag_ms.begin(), submitter_queue_lag_ms.end(), 0.0) / submitter_queue_lag_ms.size();
+	summary.p99_submitter_queue_lag_ms = Percentile(submitter_queue_lag_ms, 0.99);
+	summary.mean_database_registration_latency_ms = database_registration_latency_ms.empty() ? 0 : std::accumulate(database_registration_latency_ms.begin(), database_registration_latency_ms.end(), 0.0) / database_registration_latency_ms.size();
+	summary.p99_database_registration_latency_ms = Percentile(database_registration_latency_ms, 0.99);
+	summary.mean_database_registration_cpu_ms = database_registration_cpu_ms.empty() ? 0 : std::accumulate(database_registration_cpu_ms.begin(), database_registration_cpu_ms.end(), 0.0) / database_registration_cpu_ms.size();
+	summary.p99_database_registration_cpu_ms = Percentile(database_registration_cpu_ms, 0.99);
+
 	summary.p99_admission_resume_lag_ms = Percentile(admission_resume_lag_ms, 0.99);
 	if (summary.completed_count != summary.request_count) {
 		summary.validity_errors.push_back("not_all_requests_completed_successfully");
@@ -392,8 +444,8 @@ static RunSummary Summarize(const WorkloadConfig &config, const vector<ScheduleE
 	if (summary.p99_arrival_dispatch_lag_ms > config.max_driver_lag_ms) {
 		summary.validity_errors.push_back("p99_arrival_dispatch_lag_exceeded_limit");
 	}
-	if (summary.p99_submission_lag_ms > config.max_driver_lag_ms) {
-		summary.validity_errors.push_back("p99_database_submission_lag_exceeded_limit");
+	if (summary.p99_driver_handoff_lag_ms > config.max_driver_lag_ms) {
+		summary.validity_errors.push_back("p99_driver_handoff_lag_exceeded_limit");
 	}
 	if (summary.p99_admission_resume_lag_ms > config.max_driver_lag_ms) {
 		summary.validity_errors.push_back("p99_admission_resume_lag_exceeded_limit");
@@ -457,35 +509,48 @@ vector<CalibrationEntry> Calibrate(const WorkloadConfig &config) {
 	return calibration;
 }
 
+RunSummary SummarizeRun(const WorkloadConfig &config, const vector<ScheduleEntry> &schedule,
+ const vector<RequestResult> &results, uint64_t run_start_ns, idx_t queue_high_water, idx_t max_waiters) {
+ return SummarizeInternal(config, schedule, results, run_start_ns, queue_high_water, max_waiters);
+}
+
 void TrainProfiles(const WorkloadConfig &config) {
-	DuckDB db;
-	Connection root(db);
-	ConfigureDatabase(root, config, QuerySchedulerPolicy::DEFAULT);
-	ConfigureEnergyAttribution(root, config);
-	ImportProfiles(db, config);
-	uint64_t request_id = 1;
-	for (idx_t repetition = 0; repetition < config.repetitions; repetition++) {
-		for (const auto &database : config.databases) {
-			for (const auto template_id : config.query_templates) {
-				Connection connection(db);
-				ConfigureRequestConnection(connection, config, database.scale_factor, false, false);
-				auto prepared = connection.Prepare(ReadTextFile(QueryPath(config, template_id)));
-				if (prepared->HasError()) {
-					throw InvalidInputException("Could not prepare Q%llu SF%llu: %s", template_id,
-					                            database.scale_factor, prepared->GetError());
-				}
-				auto now = TimestampNs();
-				auto metadata = BuildMetadata(request_id++, template_id, database.scale_factor, config.sla_tag,
-				                              config.sla_penalty_per_s, now + 86400ULL * 1000000000ULL);
-				auto result = ExecutePrepared(*prepared, metadata);
-				if (!result || result->HasError()) {
-					throw InvalidInputException("Profile training Q%llu SF%llu failed: %s", template_id,
-					                            database.scale_factor, result ? result->GetError() : "no result");
-				}
-			}
-		}
-	}
-	ExportProfiles(db, config);
+ DuckDB db;
+ Connection root(db);
+ ConfigureDatabase(root, config, config.scheduler_policy);
+ ConfigureEnergyAttribution(root, config);
+ ImportProfiles(db, config);
+ auto &store = db.instance->GetQueryRequestProfileStore();
+ if (config.sla_suffix_bootstrap) { store.SetSuffixBootstrapMode(true, config.sla_suffix_bootstrap_observations); }
+ vector<std::pair<idx_t, uint64_t>> tasks;
+ for (idx_t i = 0; i < config.databases.size(); i++) {
+  for (auto template_id : config.query_templates) { tasks.emplace_back(i, template_id); }
+ }
+ std::mt19937_64 random(config.seed);
+ uint64_t request_id = 1;
+ for (idx_t repetition = 0; repetition < config.repetitions; repetition++) {
+  std::shuffle(tasks.begin(), tasks.end(), random);
+  for (const auto &task : tasks) {
+   const auto &database = config.databases[task.first];
+   auto template_id = task.second;
+   Connection connection(db);
+   ConfigureRequestConnection(connection, config, database.scale_factor, false, false);
+   auto prepared = connection.Prepare(ReadTextFile(QueryPath(config, template_id)));
+   if (prepared->HasError()) { throw InvalidInputException("Could not prepare profile training query: %s", prepared->GetError()); }
+   auto metadata = BuildMetadata(request_id++, template_id, database.scale_factor, config.sla_tag,
+                                 config.sla_penalty_per_s, TimestampNs() + 86400ULL * 1000000000ULL);
+   auto result = ExecutePrepared(*prepared, metadata);
+   if (!result || result->HasError()) { throw InvalidInputException("Profile training failed: %s", result ? result->GetError() : "no result"); }
+  }
+ }
+ if (config.sla_suffix_bootstrap && !store.SuffixBootstrapComplete()) { throw InvalidInputException("Incomplete exact-key suffix bootstrap; no snapshot exported"); }
+ store.SetSuffixBootstrapMode(false);
+ FinalizeEnergyAttribution(db, root, config);
+ ExportProfiles(db, config);
+ if (!config.output_dir.empty()) {
+  ExportRelation(root, "SELECT * FROM duckdb_debug_query_request_pipeline_hardware_profiles()",
+                 config.output_dir + "/query_request_pipeline_hardware_profiles.csv", "export training hardware profiles");
+ }
 }
 
 RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry> &schedule,
@@ -559,7 +624,9 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 				    run_start_ns + request.schedule.deadline_offset_ns);
 				parameters.has_request_metadata = true;
 				parameters.notification = request.notification;
+				auto registration_cpu_start = ThreadCpuNs();
 				request.pending = request.prepared->PendingQuery(values, std::move(parameters));
+				request.result.database_registration_cpu_ns = ThreadCpuNs() - registration_cpu_start;
 				request.result.submit_end_ns = TimestampNs();
 				request.submission_done = true;
 				guard.unlock();
@@ -705,8 +772,15 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	for (auto &request : requests) {
 		results.push_back(std::move(request->result));
 	}
-	auto summary = Summarize(config, schedule, results, run_start_ns, notification_queue->HighWaterMark(),
+	auto summary = SummarizeInternal(config, schedule, results, run_start_ns, notification_queue->HighWaterMark(),
 	                         max_waiters.load());
+ auto suffix_runtime = db.instance->GetQueryRequestProfileStore().GetSuffixModelRuntimeSnapshot();
+ if (IsQuerySLAPolicy(config.scheduler_policy) && (suffix_runtime.outstanding_count || suffix_runtime.missing_key_count ||
+     suffix_runtime.duplicate_feedback_count || suffix_runtime.unmatched_feedback_count ||
+     suffix_runtime.issued_count != suffix_runtime.resolved_count)) {
+  summary.validity_errors.push_back("invalid_suffix_forecast_feedback");
+  summary.valid = false;
+ }
 	FinalizeEnergyAttribution(db, root, config);
 	db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
 	if (!config.scheduler_trace_templates.empty()) {

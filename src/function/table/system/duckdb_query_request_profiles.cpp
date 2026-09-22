@@ -1265,6 +1265,8 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext 
 	SLA_EPOCH_COLUMN("continuation_sample_count", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("continuation_p90", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("suffix_primary_level", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("suffix_model", LogicalType::VARCHAR);
+	SLA_EPOCH_COLUMN("suffix_generation", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("suffix_exact_sample_count", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("suffix_scale_sample_count", LogicalType::UBIGINT);
 	SLA_EPOCH_COLUMN("suffix_global_sample_count", LogicalType::UBIGINT);
@@ -1490,6 +1492,8 @@ static void DuckDBQuerySLASchedulerEpochsFunction(ClientContext &context, TableF
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.continuation_sample_count));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.continuation_p90));
 		output.SetValue(col++, count, Value(snapshot.suffix_primary_level));
+		output.SetValue(col++, count, Value(snapshot.suffix_model));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_generation));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_exact_sample_count));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_scale_sample_count));
 		output.SetValue(col++, count, Value::UBIGINT(snapshot.suffix_global_sample_count));

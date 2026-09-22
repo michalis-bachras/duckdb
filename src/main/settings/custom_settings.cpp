@@ -1869,6 +1869,28 @@ Value QuerySLASchedulerEpochMsSetting::GetSetting(const ClientContext &context) 
 	return Value::UBIGINT(DBConfig::GetConfig(context).options.query_sla_scheduler_epoch_ms);
 }
 
+void QuerySLASuffixModelSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+ if (db && db->GetQuerySLAScheduler().ActiveQueryCount() != 0) {
+  throw InvalidInputException("query_sla_suffix_model cannot change while SLA-managed queries are active");
+ }
+ auto value = StringUtil::Lower(input.ToString());
+ QuerySLASuffixModel model;
+ if (value == "model_default") { model = QuerySLASuffixModel::MODEL_DEFAULT; }
+ else if (value == "point") { model = QuerySLASuffixModel::POINT; }
+ else if (value == "histogram") { model = QuerySLASuffixModel::HISTOGRAM; }
+ else { throw InvalidInputException("query_sla_suffix_model must be model_default, point, or histogram"); }
+ config.options.query_sla_suffix_model = model;
+}
+
+void QuerySLASuffixModelSetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+ SetGlobal(db, config, Value("model_default"));
+}
+
+Value QuerySLASuffixModelSetting::GetSetting(const ClientContext &context) {
+ const auto &options = DBConfig::GetConfig(context).options;
+ return Value(QuerySLASuffixModelName(ResolveQuerySLASuffixModel(options.query_sla_suffix_model, options.query_scheduler_policy)));
+}
+
 void QuerySLAResidualPolicySetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
 	auto value = StringUtil::Lower(input.ToString());
 	bool enabled;
