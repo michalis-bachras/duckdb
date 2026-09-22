@@ -187,6 +187,16 @@ public:
 		work.lifecycle_tail_estimate.valid = true;
 		work.lifecycle_tail_estimate.p90_ns = 1000000;
 	}
+	void SetModeledWork(idx_t remaining_units, double live_units_per_s, double continuation_p90_ns_per_unit) {
+		work.total_chunks_equiv = remaining_units;
+		work.remaining_chunks_equiv = remaining_units;
+		work.selected_throughput_valid = true;
+		work.selected_throughput_is_live = true;
+		work.selected_single_worker_chunks_per_s = live_units_per_s;
+		work.continuation_estimate.valid = true;
+		work.continuation_estimate.kind = ContinuationEstimateKind::NS_PER_WORK_UNIT;
+		work.continuation_estimate.p90 = continuation_p90_ns_per_unit;
+	}
 	void Schedule() override {
 	}
 	bool GetPipelineWorkSnapshot(PipelineWorkSnapshot &result) const override {
@@ -467,17 +477,51 @@ TEST_CASE("SLA energy allocator lowers hardware only with mature SLA-equivalent 
 	REQUIRE(cold.queries[0].workers[0].hardware == input.reference_hardware);
 }
 
-TEST_CASE("SLA energy mandatory counts preserve the pure SLA reference model",
+TEST_CASE("SLA energy mandatory counts use the trained fastest reference model",
 	      "[api][sla][energy_model]") {
 	auto input = PlannerQuery(90);
 	input.hardware_profiles[0] = TestHardwareProfile(3000000, 2800000, 20, 20);
+	input.reference_model = BuildQuerySLAEnergyReferenceModel(input);
 	auto reference = AllocateQuerySLAWorkers({input.reference_model}, 4, false);
 	auto allocation = AllocateQuerySLAMandatoryWorkers({input}, reference.mandatory);
 
-	REQUIRE(reference.mandatory == vector<idx_t> {2});
+	REQUIRE(reference.mandatory == vector<idx_t> {1});
 	REQUIRE(allocation.valid);
-	REQUIRE(allocation.queries[0].mandatory_workers == 2);
-	REQUIRE(allocation.queries[0].mandatory_reference_safe_throughput == Approx(10));
+	REQUIRE(allocation.queries[0].mandatory_workers == 1);
+	REQUIRE(allocation.queries[0].mandatory_reference_safe_throughput == Approx(20));
+}
+
+TEST_CASE("SLA energy allocates workers using the trained maximum-pair throughput",
+	      "[api][sla][energy_model]") {
+	auto sla_input = BaseModelInput();
+	sla_input.metadata.deadline_ns = 3100000000ULL;
+	sla_input.work.selected_single_worker_chunks_per_s = 2;
+	sla_input.work.selected_throughput_is_live = true;
+	QuerySLAEnergyModelInput input;
+	input.sla_input = sla_input;
+	input.reference_model = BuildQuerySLAModel(sla_input);
+	input.reference_hardware = TestHardware(3000000, 2800000);
+	input.hardware_profiles = {TestHardwareProfile(3000000, 2800000, 10, 10),
+	                           TestHardwareProfile(1200000, 1200000, 8, 2)};
+
+	auto reference = BuildQuerySLAEnergyReferenceModel(input);
+	REQUIRE(reference.valid);
+	REQUIRE(reference.throughput == Approx(10));
+	REQUIRE_FALSE(reference.throughput_is_live);
+	REQUIRE(reference.service_rates == vector<double> {0, 10, 20, 30, 40});
+	REQUIRE(AllocateQuerySLAWorkers({input.reference_model}, 2, false).mandatory == vector<idx_t> {2});
+	REQUIRE(AllocateQuerySLAWorkers({reference}, 2, false).mandatory == vector<idx_t> {1});
+	// The continuation p90 still determines the unfinished work after the first epoch.
+	REQUIRE(QuerySLACurrentPipelineFinishNs(sla_input.work, sla_input.event_kind, 10, true,
+	                                        sla_input.now_ns, sla_input.epoch_ns) == Approx(3000000000.0));
+
+	input.hardware_profiles[0].mature = false;
+	REQUIRE(BuildQuerySLAEnergyReferenceModel(input).throughput == Approx(2));
+	input.hardware_profiles[0].mature = true;
+	input.sla_input.work.selected_throughput_valid = false;
+	input.reference_model = BuildQuerySLAModel(input.sla_input);
+	REQUIRE_FALSE(input.reference_model.valid);
+	REQUIRE(BuildQuerySLAEnergyReferenceModel(input).valid);
 }
 
 TEST_CASE("SLA energy mandatory hardware minimizes normalized EDP after SLA filters",
@@ -1278,6 +1322,59 @@ TEST_CASE("Finishing events reuse the owner's suffix in SLA and energy epochs", 
    if (policy == QuerySchedulerPolicy::SLA_ENERGY) { scheduler.UnregisterWorker(0); }
   }
  }
+}
+
+TEST_CASE("SLA energy activation and epochs use the mature maximum-pair throughput",
+          "[api][sla][energy_model][point_suffix]") {
+	DBConfig config;
+	config.options.maximum_threads = 1;
+	config.options.query_sla_energy_hardware_control_enabled = false;
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	Executor executor(*con.context);
+	auto producer = db.instance->GetScheduler().CreateProducer();
+	auto &store = db.instance->GetQueryRequestProfileStore();
+	auto profile = LifecycleProfile(17);
+	store.SetSuffixBootstrapMode(true, 15);
+	SeedLifecycleSuffix(store, profile, 600000000000ULL);
+	store.SetSuffixBootstrapMode(false);
+	PipelineProfileIdentity identity;
+	identity.valid = true;
+	identity.pipeline_id = profile.pipeline_id;
+	identity.pipeline_signature_hash = profile.pipeline_signature_hash;
+	auto reference_hardware = TestHardware(3500000, 2800000);
+	for (idx_t i = 0; i < PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES; i++) {
+		store.RecordPipelineHardwareThroughput(919, 10, identity, reference_hardware, 10, 1000000000, true);
+		store.RecordPipelineHardwareEnergy(919, 10, identity, reference_hardware, 1000000000, 10, 0, true);
+	}
+	auto hardware_profiles = store.GetPipelineHardwareProfiles(919, 10, identity);
+	REQUIRE(hardware_profiles.size() == 1);
+	REQUIRE(hardware_profiles[0].mature);
+	db.instance->config.options.query_sla_suffix_model = QuerySLASuffixModel::POINT;
+	db.instance->config.options.query_sla_scheduler_epoch_ms = 50;
+	db.instance->SetQuerySchedulerPolicy(QuerySchedulerPolicy::SLA_ENERGY);
+	auto &scheduler = db.instance->GetQuerySLAScheduler();
+	scheduler.RegisterWorker(0, 0);
+	auto metadata = BaseModelInput().metadata;
+	metadata.db_query_id = 9917;
+	metadata.template_id = 919;
+	metadata.scale_factor = 10;
+	metadata.query_start_ns = LifecycleNowNs();
+	metadata.deadline_ns = LifecycleNowNs() + 60000000000ULL;
+	scheduler.RegisterQuery(metadata, *producer, true);
+	auto event = make_shared_ptr<LifecycleTestEvent>(executor, QueryActivationEventKind::PIPELINE, profile);
+	event->SetModeledWork(20, 2, 100000000);
+	scheduler.OnEventScheduled(metadata.db_query_id, event, 2);
+	REQUIRE(scheduler.GetSnapshot()[0].selected_throughput == Approx(10));
+	scheduler.RequestInitialEpoch();
+	shared_ptr<Task> task;
+	REQUIRE(scheduler.TryDequeueTask(0, task) == QuerySLADequeueResult::NO_TASK);
+	auto trace = scheduler.GetEpochTrace();
+	REQUIRE_FALSE(trace.empty());
+	REQUIRE(trace.back().selected_throughput == Approx(10));
+	scheduler.OnEventFinished(metadata.db_query_id, *event);
+	scheduler.UnregisterQuery(metadata.db_query_id);
+	scheduler.UnregisterWorker(0);
 }
 
 TEST_CASE("Point defaults resolve by policy and explicit choices survive ordering", "[api][sla][point_suffix]") {

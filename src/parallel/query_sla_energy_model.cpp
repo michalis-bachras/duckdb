@@ -153,6 +153,8 @@ static CandidateAddition SelectMandatoryAddition(const QuerySLAEnergyModelInput 
 	}
 	for (const auto &candidate : candidates) {
 		auto service = candidate.reference ? reference_service_rate : existing_service_rate + candidate.throughput;
+		// Keep mandatory progress at the reference rate: a slower worker can occupy capacity needed by later
+		// pipelines even when the current Point forecast leaves this query's SLA cost unchanged.
 		if (!candidate.reference && candidate.throughput < reference_increment) {
 			continue;
 		}
@@ -194,6 +196,7 @@ static CandidateAddition SelectMandatoryConfiguration(const QuerySLAEnergyModelI
 	for (const auto &candidate : candidates) {
 		auto service = candidate.reference ? reference_service_rate
 		                                   : static_cast<double>(target_worker_count) * candidate.throughput;
+		// The same progress floor applies when selecting a configuration for all mandatory workers at once.
 		if (!candidate.reference && service < reference_service_rate) {
 			continue;
 		}
@@ -252,22 +255,22 @@ static void ApplyMandatoryConfiguration(QuerySLAEnergyQueryAllocation &target, c
 } // namespace
 
 QuerySLAModel BuildQuerySLAEnergyReferenceModel(const QuerySLAEnergyModelInput &input) {
-	if (input.reference_model.event_kind != QueryActivationEventKind::PIPELINE) {
+	if (input.sla_input.event_kind != QueryActivationEventKind::PIPELINE) {
 		return input.reference_model;
 	}
-	auto candidates = BuildCandidates(input);
-	auto reference = std::find_if(candidates.begin(), candidates.end(),
-	                              [](const HardwareCandidate &candidate) { return candidate.reference; });
-	if (reference == candidates.end()) {
-		return input.reference_model;
+	for (const auto &profile : input.hardware_profiles) {
+		if (!profile.mature || !SameHardware(profile.hardware, input.reference_hardware) ||
+		    profile.safe_work_units_per_s <= 0) {
+			continue;
+		}
+		auto model_input = input.sla_input;
+		model_input.work.selected_throughput_valid = true;
+		model_input.work.selected_throughput_is_live = false;
+		model_input.work.selected_single_worker_chunks_per_s = profile.safe_work_units_per_s;
+		model_input.service_rates.clear();
+		return BuildQuerySLAModel(model_input);
 	}
-	auto model_input = input.sla_input;
-	auto demand_cap = input.reference_model.demand_cap;
-	model_input.service_rates.resize(demand_cap + 1);
-	for (idx_t workers = 0; workers <= demand_cap; workers++) {
-		model_input.service_rates[workers] = static_cast<double>(workers) * reference->throughput;
-	}
-	return BuildQuerySLAModel(model_input);
+	return input.reference_model;
 }
 
 QuerySLAEnergyWorkerAssignment SelectQuerySLAMandatoryAddition(const QuerySLAEnergyModelInput &input,

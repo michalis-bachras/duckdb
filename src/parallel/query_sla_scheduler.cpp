@@ -102,6 +102,13 @@ static bool UsesPipelineSuffix(QueryActivationEventKind kind) {
 	       kind == QueryActivationEventKind::PREPARE_FINISH || kind == QueryActivationEventKind::FINISH;
 }
 
+static bool HasMatureReferenceThroughput(const vector<QueryRequestPipelineHardwareProfileEstimate> &profiles,
+	                                    const QueryRequestHardwareConfiguration &reference) {
+	return std::any_of(profiles.begin(), profiles.end(), [&](const QueryRequestPipelineHardwareProfileEstimate &profile) {
+		return profile.mature && profile.hardware == reference && profile.safe_work_units_per_s > 0;
+	});
+}
+
 static const char *SLAEventKindName(QueryActivationEventKind kind) {
 	switch (kind) {
 	case QueryActivationEventKind::INITIALIZE:
@@ -227,24 +234,23 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 	model_input.now_ns = now_ns;
 	model_input.epoch_ns = epoch_ns;
 	result.suffix = suffix;
-	result.model = BuildQuerySLAModel(model_input);
-	if (!result.model.valid) {
-		throw InvalidInputException("SLA scheduler cannot model query %llu pipeline %llu: %s",
-		                            static_cast<unsigned long long>(capture.metadata.db_query_id),
-		                            static_cast<unsigned long long>(work.pipeline_id), result.model.error);
-	}
-
 	result.energy_policy = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
-	result.claimable =
-	    (!result.model.mandatory_gain.empty() && result.model.mandatory_gain[0] > 0) ||
-	    (!result.model.optional_gain.empty() && result.model.optional_gain[0] > 0);
 	if (!result.energy_policy) {
+		result.model = BuildQuerySLAModel(model_input);
+		if (!result.model.valid) {
+			throw InvalidInputException("SLA scheduler cannot model query %llu pipeline %llu: %s",
+			                            static_cast<unsigned long long>(capture.metadata.db_query_id),
+			                            static_cast<unsigned long long>(work.pipeline_id), result.model.error);
+		}
+		result.claimable =
+		    (!result.model.mandatory_gain.empty() && result.model.mandatory_gain[0] > 0) ||
+		    (!result.model.optional_gain.empty() && result.model.optional_gain[0] > 0);
 		return result;
 	}
 
 	QuerySLAEnergyModelInput energy_input;
 	energy_input.sla_input = model_input;
-	energy_input.reference_model = result.model;
+	energy_input.reference_model = BuildQuerySLAModel(model_input);
 	energy_input.reference_hardware = hardware_manager.ReferenceConfiguration();
 	if (work.profile_identity.valid) {
 		auto &profile_store = db.GetQueryRequestProfileStore();
@@ -265,11 +271,25 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 			energy_input.hardware_profiles.clear();
 		}
 	}
+	auto trained_reference = HasMatureReferenceThroughput(energy_input.hardware_profiles, energy_input.reference_hardware);
+	result.model = BuildQuerySLAEnergyReferenceModel(energy_input);
+	if (trained_reference && event_kind == QueryActivationEventKind::PIPELINE) {
+		energy_input.sla_input.work.selected_throughput_valid = true;
+		energy_input.sla_input.work.selected_throughput_is_live = false;
+		energy_input.sla_input.work.selected_single_worker_chunks_per_s = result.model.throughput;
+	} else if (!db.config.options.query_sla_energy_exploration_enabled) {
+		// An untrained reference cannot qualify lower-frequency placements for normal scheduling.
+		energy_input.hardware_profiles.clear();
+	}
 	auto reference_model = result.model;
 	if (!reference_model.valid) {
-		throw InvalidInputException("SLA-energy scheduler cannot build a successor reference model for query %llu",
-		                            static_cast<unsigned long long>(capture.metadata.db_query_id));
+		throw InvalidInputException("SLA-energy scheduler cannot model query %llu pipeline %llu: %s",
+		                            static_cast<unsigned long long>(capture.metadata.db_query_id),
+		                            static_cast<unsigned long long>(work.pipeline_id), reference_model.error);
 	}
+	result.claimable =
+	    (!reference_model.mandatory_gain.empty() && reference_model.mandatory_gain[0] > 0) ||
+	    (!reference_model.optional_gain.empty() && reference_model.optional_gain[0] > 0);
 	energy_input.reference_model = reference_model;
 	double service_rate = 0;
 	idx_t worker_count = 0;
@@ -970,6 +990,33 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 	auto suffix_estimates = db.GetQueryRequestProfileStore().PrepareDownstreamSuffixEpoch(suffix_requests);
 	const auto suffix_prepare_ns =
 	    collect_diagnostics ? SLADurationNs(SLATimestampNs(), suffix_prepare_start_ns) : 0;
+	const auto energy_policy = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
+	QueryRequestHardwareConfiguration reference_hardware;
+	vector<vector<QueryRequestPipelineHardwareProfileEstimate>> hardware_profiles(captures.size());
+	bool stable_profile_snapshot = !energy_policy;
+	if (energy_policy) {
+		reference_hardware = state->hardware_manager->ReferenceConfiguration();
+		auto &profile_store = db.GetQueryRequestProfileStore();
+		for (idx_t attempt = 0; attempt < 3; attempt++) {
+			auto generation = profile_store.GetPipelineHardwareProfileGeneration();
+			for (idx_t i = 0; i < captures.size(); i++) {
+				hardware_profiles[i].clear();
+				if (work[i].profile_identity.valid) {
+					hardware_profiles[i] = profile_store.GetPipelineHardwareProfiles(
+					    captures[i].metadata.template_id, captures[i].metadata.scale_factor, work[i].profile_identity);
+				}
+			}
+			if (profile_store.GetPipelineHardwareProfileGeneration() == generation) {
+				stable_profile_snapshot = true;
+				break;
+			}
+		}
+		if (!stable_profile_snapshot) {
+			for (auto &profiles : hardware_profiles) {
+				profiles.clear();
+			}
+		}
+	}
 	const auto model_build_start_ns = collect_diagnostics ? SLATimestampNs() : 0;
 	vector<DownstreamSuffixEstimate> resolved_suffixes(captures.size());
 	vector<QuerySLAModelInput> model_inputs;
@@ -997,14 +1044,29 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		model_input.generation = captures[i].generation;
 		model_input.now_ns = now_ns;
 		model_input.epoch_ns = EpochMs() * 1000000ULL;
+		if (energy_policy) {
+			QuerySLAEnergyModelInput reference_input;
+			reference_input.sla_input = model_input;
+			reference_input.reference_model = BuildQuerySLAModel(model_input);
+			reference_input.reference_hardware = reference_hardware;
+			reference_input.hardware_profiles = hardware_profiles[i];
+			auto reference_model = BuildQuerySLAEnergyReferenceModel(reference_input);
+			if (event_kind == QueryActivationEventKind::PIPELINE &&
+			    HasMatureReferenceThroughput(hardware_profiles[i], reference_hardware)) {
+				model_input.work.selected_throughput_valid = true;
+				model_input.work.selected_throughput_is_live = false;
+				model_input.work.selected_single_worker_chunks_per_s = reference_model.throughput;
+			}
+			models.push_back(std::move(reference_model));
+		} else {
+			models.push_back(BuildQuerySLAModel(model_input));
+		}
 		model_inputs.push_back(model_input);
-		models.push_back(BuildQuerySLAModel(model_input));
 	}
 	const auto model_build_ns = collect_diagnostics ? SLADurationNs(SLATimestampNs(), model_build_start_ns) : 0;
 
 	const auto allocation_start_ns = collect_diagnostics ? SLATimestampNs() : 0;
 	auto worker_budget = NumericCast<idx_t>(db.GetScheduler().NumberOfThreads());
-	const auto energy_policy = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
 	auto logical_allocation =
 	    AllocateQuerySLAWorkers(models, worker_budget,
 	                            !energy_policy && db.config.options.query_sla_residual_workers_enabled);
@@ -1019,7 +1081,6 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 	auto published_generation = state->epoch_generation.load() + 1;
 	if (energy_policy) {
 		QuerySLAEnergyPlannerInput planner_input;
-		auto reference_hardware = state->hardware_manager->ReferenceConfiguration();
 		energy_topology = state->hardware_manager->GetWorkerTopology();
 		planner_input.topology = energy_topology;
 		planner_input.core_frequency_levels_khz = state->hardware_manager->CoreFrequencyLevelsKHz();
@@ -1031,32 +1092,19 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		planner_input.exploration_enabled = db.config.options.query_sla_energy_exploration_enabled;
 		planner_input.exploration_seed = db.config.options.query_sla_energy_exploration_seed;
 		planner_input.epochs_without_optional_only_socket = epochs_without_optional_only_socket;
-		auto &profile_store = db.GetQueryRequestProfileStore();
-		bool stable_profile_snapshot = false;
-		for (idx_t attempt = 0; attempt < 3; attempt++) {
-			auto profile_generation = profile_store.GetPipelineHardwareProfileGeneration();
-			planner_input.queries.clear();
-			planner_input.queries.reserve(captures.size());
-			for (idx_t i = 0; i < captures.size(); i++) {
-				QuerySLAEnergyModelInput input;
-				input.sla_input = model_inputs[i];
-				input.reference_model = models[i];
-				input.reference_hardware = reference_hardware;
-				if (work[i].profile_identity.valid) {
-					input.hardware_profiles = profile_store.GetPipelineHardwareProfiles(
-					    captures[i].metadata.template_id, captures[i].metadata.scale_factor, work[i].profile_identity);
-				}
-				planner_input.queries.push_back(std::move(input));
+		planner_input.queries.reserve(captures.size());
+		for (idx_t i = 0; i < captures.size(); i++) {
+			QuerySLAEnergyModelInput input;
+			input.sla_input = model_inputs[i];
+			input.reference_model = models[i];
+			input.reference_hardware = reference_hardware;
+			if (planner_input.exploration_enabled ||
+			    HasMatureReferenceThroughput(hardware_profiles[i], reference_hardware)) {
+				input.hardware_profiles = hardware_profiles[i];
 			}
-			if (profile_store.GetPipelineHardwareProfileGeneration() != profile_generation) {
-				continue;
-			}
-			energy_epoch_plan = PlanQuerySLAEnergyEpoch(planner_input);
-			if (profile_store.GetPipelineHardwareProfileGeneration() == profile_generation) {
-				stable_profile_snapshot = true;
-				break;
-			}
+			planner_input.queries.push_back(std::move(input));
 		}
+		energy_epoch_plan = PlanQuerySLAEnergyEpoch(planner_input);
 		if (!stable_profile_snapshot || !energy_epoch_plan.valid) {
 			// Hardware profiling and placement are secondary to the logical SLA allocation. Retry with only the
 			// calibrated reference pair so an unstable or unusable hardware profile cannot veto runnable work.
