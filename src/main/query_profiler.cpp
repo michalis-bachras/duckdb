@@ -165,13 +165,18 @@ static uint64_t StablePipelineSignatureHash(const string &value) {
 	return hash;
 }
 
+uint64_t PipelineStructureSignatureHash(const string &operator_type_sequence, const string &source_type,
+                                        const string &sink_type) {
+	return StablePipelineSignatureHash(
+	    StringUtil::Format("%s|source=%s|sink=%s", operator_type_sequence, source_type, sink_type));
+}
+
 static string BuildPipelineSignature(const PipelineProfilingInfo &profile) {
-	return StringUtil::Format(
-	    "%s|source=%s|sink=%s|input=%s|confidence=%s|native=%s|source_card=%llu|sink_card=%llu",
-	    profile.operator_type_sequence, profile.source_type, profile.sink_type, profile.source_input_kind,
-	    profile.source_input_confidence, profile.planned_input_native_unit,
-	    static_cast<unsigned long long>(profile.source_estimated_cardinality),
-	    static_cast<unsigned long long>(profile.sink_estimated_cardinality));
+	// Preserve execution-mode and native-unit separation without fragmenting profiles on cardinality estimates.
+	return StringUtil::Format("%s|source=%s|sink=%s|input=%s|confidence=%s|native=%s",
+	                          profile.operator_type_sequence, profile.source_type, profile.sink_type,
+	                          profile.source_input_kind, profile.source_input_confidence,
+	                          profile.planned_input_native_unit);
 }
 
 static SourceThroughputCounters ApplySourceThroughputFallback(const PipelineProfilingInfo &profile,
@@ -257,6 +262,8 @@ idx_t QueryProfiler::RegisterPipelineProfile(const PhysicalOperator &source,
 		profile.operator_count++;
 		AppendPipelineOperatorType(profile.operator_type_sequence, profile.sink_type);
 	}
+	profile.pipeline_structure_hash =
+	    PipelineStructureSignatureHash(profile.operator_type_sequence, profile.source_type, profile.sink_type);
 	pipeline_profiles.push_back(std::move(profile));
 	pipeline_profile_index[pipeline_profiles.back().pipeline_id] = pipeline_profiles.size() - 1;
 	return pipeline_profiles.back().pipeline_id;
@@ -318,6 +325,7 @@ PipelineProfileIdentity QueryProfiler::RecordPipelineProfileStart(idx_t pipeline
 	PipelineProfileIdentity identity;
 	identity.pipeline_id = profile->pipeline_id;
 	identity.pipeline_signature_hash = profile->pipeline_signature_hash;
+	identity.pipeline_structure_hash = profile->pipeline_structure_hash;
 	identity.source_work_class = profile->source_work_class;
 	identity.sink_type = profile->sink_operator_type;
 	identity.planned_input_native_unit = profile->planned_input_native_unit;
@@ -1149,6 +1157,9 @@ static void PipelineProfilesToJSON(yyjson_mut_doc *doc, yyjson_mut_val *result_o
 	for (auto &profile : pipeline_profiles) {
 		auto pipeline_obj = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_id", profile.pipeline_id);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_signature_hash", profile.pipeline_signature_hash);
+		yyjson_mut_obj_add_uint(doc, pipeline_obj, "pipeline_structure_hash", profile.pipeline_structure_hash);
+		yyjson_mut_obj_add_str(doc, pipeline_obj, "pipeline_signature", profile.pipeline_signature.c_str());
 		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_name", profile.source_name.c_str());
 		yyjson_mut_obj_add_str(doc, pipeline_obj, "source_type", profile.source_type.c_str());
 		yyjson_mut_obj_add_str(doc, pipeline_obj, "sink_name", profile.sink_name.c_str());

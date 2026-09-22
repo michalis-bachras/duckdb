@@ -58,10 +58,10 @@ bool DBConfigOptions::debug_print_bindings = false;
 		    nullptr, optional_idx()                                                                                    \
 	}
 
-#define DUCKDB_SETTING_ALIAS(_ALIAS, _SETTING_INDEX)                                                                   \
-	{ _ALIAS, _SETTING_INDEX }
+#define DUCKDB_SETTING_ALIAS(_ALIAS, _SETTING)                                                                   \
+	{ _ALIAS, _SETTING::Name }
 #define FINAL_ALIAS                                                                                                    \
-	{ nullptr, 0 }
+	{ nullptr, nullptr }
 
 static const ConfigurationOption internal_options[] = {
 
@@ -229,12 +229,12 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     FINAL_SETTING};
 
-static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 120),
-                                                     DUCKDB_SETTING_ALIAS("null_order", 43),
-                                                     DUCKDB_SETTING_ALIAS("profiling_output", 139),
-                                                     DUCKDB_SETTING_ALIAS("user", 154),
-                                                     DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 25),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 153),
+static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", MaxMemorySetting),
+	                                                     DUCKDB_SETTING_ALIAS("null_order", DefaultNullOrderSetting),
+	                                                     DUCKDB_SETTING_ALIAS("profiling_output", ProfileOutputSetting),
+	                                                     DUCKDB_SETTING_ALIAS("user", UsernameSetting),
+	                                                     DUCKDB_SETTING_ALIAS("wal_autocheckpoint", CheckpointThresholdSetting),
+	                                                     DUCKDB_SETTING_ALIAS("worker_threads", ThreadsSetting),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {
@@ -303,9 +303,13 @@ optional_ptr<const ConfigurationOption> DBConfig::GetOptionByName(const String &
 		}
 	}
 	for (idx_t index = 0; setting_aliases[index].alias; index++) {
-		D_ASSERT(StringUtil::Lower(internal_options[index].name) == string(internal_options[index].name));
 		if (setting_aliases[index].alias == lname) {
-			return GetOptionByIndex(setting_aliases[index].option_index);
+			for (idx_t option_index = 0; internal_options[option_index].name; option_index++) {
+				if (setting_aliases[index].target == string(internal_options[option_index].name)) {
+					return internal_options + option_index;
+				}
+			}
+			return nullptr;
 		}
 	}
 	return nullptr;

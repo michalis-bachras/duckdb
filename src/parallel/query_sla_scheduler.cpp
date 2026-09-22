@@ -97,6 +97,11 @@ static uint64_t SLADurationNs(uint64_t end_ns, uint64_t start_ns) {
 	return end_ns >= start_ns ? end_ns - start_ns : 0;
 }
 
+static bool UsesPipelineSuffix(QueryActivationEventKind kind) {
+	return kind == QueryActivationEventKind::PIPELINE || kind == QueryActivationEventKind::INTERNAL ||
+	       kind == QueryActivationEventKind::PREPARE_FINISH || kind == QueryActivationEventKind::FINISH;
+}
+
 static const char *SLAEventKindName(QueryActivationEventKind kind) {
 	switch (kind) {
 	case QueryActivationEventKind::INITIALIZE:
@@ -189,14 +194,14 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 	}
 
 	DownstreamSuffixEstimate suffix;
-	if (event_kind == QueryActivationEventKind::PIPELINE || event_kind == QueryActivationEventKind::INTERNAL) {
+	if (UsesPipelineSuffix(event_kind)) {
 		if (!work.profile_identity.valid) {
 			throw InvalidInputException("SLA scheduler requires a stable profile identity for modeled work");
 		}
 		vector<DownstreamSuffixEpochRequest> requests;
 		requests.emplace_back(capture.metadata.template_id, capture.metadata.scale_factor,
 		                      work.profile_identity.pipeline_id, work.profile_identity.pipeline_signature_hash,
-		                      capture.remaining_suffix_stages);
+		                      capture.remaining_suffix_stages, work.profile_identity.pipeline_structure_hash);
 		auto estimates = db.GetQueryRequestProfileStore().PrepareDownstreamSuffixEpoch(requests);
 		if (!estimates.empty()) {
 			suffix = estimates[0];
@@ -937,7 +942,7 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 			continue;
 		}
 		auto event_kind = captures[i].event->GetQueryActivationKind();
-		if ((event_kind != QueryActivationEventKind::PIPELINE && event_kind != QueryActivationEventKind::INTERNAL) ||
+		if (!UsesPipelineSuffix(event_kind) ||
 		    !work[i].profile_identity.valid) {
 			continue;
 		}
@@ -945,7 +950,7 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 		suffix_requests.emplace_back(captures[i].metadata.template_id, captures[i].metadata.scale_factor,
 		                             work[i].profile_identity.pipeline_id,
 		                             work[i].profile_identity.pipeline_signature_hash,
-		                             captures[i].remaining_suffix_stages);
+		                             captures[i].remaining_suffix_stages, work[i].profile_identity.pipeline_structure_hash);
 	}
 	const auto work_snapshot_ns = collect_diagnostics ? SLADurationNs(SLATimestampNs(), work_snapshot_start_ns) : 0;
 	const auto suffix_prepare_start_ns = collect_diagnostics ? SLATimestampNs() : 0;
@@ -961,7 +966,7 @@ idx_t QuerySLAScheduler::RunEpoch(uint64_t now_ns) {
 	for (idx_t i = 0; i < captures.size(); i++) {
 		DownstreamSuffixEstimate suffix;
 		auto event_kind = captures[i].event->GetQueryActivationKind();
-		if (event_kind == QueryActivationEventKind::PIPELINE || event_kind == QueryActivationEventKind::INTERNAL) {
+		if (UsesPipelineSuffix(event_kind)) {
 			if (suffix_indexes[i] != DConstants::INVALID_INDEX && suffix_indexes[i] < suffix_estimates.size()) {
 				suffix = suffix_estimates[suffix_indexes[i]];
 			}

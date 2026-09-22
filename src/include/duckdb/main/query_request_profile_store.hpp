@@ -95,9 +95,11 @@ struct DownstreamSuffixEstimate {
 struct DownstreamSuffixEpochRequest {
 	DownstreamSuffixEpochRequest() = default;
 	DownstreamSuffixEpochRequest(uint64_t template_id_p, uint64_t scale_factor_p, idx_t pipeline_id_p,
-	                             uint64_t pipeline_signature_hash_p, idx_t remaining_suffix_stages_p)
+	                             uint64_t pipeline_signature_hash_p, idx_t remaining_suffix_stages_p,
+	                             uint64_t pipeline_structure_hash_p = 0)
 	    : template_id(template_id_p), scale_factor(scale_factor_p), pipeline_id(pipeline_id_p),
-	      pipeline_signature_hash(pipeline_signature_hash_p), remaining_suffix_stages(remaining_suffix_stages_p) {
+	      pipeline_signature_hash(pipeline_signature_hash_p), remaining_suffix_stages(remaining_suffix_stages_p),
+	      pipeline_structure_hash(pipeline_structure_hash_p) {
 	}
 
 	uint64_t template_id = 0;
@@ -105,6 +107,7 @@ struct DownstreamSuffixEpochRequest {
 	idx_t pipeline_id = 0;
 	uint64_t pipeline_signature_hash = 0;
 	idx_t remaining_suffix_stages = 0;
+	uint64_t pipeline_structure_hash = 0;
 };
 
 struct QueryRequestProfileEstimate {

@@ -114,6 +114,7 @@ struct PipelineTaskProfilingInfo {
 struct PipelineProfilingInfo {
 	idx_t pipeline_id = 0;
 	uint64_t pipeline_signature_hash = 0;
+	uint64_t pipeline_structure_hash = 0;
 	string pipeline_signature;
 	SourceWorkClass source_work_class;
 	PhysicalOperatorType source_operator_type = PhysicalOperatorType::INVALID;

@@ -34,12 +34,10 @@ static uint64_t StableStringHash64(const string &value) {
 }
 
 static string PipelineSignature(const PipelineProfilingInfo &profile) {
-	return StringUtil::Format(
-	    "%s|source=%s|sink=%s|input=%s|confidence=%s|native=%s|source_card=%llu|sink_card=%llu",
-	    profile.operator_type_sequence, profile.source_type, profile.sink_type, profile.source_input_kind,
-	    profile.source_input_confidence, profile.planned_input_native_unit,
-	    static_cast<unsigned long long>(profile.source_estimated_cardinality),
-	    static_cast<unsigned long long>(profile.sink_estimated_cardinality));
+	return StringUtil::Format("%s|source=%s|sink=%s|input=%s|confidence=%s|native=%s",
+	                          profile.operator_type_sequence, profile.source_type, profile.sink_type,
+	                          profile.source_input_kind, profile.source_input_confidence,
+	                          profile.planned_input_native_unit);
 }
 
 static QueryRequestMetadata Metadata(uint64_t request_id, uint64_t template_id, uint64_t scale_factor,
@@ -134,6 +132,34 @@ static string MetadataQuery(uint64_t request_id, uint64_t template_id, uint64_t 
 }
 
 } // namespace
+
+TEST_CASE("Structural suffix sharing preserves execution and hardware profile separation", "[api][sla][suffix_identity]") {
+ QueryRequestProfileStore store;
+ auto build = PipelineProfile(1000);
+ build.pipeline_structure_hash = PipelineStructureSignatureHash(build.operator_type_sequence, build.source_type, build.sink_type);
+ auto alternate = build;
+ alternate.planned_input_native_unit = "standard_chunk";
+ alternate.pipeline_signature_hash++;
+ auto metadata = Metadata(1, 919, 10, 1, 1000000000);
+ for (idx_t i = 0; i < 4; i++) {
+  metadata.db_query_id++;
+  store.RecordQueryCompletion(metadata, build.finish_done_ns + 500, {build}, {});
+ }
+ DownstreamSuffixEpochRequest request(919, 10, alternate.pipeline_id, alternate.pipeline_signature_hash, 1, alternate.pipeline_structure_hash);
+ auto suffix = store.PrepareDownstreamSuffixEpoch({request})[0];
+ REQUIRE(suffix.valid);
+ REQUIRE(suffix.exact_sample_count == 4);
+ REQUIRE(suffix.exact_weight == Approx(1));
+ QueryRequestPipelineProfileEstimate estimate;
+ REQUIRE_FALSE(store.TryGetPipelineEstimate(919, 10, alternate.pipeline_id, alternate.pipeline_signature_hash, estimate));
+ auto hardware = QueryRequestHardwareConfiguration();
+ hardware.core_frequency_khz = 3000000;
+ hardware.uncore_frequency_khz = 2800000;
+ store.RecordPipelineHardwareThroughput(919, 10, PipelineIdentity(build), hardware, 10, 1000000, true);
+ REQUIRE(store.GetPipelineHardwareProfiles(919, 10, PipelineIdentity(alternate)).empty());
+ request.pipeline_structure_hash++;
+ REQUIRE(store.PrepareDownstreamSuffixEpoch({request})[0].exact_sample_count == 0);
+}
 
 TEST_CASE("Pipeline hardware profiles require stable exact-pair observations", "[api][sla_energy]") {
 	QueryRequestProfileStore store;

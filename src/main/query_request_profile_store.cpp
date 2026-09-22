@@ -31,8 +31,7 @@ static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
 static constexpr double HARDWARE_POWER_EWMA_ALPHA = 0.7;
 static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
 static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
-static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 6;
-static constexpr uint32_t PROFILE_SNAPSHOT_VERSION_LEGACY_CHARGED_POWER = 5;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 11;
 static const char *PROFILE_SNAPSHOT_MAGIC = "DUCKDB_QUERY_REQUEST_PROFILE";
 
 class ProfileSnapshotWriter {
@@ -430,6 +429,30 @@ struct PipelineProfileKeyHash {
 	}
 };
 
+struct SuffixProfileKey {
+	uint64_t template_id = 0;
+	uint64_t scale_factor = 0;
+	idx_t pipeline_id = 0;
+	uint64_t pipeline_structure_hash = 0;
+
+	bool operator==(const SuffixProfileKey &other) const {
+		return template_id == other.template_id && scale_factor == other.scale_factor &&
+		       pipeline_id == other.pipeline_id && pipeline_structure_hash == other.pipeline_structure_hash;
+	}
+};
+
+struct SuffixProfileKeyHash {
+	size_t operator()(const SuffixProfileKey &key) const {
+		size_t result = std::hash<uint64_t> {}(key.template_id);
+		result ^= std::hash<uint64_t> {}(key.scale_factor) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		result ^= std::hash<idx_t> {}(key.pipeline_id) + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+		result ^= std::hash<uint64_t> {}(key.pipeline_structure_hash) + 0x9e3779b97f4a7c15ULL + (result << 6) +
+		          (result >> 2);
+		return result;
+	}
+};
+
 struct InternalEventProfileKey {
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
@@ -652,6 +675,7 @@ struct QueryProfileAggregate {
 };
 
 struct PipelineProfileAggregate {
+	uint64_t pipeline_structure_hash = 0;
 	uint64_t template_id = 0;
 	uint64_t scale_factor = 0;
 	idx_t pipeline_id = 0;
@@ -689,6 +713,7 @@ struct InternalEventProfileAggregate {
 using namespace query_request_profile_store_internal;
 
 struct QueryRequestProfileStoreState {
+	std::unordered_map<SuffixProfileKey, PipelineProfileKey, SuffixProfileKeyHash> suffix_profile_index;
 	std::mutex lock;
 	std::atomic<uint64_t> pipeline_hardware_profile_generation {1};
 	std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> query_profiles;
@@ -721,6 +746,76 @@ struct QueryRequestProfileStoreState {
 namespace query_request_profile_store_internal {
 
 static constexpr uint64_t PROFILE_SNAPSHOT_MAX_ENTRIES = 1ULL << 20;
+
+static SuffixProfileKey BuildSuffixProfileKey(uint64_t template_id, uint64_t scale_factor, idx_t pipeline_id,
+                                              uint64_t pipeline_signature_hash,
+                                              uint64_t pipeline_structure_hash) {
+	SuffixProfileKey result;
+	result.template_id = template_id;
+	result.scale_factor = scale_factor;
+	result.pipeline_id = pipeline_id;
+	result.pipeline_structure_hash = pipeline_structure_hash ? pipeline_structure_hash : pipeline_signature_hash;
+	return result;
+}
+
+static SuffixProfileKey BuildSuffixProfileKey(const DownstreamSuffixEpochRequest &request) {
+	return BuildSuffixProfileKey(request.template_id, request.scale_factor, request.pipeline_id,
+	                             request.pipeline_signature_hash, request.pipeline_structure_hash);
+}
+
+static SuffixProfileKey BuildSuffixProfileKey(const QueryRequestMetadata &metadata,
+                                              const PipelineProfilingInfo &profile) {
+	return BuildSuffixProfileKey(metadata.template_id, metadata.scale_factor, profile.pipeline_id,
+	                             profile.pipeline_signature_hash, profile.pipeline_structure_hash);
+}
+
+static uint64_t StoredPipelineStructureHash(const PipelineProfileKey &key, const PipelineProfileAggregate &profile) {
+	return profile.pipeline_structure_hash ? profile.pipeline_structure_hash : key.pipeline_signature_hash;
+}
+
+static SuffixProfileKey BuildStoredSuffixProfileKey(const PipelineProfileKey &key,
+                                                    const PipelineProfileAggregate &profile) {
+	return BuildSuffixProfileKey(key.template_id, key.scale_factor, key.pipeline_id, key.pipeline_signature_hash,
+	                             StoredPipelineStructureHash(key, profile));
+}
+
+static bool HasSuffixProfileState(const PipelineProfileAggregate &profile) {
+	return profile.downstream_suffix_ns.samples.Count() > 0;
+}
+
+static PipelineProfileAggregate *FindSuffixProfile(QueryRequestProfileStoreState &state,
+                                                   const SuffixProfileKey &key) {
+	auto index_entry = state.suffix_profile_index.find(key);
+	if (index_entry == state.suffix_profile_index.end()) {
+		return nullptr;
+	}
+	auto profile_entry = state.pipeline_profiles.find(index_entry->second);
+	return profile_entry == state.pipeline_profiles.end() ? nullptr : &profile_entry->second;
+}
+
+static PipelineProfileAggregate &GetOrCreateSuffixProfile(QueryRequestProfileStoreState &state,
+                                                          const SuffixProfileKey &key,
+                                                          const PipelineProfileKey &execution_key) {
+	auto insertion = state.suffix_profile_index.emplace(key, execution_key);
+	auto profile_entry = state.pipeline_profiles.find(insertion.first->second);
+	if (profile_entry == state.pipeline_profiles.end()) {
+		throw InternalException("Structural suffix index references an unavailable execution profile");
+	}
+	return profile_entry->second;
+}
+
+static void RebuildSuffixProfileIndex(QueryRequestProfileStoreState &state) {
+	state.suffix_profile_index.clear();
+	for (const auto &entry : state.pipeline_profiles) {
+		if (!HasSuffixProfileState(entry.second)) {
+			continue;
+		}
+		auto key = BuildStoredSuffixProfileKey(entry.first, entry.second);
+		if (!state.suffix_profile_index.emplace(key, entry.first).second) {
+			throw SerializationException("Duplicate structural suffix profile in query profile snapshot");
+		}
+	}
+}
 
 struct ProfileSnapshotState {
 	std::unordered_map<QueryProfileKey, QueryProfileAggregate, QueryProfileKeyHash> query_profiles;
@@ -857,6 +952,7 @@ static void WritePipelineProfile(ProfileSnapshotWriter &writer, const PipelinePr
 	writer.Write<uint64_t>(profile.scale_factor);
 	writer.Write<uint64_t>(profile.pipeline_id);
 	writer.Write<uint64_t>(profile.pipeline_signature_hash);
+	writer.Write<uint64_t>(profile.pipeline_structure_hash);
 	writer.WriteString(profile.pipeline_signature);
 	writer.WriteString(profile.operator_type_sequence);
 	writer.WriteString(profile.source_type);
@@ -884,6 +980,7 @@ static PipelineProfileAggregate ReadPipelineProfile(ProfileSnapshotReader &reade
 	result.scale_factor = reader.Read<uint64_t>();
 	result.pipeline_id = reader.Read<uint64_t>();
 	result.pipeline_signature_hash = reader.Read<uint64_t>();
+	result.pipeline_structure_hash = reader.Read<uint64_t>();
 	result.pipeline_signature = reader.ReadString();
 	result.operator_type_sequence = reader.ReadString();
 	result.source_type = reader.ReadString();
@@ -1235,6 +1332,7 @@ static void InstallSnapshotState(QueryRequestProfileStoreState &state, ProfileSn
 	lock_guard<std::mutex> guard(state.lock);
 	state.query_profiles = std::move(snapshot.query_profiles);
 	state.pipeline_profiles = std::move(snapshot.pipeline_profiles);
+	RebuildSuffixProfileIndex(state);
 	state.scale_downstream_suffix_profiles = std::move(snapshot.scale_downstream_suffix_profiles);
 	state.global_downstream_suffix_profile = std::move(snapshot.global_downstream_suffix_profile);
 	state.source_sink_continuation_profiles = std::move(snapshot.source_sink_continuation_profiles);
@@ -1525,7 +1623,9 @@ static DownstreamSuffixEstimate BuildDownstreamSuffixEstimate(const DownstreamSu
 }
 
 struct EpochExactSuffixProfile {
-	PipelineProfileKey key;
+	SuffixProfileKey key;
+	PipelineProfileKey execution_key;
+	bool profile_present = false;
 	SuffixHistogramRead read;
 };
 
@@ -1628,6 +1728,7 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		pipeline_profile.scale_factor = metadata.scale_factor;
 		pipeline_profile.pipeline_id = profile.pipeline_id;
 		pipeline_profile.pipeline_signature_hash = profile.pipeline_signature_hash;
+		pipeline_profile.pipeline_structure_hash = profile.pipeline_structure_hash;
 		pipeline_profile.pipeline_signature = profile.pipeline_signature;
 		pipeline_profile.operator_type_sequence = profile.operator_type_sequence;
 		pipeline_profile.source_type = profile.source_type;
@@ -1734,7 +1835,8 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
 		}
 		const auto &suffix_observation = suffix_observations[i];
 		if (suffix_observation.valid) {
-			pipeline_profile.downstream_suffix_ns.Add(static_cast<double>(suffix_observation.suffix_ns));
+			auto &suffix_profile = GetOrCreateSuffixProfile(*state, BuildSuffixProfileKey(metadata, profile), pipeline_key);
+			suffix_profile.downstream_suffix_ns.Add(static_cast<double>(suffix_observation.suffix_ns));
 			state->scale_downstream_suffix_profiles[metadata.scale_factor].Add(
 			    suffix_observation.normalized_suffix_ns);
 			state->global_downstream_suffix_profile.Add(suffix_observation.normalized_suffix_ns);
@@ -2192,7 +2294,7 @@ vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuff
 	vector<idx_t> request_exact_indexes(requests.size(), 0);
 	vector<idx_t> request_scale_indexes(requests.size(), 0);
 	vector<bool> valid_requests(requests.size(), false);
-	std::unordered_map<PipelineProfileKey, idx_t, PipelineProfileKeyHash> exact_indexes;
+	std::unordered_map<SuffixProfileKey, idx_t, SuffixProfileKeyHash> exact_indexes;
 	std::unordered_map<uint64_t, idx_t> scale_indexes;
 	exact_indexes.reserve(requests.size());
 	scale_indexes.reserve(requests.size());
@@ -2203,11 +2305,7 @@ vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuff
 			continue;
 		}
 		valid_requests[request_idx] = true;
-		PipelineProfileKey exact_key;
-		exact_key.template_id = request.template_id;
-		exact_key.scale_factor = request.scale_factor;
-		exact_key.pipeline_id = request.pipeline_id;
-		exact_key.pipeline_signature_hash = request.pipeline_signature_hash;
+		auto exact_key = BuildSuffixProfileKey(request);
 		auto exact_insert = exact_indexes.emplace(exact_key, exact_profiles.size());
 		if (exact_insert.second) {
 			EpochExactSuffixProfile profile;
@@ -2232,7 +2330,14 @@ vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuff
 	{
 		lock_guard<std::mutex> guard(state->lock);
 		for (auto &profile : exact_profiles) {
-			auto entry = state->pipeline_profiles.find(profile.key);
+			auto index_entry = state->suffix_profile_index.find(profile.key);
+			auto entry = index_entry == state->suffix_profile_index.end()
+			                 ? state->pipeline_profiles.end()
+			                 : state->pipeline_profiles.find(index_entry->second);
+			if (entry != state->pipeline_profiles.end()) {
+				profile.execution_key = entry->first;
+				profile.profile_present = true;
+			}
 			profile.read = CaptureSuffixHistogram(entry == state->pipeline_profiles.end()
 			                                          ? nullptr
 			                                          : &entry->second.downstream_suffix_ns);
@@ -2271,7 +2376,8 @@ vector<DownstreamSuffixEstimate> QueryRequestProfileStore::PrepareDownstreamSuff
 	if (has_rebuilt_histogram) {
 		lock_guard<std::mutex> guard(state->lock);
 		for (const auto &profile : exact_profiles) {
-			auto entry = state->pipeline_profiles.find(profile.key);
+			auto entry = profile.profile_present ? state->pipeline_profiles.find(profile.execution_key)
+			                                     : state->pipeline_profiles.end();
 			if (entry != state->pipeline_profiles.end()) {
 				PublishCapturedSuffixHistogram(entry->second.downstream_suffix_ns, profile.read);
 			}
@@ -2651,9 +2757,8 @@ void QueryRequestProfileStore::ImportSnapshot(FileSystem &fs, const string &path
 		throw SerializationException("Invalid query profile snapshot magic");
 	}
 	auto snapshot_version = reader.Read<uint32_t>();
-	if (snapshot_version != PROFILE_SNAPSHOT_VERSION &&
-	    snapshot_version != PROFILE_SNAPSHOT_VERSION_LEGACY_CHARGED_POWER) {
-		throw SerializationException("Unsupported query profile snapshot version");
+	if (snapshot_version != PROFILE_SNAPSHOT_VERSION) {
+		throw SerializationException("Query profile snapshot requires version 11; regenerate training profiles");
 	}
 	if (reader.ReadString() != DuckDB::SourceID()) {
 		throw SerializationException("Query profile snapshot was created by a different DuckDB build");
@@ -2678,6 +2783,7 @@ void QueryRequestProfileStore::Clear() {
 	lock_guard<std::mutex> guard(state->lock);
 	state->query_profiles.clear();
 	state->pipeline_profiles.clear();
+	state->suffix_profile_index.clear();
 	state->scale_downstream_suffix_profiles.clear();
 	state->global_downstream_suffix_profile = SuffixHistogramAggregate();
 	state->source_sink_continuation_profiles.clear();

@@ -27,10 +27,13 @@ struct SourceWorkClass {
 };
 
 string SourceWorkClassToString(const SourceWorkClass &work_class);
+DUCKDB_API uint64_t PipelineStructureSignatureHash(const string &operator_type_sequence, const string &source_type,
+                                                   const string &sink_type);
 
 struct PipelineProfileIdentity {
 	idx_t pipeline_id = 0;
 	uint64_t pipeline_signature_hash = 0;
+	uint64_t pipeline_structure_hash = 0;
 	SourceWorkClass source_work_class;
 	PhysicalOperatorType sink_type = PhysicalOperatorType::INVALID;
 	string planned_input_native_unit;

@@ -97,7 +97,7 @@ struct ConfigurationOption {
 
 struct ConfigurationAlias {
 	const char *alias;
-	idx_t option_index;
+	const char *target;
 };
 
 typedef void (*set_option_callback_t)(ClientContext &context, SetScope scope, Value &parameter);
