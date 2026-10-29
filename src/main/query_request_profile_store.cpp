@@ -33,7 +33,7 @@ static constexpr double THROUGHPUT_EWMA_ALPHA = 0.7;
 static constexpr double HARDWARE_POWER_EWMA_ALPHA = 0.7;
 static constexpr double CONTINUATION_MEDIAN_QUANTILE = 0.50;
 static constexpr double CONTINUATION_TAIL_QUANTILE = 0.90;
-static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 11;
+static constexpr uint32_t PROFILE_SNAPSHOT_VERSION = 12;
 static const char *PROFILE_SNAPSHOT_MAGIC = "DUCKDB_QUERY_REQUEST_PROFILE";
 
 class ProfileSnapshotWriter {
@@ -372,6 +372,7 @@ struct ContinuationAggregate {
 	BoundedSamples values;
 	BoundedQuantileTracker p50 {CONTINUATION_MEDIAN_QUANTILE};
 	BoundedQuantileTracker p90 {CONTINUATION_TAIL_QUANTILE};
+	BoundedQuantileTracker p95 {0.95};
 	string native_unit;
 	idx_t native_unit_mismatch_count = 0;
 
@@ -387,6 +388,7 @@ struct ContinuationAggregate {
 		values.Add(value);
 		p50.Add(value);
 		p90.Add(value);
+		p95.Add(value);
 		return true;
 	}
 };
@@ -1483,6 +1485,7 @@ static void PopulatePipelineEstimate(const PipelineProfileAggregate &profile,
 	estimate.mean_effective_ns_per_work_unit = profile.continuation.values.Mean();
 	estimate.p50_effective_ns_per_work_unit = profile.continuation.p50.Quantile();
 	estimate.p90_effective_ns_per_work_unit = profile.continuation.p90.Quantile();
+	estimate.p95_effective_ns_per_work_unit = profile.continuation.p95.Quantile();
 }
 
 static PipelineContinuationEstimate BuildContinuationEstimate(const ContinuationAggregate &profile,
@@ -1499,6 +1502,7 @@ static PipelineContinuationEstimate BuildContinuationEstimate(const Continuation
 	result.mean = profile.values.Mean();
 	result.p50 = profile.p50.Quantile();
 	result.p90 = profile.p90.Quantile();
+	result.p95 = profile.p95.Quantile();
 	return result;
 }
 
@@ -1533,6 +1537,7 @@ static PipelineLifecycleTailEstimate BuildLifecycleTailEstimate(const Continuati
 	result.mean_ns = profile.values.Mean();
 	result.p50_ns = profile.p50.Quantile();
 	result.p90_ns = profile.p90.Quantile();
+	result.p95_ns = profile.p95.Quantile();
 	return result;
 }
 

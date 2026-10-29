@@ -16,6 +16,7 @@ namespace duckdb {
 
 //! Immutable inputs used to construct the SLA cost curves for one active query event.
 struct QuerySLAModelInput {
+	bool total_package = false;
 	QueryRequestMetadata metadata;
 	PipelineWorkSnapshot work;
 	DownstreamSuffixEstimate suffix;
@@ -28,6 +29,7 @@ struct QuerySLAModelInput {
 };
 
 struct QuerySLAModel {
+	bool total_package = false;
 	bool valid = false;
 	string error;
 	uint64_t db_query_id = 0;

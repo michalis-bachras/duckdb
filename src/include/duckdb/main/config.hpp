@@ -119,6 +119,13 @@ struct DBConfigOptions {
 	QuerySchedulerPolicy query_scheduler_policy = QuerySchedulerPolicy::DEFAULT;
 	//! SLA scheduler epoch length in milliseconds.
 	idx_t query_sla_scheduler_epoch_ms = 200;
+	bool query_sla_total_package = false;
+	bool query_sla_total_reference_only = false;
+	bool query_sla_total_lowest_safe = false;
+	bool query_sla_total_shadow = false;
+	bool query_sla_total_models_validated = false;
+	string query_sla_total_isolated_profiles_path;
+	double query_sla_total_margin = 0.05;
 	QuerySLASuffixModel query_sla_suffix_model = QuerySLASuffixModel::MODEL_DEFAULT;
 	//! Whether the SLA-only scheduler assigns zero-gain residual workers up to pipeline demand caps.
 	bool query_sla_residual_workers_enabled = false;

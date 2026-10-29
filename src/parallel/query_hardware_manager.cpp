@@ -387,6 +387,7 @@ struct QueryHardwareManagerState {
 		std::set<uint32_t> calibrated_core_levels;
 		std::set<uint32_t> calibrated_uncore_levels;
 		std::set<int> calibrated_sockets;
+		bool hierarchy_schema = false;
 		string line;
 		while (std::getline(input, line)) {
 			if (line.empty() || line[0] == '#') {
@@ -396,7 +397,11 @@ struct QueryHardwareManagerState {
 			vector<string> fields;
 			string field;
 			while (std::getline(parser, field, ',')) {
+				if (!field.empty() && field.back() == '\r') field.pop_back();
 				fields.push_back(field);
+			}
+			if (fields.size() >= 8 && fields[0] == "socket_id") {
+				hierarchy_schema = fields[5] == "idle_power_w" && fields[6] == "socket_awake_power_w" && fields[7] == "core_awake_power_w";
 			}
 			if (fields.size() < 5 || fields[0] == "socket_id") {
 				continue;
@@ -426,6 +431,22 @@ struct QueryHardwareManagerState {
 			calibration.core_frequency_khz = std::get<1>(entry.first);
 			calibration.uncore_frequency_khz = std::get<2>(entry.first);
 			calibration.base_power_w = entry.second.first / static_cast<double>(entry.second.second);
+			// Hierarchical rows use the same first five fields as the legacy table.
+			std::ifstream hierarchy(path.c_str());
+			string row;
+			while (hierarchy_schema && std::getline(hierarchy, row)) {
+				std::stringstream stream(row); vector<string> f; string v;
+				while (std::getline(stream, v, ',')) f.push_back(v);
+				if (f.size() < 8 || f[0] == "socket_id") continue;
+				try {
+					if (std::stoi(f[0]) == calibration.socket_id && std::llround(std::stod(f[1])/1000.0) == calibration.core_frequency_khz &&
+					    std::llround(std::stod(f[2])/1000.0) == calibration.uncore_frequency_khz) {
+						calibration.idle_w = std::stod(f[5]); calibration.awake_w = std::stod(f[6]); calibration.physical_core_w = std::stod(f[7]);
+						calibration.hierarchy_valid = std::isfinite(calibration.idle_w) && std::isfinite(calibration.awake_w) &&
+						    std::isfinite(calibration.physical_core_w) && calibration.idle_w >= 0 && calibration.awake_w >= 0 && calibration.physical_core_w >= 0;
+					}
+				} catch (...) {}
+			}
 			power_model.entries.push_back(calibration);
 		}
 		power_model.valid = !power_model.entries.empty();
@@ -434,6 +455,10 @@ struct QueryHardwareManagerState {
 		}
 		core_levels_khz.assign(calibrated_core_levels.begin(), calibrated_core_levels.end());
 		uncore_levels_khz.assign(calibrated_uncore_levels.begin(), calibrated_uncore_levels.end());
+		if (db.config.options.query_sla_total_package) {
+			core_levels_khz = {1200000, 2400000, 3500000};
+			uncore_levels_khz = {2800000};
+		}
 		power_model.minimum_core_frequency_khz = core_levels_khz.front();
 		power_model.minimum_uncore_frequency_khz = uncore_levels_khz.front();
 		auto reference_core_khz = core_levels_khz.back();

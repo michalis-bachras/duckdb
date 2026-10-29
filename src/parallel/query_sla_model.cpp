@@ -214,6 +214,10 @@ QuerySLAServiceEvaluation QuerySLAEvaluateServiceRate(const QuerySLAModelInput &
 	                                                  double aggregate_service_rate, idx_t workers) {
 	QuerySLAServiceEvaluation result;
 	auto work = input.work;
+	if (input.total_package) {
+		work.continuation_estimate.p90 = work.continuation_estimate.p95;
+		work.lifecycle_tail_estimate.p90_ns = work.lifecycle_tail_estimate.p95_ns;
+	}
 	if (workers == 0 && aggregate_service_rate <= 0 && !work.selected_throughput_valid &&
 	    input.service_rates.size() > 1 && input.service_rates[1] > 0) {
 		// An explicit service curve fully models this event. The first positive rate is
@@ -228,6 +232,13 @@ QuerySLAServiceEvaluation QuerySLAEvaluateServiceRate(const QuerySLAModelInput &
 	}
 	auto downstream_budget_ns = static_cast<double>(input.metadata.deadline_ns) - result.current_pipeline_finish_ns;
 	auto penalty_weight_per_ns = input.metadata.sla_penalty_per_s / 1000000000.0;
+	if (input.total_package) {
+		auto suffix95 = QuerySLASuffixQuantileNs(input.suffix, 0.95);
+		result.mandatory_cost = penalty_weight_per_ns * MaxValue<double>(0, suffix95 - downstream_budget_ns);
+		result.optional_risk = 0;
+		result.valid = true;
+		return result;
+	}
 	result.mandatory_cost =
 	    penalty_weight_per_ns * QuerySLAExpectedTardiness(input.suffix, downstream_budget_ns);
 	result.optional_risk = input.metadata.sla_penalty_per_s *
@@ -239,6 +250,7 @@ QuerySLAServiceEvaluation QuerySLAEvaluateServiceRate(const QuerySLAModelInput &
 
 QuerySLAModel BuildProvisionalQuerySLAModel(const QuerySLAModelInput &input) {
 	QuerySLAModel model;
+	model.total_package = input.total_package;
 	model.db_query_id = input.metadata.db_query_id;
 	model.generation = input.generation;
 	model.pipeline_id = input.work.pipeline_id;
@@ -299,7 +311,7 @@ QuerySLAModel BuildQuerySLAModel(const QuerySLAModelInput &input) {
 			return model;
 		}
 		model.mandatory_cost[workers] = evaluation.mandatory_cost;
-		model.optional_risk[workers] = evaluation.optional_risk;
+		model.optional_risk[workers] = input.total_package ? 0 : evaluation.optional_risk;
 	}
 	for (idx_t workers = 0; workers < model.demand_cap; workers++) {
 		model.mandatory_gain[workers] = model.mandatory_cost[workers] - model.mandatory_cost[workers + 1];
@@ -316,10 +328,19 @@ QuerySLAAllocation AllocateQuerySLAWorkers(const vector<QuerySLAModel> &models, 
 	result.optional.resize(models.size(), 0);
 	result.residual.resize(models.size(), 0);
 
+    // Required serial lifecycle tasks are execution plumbing, not invented useful work or optional service.
+    for (idx_t i=0; i<models.size() && worker_budget>0; i++) {
+        const auto &m=models[i];
+        if (m.total_package && m.valid && m.demand_cap &&
+            ((m.event_kind != QueryActivationEventKind::PIPELINE && m.event_kind != QueryActivationEventKind::INTERNAL) || m.remaining_work_units==0)) {
+            result.mandatory[i]=1; worker_budget--;
+            QuerySLAAllocationToken token;token.query_index=i;token.worker_ordinal=0;token.mandatory=true;token.gain=0;result.tokens.push_back(token);
+        }
+    }
 	std::priority_queue<EpochHeapEntry> mandatory_heap;
 	for (idx_t i = 0; i < models.size(); i++) {
-		if (models[i].valid && models[i].demand_cap > 0 && !models[i].mandatory_gain.empty()) {
-			mandatory_heap.emplace(models[i].mandatory_gain[0], i, 0);
+		if (models[i].valid && models[i].demand_cap > 0 && !models[i].mandatory_gain.empty() && result.mandatory[i] < models[i].mandatory_gain.size()) {
+			auto n=result.mandatory[i]; mandatory_heap.emplace(models[i].mandatory_gain[n], i, n);
 		}
 	}
 	while (worker_budget > 0 && !mandatory_heap.empty()) {

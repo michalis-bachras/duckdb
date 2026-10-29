@@ -125,6 +125,8 @@ struct QueryHardwarePowerCalibrationEntry {
 	uint32_t core_frequency_khz = 0;
 	uint32_t uncore_frequency_khz = 0;
 	double base_power_w = 0;
+	bool hierarchy_valid = false;
+	double idle_w = 0, awake_w = 0, physical_core_w = 0;
 };
 
 struct QueryHardwarePowerModelSnapshot {

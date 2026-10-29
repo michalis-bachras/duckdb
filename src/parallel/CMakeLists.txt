@@ -20,6 +20,7 @@ add_library_unity(
   query_sla_energy_model.cpp
   query_sla_energy_planner.cpp
   query_sla_model.cpp
+  query_total_package.cpp
   query_sla_scheduler.cpp
   query_stride_scheduler.cpp
   query_stride_optimizer.cpp

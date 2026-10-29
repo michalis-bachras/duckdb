@@ -32,11 +32,6 @@ struct CandidateAddition {
 	double epoch_energy_j = 0;
 };
 
-static bool SameHardware(const QueryRequestHardwareConfiguration &left,
-	                     const QueryRequestHardwareConfiguration &right) {
-	return left == right;
-}
-
 static bool IsLifecycleEvent(QueryActivationEventKind event_kind) {
 	switch (event_kind) {
 	case QueryActivationEventKind::INITIALIZE:
@@ -75,17 +70,6 @@ static bool MandatoryCandidatePreferred(const HardwareCandidate &candidate, cons
 	return candidate.hardware.core_frequency_khz < current.hardware.core_frequency_khz;
 }
 
-static double PredictedEpochEnergy(const QuerySLAModelInput &input, double service_rate, double power_w) {
-	if (service_rate <= 0 || power_w < 0 || !std::isfinite(service_rate) || !std::isfinite(power_w)) {
-		return 0;
-	}
-	auto epoch_s = static_cast<double>(input.epoch_ns) / 1000000000.0;
-	auto work_s = input.work.remaining_chunks_equiv > 0
-	                  ? static_cast<double>(input.work.remaining_chunks_equiv) / service_rate
-	                  : 0.0;
-	return power_w * MinValue<double>(epoch_s, work_s);
-}
-
 static vector<HardwareCandidate> BuildCandidates(const QuerySLAEnergyModelInput &input) {
 	vector<HardwareCandidate> result;
 	HardwareCandidate reference;
@@ -93,7 +77,7 @@ static vector<HardwareCandidate> BuildCandidates(const QuerySLAEnergyModelInput 
 	reference.throughput = input.reference_model.throughput;
 	reference.reference = true;
 	for (const auto &profile : input.hardware_profiles) {
-		if (!profile.mature || !SameHardware(profile.hardware, input.reference_hardware)) {
+		if (!profile.mature || !(profile.hardware == input.reference_hardware)) {
 			continue;
 		}
 		reference.throughput = profile.safe_work_units_per_s;
@@ -112,7 +96,7 @@ static vector<HardwareCandidate> BuildCandidates(const QuerySLAEnergyModelInput 
 		auto active_power_w =
 		    profile.ewma_active_power_w > 0 ? profile.ewma_active_power_w : profile.mean_active_power_w;
 		if (!profile.mature || profile.safe_work_units_per_s <= 0 || active_power_w <= 0 ||
-		    SameHardware(profile.hardware, input.reference_hardware)) {
+		    (profile.hardware == input.reference_hardware)) {
 			continue;
 		}
 		HardwareCandidate candidate;
@@ -169,7 +153,7 @@ static CandidateAddition SelectMandatoryAddition(const QuerySLAEnergyModelInput 
 		addition.evaluation = evaluation;
 		addition.aggregate_service_rate = service;
 		addition.aggregate_power_w = candidate.active_power_w;
-		addition.epoch_energy_j = PredictedEpochEnergy(input.sla_input, service, candidate.active_power_w);
+		addition.epoch_energy_j = QuerySLAPredictedEpochEnergy(input.sla_input, service, candidate.active_power_w);
 		if (candidate.reference) {
 			fallback = addition;
 		}
@@ -212,7 +196,7 @@ static CandidateAddition SelectMandatoryConfiguration(const QuerySLAEnergyModelI
 		addition.aggregate_service_rate = service;
 		addition.aggregate_power_w = static_cast<double>(target_worker_count) * candidate.active_power_w;
 		addition.epoch_energy_j =
-		    PredictedEpochEnergy(input.sla_input, addition.aggregate_service_rate, addition.aggregate_power_w);
+		    QuerySLAPredictedEpochEnergy(input.sla_input, addition.aggregate_service_rate, addition.aggregate_power_w);
 		if (candidate.reference) {
 			fallback = addition;
 		}
@@ -254,12 +238,23 @@ static void ApplyMandatoryConfiguration(QuerySLAEnergyQueryAllocation &target, c
 
 } // namespace
 
+double QuerySLAPredictedEpochEnergy(const QuerySLAModelInput &input, double service_rate, double power_w) {
+	if (service_rate <= 0 || power_w < 0 || !std::isfinite(service_rate) || !std::isfinite(power_w)) {
+		return 0;
+	}
+	auto epoch_s = static_cast<double>(input.epoch_ns) / 1000000000.0;
+	auto work_s = input.work.remaining_chunks_equiv > 0
+	                  ? static_cast<double>(input.work.remaining_chunks_equiv) / service_rate
+	                  : 0.0;
+	return power_w * MinValue<double>(epoch_s, work_s);
+}
+
 QuerySLAModel BuildQuerySLAEnergyReferenceModel(const QuerySLAEnergyModelInput &input) {
 	if (input.sla_input.event_kind != QueryActivationEventKind::PIPELINE) {
 		return input.reference_model;
 	}
 	for (const auto &profile : input.hardware_profiles) {
-		if (!profile.mature || !SameHardware(profile.hardware, input.reference_hardware) ||
+		if (!profile.mature || !(profile.hardware == input.reference_hardware) ||
 		    profile.safe_work_units_per_s <= 0) {
 			continue;
 		}
@@ -324,7 +319,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 	}
 	auto fixed_reference_fallback =
 	    stage == QuerySLAEnergyOptionalStage::REFERENCE_FALLBACK &&
-	    SameHardware(reference_hardware, input.reference_hardware);
+	    (reference_hardware == input.reference_hardware);
 	auto acceptable_gain = [&](double gain) {
 		if (gain > 0) {
 			return true;
@@ -356,7 +351,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 	auto candidates = BuildCandidates(input);
 	auto find_candidate = [&](const QueryRequestHardwareConfiguration &hardware) -> const HardwareCandidate * {
 		for (const auto &candidate : candidates) {
-			if (SameHardware(candidate.hardware, hardware)) {
+			if (candidate.hardware == hardware) {
 				return &candidate;
 			}
 		}
@@ -368,7 +363,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 		return result;
 	}
 	auto reference_increment =
-	    SameHardware(reference->hardware, input.reference_hardware)
+	    (reference->hardware == input.reference_hardware)
 	        ? input.reference_model.service_rates[next_worker_count] -
 	              input.reference_model.service_rates[existing_worker_count]
 	        : reference->throughput;
@@ -393,7 +388,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 			continue;
 		}
 		auto candidate_increment =
-		    SameHardware(candidate->hardware, reference_hardware) ? reference_increment : candidate->throughput;
+		    (candidate->hardware == reference_hardware) ? reference_increment : candidate->throughput;
 		auto service_rate = existing_service_rate + candidate_increment;
 		auto evaluation = QuerySLAEvaluateServiceRate(
 		    input.sla_input, service_rate, next_worker_count);
@@ -416,7 +411,7 @@ QuerySLAEnergyWorkerAssignment SelectQuerySLAOptionalAddition(
 	result.valid = true;
 	result.hardware = selected->hardware;
 	result.safe_throughput =
-	    SameHardware(selected->hardware, reference_hardware) ? reference_increment : selected->throughput;
+	    (selected->hardware == reference_hardware) ? reference_increment : selected->throughput;
 	result.active_power_w = selected->active_power_w;
 	result.normalized_edp = selected->normalized_edp;
 	result.optional_fragility_before = reference_risk_before;

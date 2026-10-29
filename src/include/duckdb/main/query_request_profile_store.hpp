@@ -157,6 +157,7 @@ struct QueryRequestPipelineProfileEstimate {
 	double mean_effective_ns_per_work_unit = 0;
 	double p50_effective_ns_per_work_unit = 0;
 	double p90_effective_ns_per_work_unit = 0;
+	double p95_effective_ns_per_work_unit = 0;
 };
 
 struct QueryRequestProfileSnapshot {

@@ -71,6 +71,7 @@ struct PipelineLifecycleTailEstimate {
 	double mean_ns = 0;
 	double p50_ns = 0;
 	double p90_ns = 0;
+	double p95_ns = 0;
 };
 
 enum class ContinuationEstimateLevel : uint8_t {
@@ -99,6 +100,7 @@ struct PipelineContinuationEstimate {
 	double mean = 0;
 	double p50 = 0;
 	double p90 = 0;
+	double p95 = 0;
 };
 
 PipelineThroughputEstimate

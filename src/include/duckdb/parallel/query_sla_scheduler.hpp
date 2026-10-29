@@ -12,6 +12,7 @@
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/parallel/task.hpp"
+#include "duckdb/parallel/query_total_package.hpp"
 
 namespace duckdb {
 
@@ -261,6 +262,7 @@ public:
 	void DeactivateEnergyPolicy();
 	QueryHardwareManager &GetHardwareManager();
 
+	vector<TotalPackageCandidateTrace> GetTotalPackageTrace() const;
 	vector<QuerySLASchedulerSnapshot> GetSnapshot() const;
 	vector<QuerySLASchedulerEpochSnapshot> GetEpochTrace() const;
 	vector<QuerySLAEnergyWorkerEpochSnapshot> GetEnergyWorkerEpochTrace() const;

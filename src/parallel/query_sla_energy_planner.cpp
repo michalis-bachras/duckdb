@@ -38,13 +38,11 @@ struct CoreKey {
 
 struct PlannerHardwareCandidate {
 	bool valid = false;
-	bool fallback = false;
 	QueryRequestHardwareConfiguration hardware;
 	double throughput = 0;
 	double active_power_w = 0;
 	double normalized_edp = 0;
 	uint64_t profile_version = 0;
-	idx_t sample_count = 0;
 };
 
 struct MandatoryToken {
@@ -87,11 +85,6 @@ struct HardwareReconciliationScore {
 	uint64_t frequency_sum_khz = 0;
 };
 
-static bool PlannerSameHardware(const QueryRequestHardwareConfiguration &left,
-	                            const QueryRequestHardwareConfiguration &right) {
-	return left == right;
-}
-
 static QueryRequestHardwareConfiguration PlannerHardware(uint32_t core_khz, uint32_t uncore_khz) {
 	QueryRequestHardwareConfiguration result;
 	result.core_frequency_khz = core_khz;
@@ -105,10 +98,9 @@ static PlannerHardwareCandidate FindHardwareCandidate(const QuerySLAEnergyModelI
 	PlannerHardwareCandidate result;
 	result.hardware = hardware;
 	for (const auto &profile : query.hardware_profiles) {
-		if (!PlannerSameHardware(profile.hardware, hardware)) {
+		if (!(profile.hardware == hardware)) {
 			continue;
 		}
-		result.sample_count = MinValue<idx_t>(profile.throughput_sample_count, profile.power_sample_count);
 		if (!profile.mature || profile.safe_work_units_per_s <= 0) {
 			if (diagnostics) {
 				diagnostics->immature_pair_rejections++;
@@ -125,10 +117,9 @@ static PlannerHardwareCandidate FindHardwareCandidate(const QuerySLAEnergyModelI
 		result.profile_version = profile.profile_version;
 		return result;
 	}
-	if (PlannerSameHardware(hardware, query.reference_hardware) && query.reference_model.valid &&
+	if (hardware == query.reference_hardware && query.reference_model.valid &&
 	    query.reference_model.throughput > 0) {
 		result.valid = true;
-		result.fallback = true;
 		result.throughput = query.reference_model.throughput;
 		if (diagnostics) {
 			diagnostics->profile_fallback_count++;
@@ -140,7 +131,7 @@ static PlannerHardwareCandidate FindHardwareCandidate(const QuerySLAEnergyModelI
 static idx_t ExactPairSampleCount(const QuerySLAEnergyModelInput &query,
 	                              const QueryRequestHardwareConfiguration &hardware) {
 	for (const auto &profile : query.hardware_profiles) {
-		if (PlannerSameHardware(profile.hardware, hardware)) {
+		if (profile.hardware == hardware) {
 			return MinValue<idx_t>(profile.throughput_sample_count, profile.power_sample_count);
 		}
 	}
@@ -232,20 +223,9 @@ static bool HardwareAtLeast(const QueryRequestHardwareConfiguration &actual,
 static idx_t CountWorkerFrequencyAdjustments(const vector<QuerySLAEnergyPlacedWorker> &workers) {
 	idx_t result = 0;
 	for (const auto &worker : workers) {
-		result += PlannerSameHardware(worker.normal_hardware, worker.preferred_hardware) ? 0 : 1;
+		result += (worker.normal_hardware == worker.preferred_hardware) ? 0 : 1;
 	}
 	return result;
-}
-
-static double PlannerPredictedEpochEnergy(const QuerySLAModelInput &input, double service_rate, double power_w) {
-	if (service_rate <= 0 || power_w < 0 || !std::isfinite(service_rate) || !std::isfinite(power_w)) {
-		return 0;
-	}
-	auto epoch_s = static_cast<double>(input.epoch_ns) / 1000000000.0;
-	auto work_s = input.work.remaining_chunks_equiv > 0
-	                  ? static_cast<double>(input.work.remaining_chunks_equiv) / service_rate
-	                  : 0.0;
-	return power_w * MinValue<double>(epoch_s, work_s);
 }
 
 static double PlannerServiceTolerance(double expected, idx_t worker_count) {
@@ -389,7 +369,7 @@ static bool RebuildQueryAllocationsFromPreferences(QuerySLAEnergyEpochPlan &plan
 		}
 		allocation.predicted_sla_cost = evaluation.mandatory_cost;
 		allocation.predicted_optional_risk = evaluation.optional_risk;
-		allocation.predicted_epoch_energy_j = PlannerPredictedEpochEnergy(
+		allocation.predicted_epoch_energy_j = QuerySLAPredictedEpochEnergy(
 		    input.queries[query_index].sla_input, allocation.aggregate_service_rate, allocation.aggregate_active_power_w);
 		if (allocation.mandatory_workers > 0) {
 			auto cost_tolerance =
@@ -438,7 +418,7 @@ static bool ResolveNormalWorkerEstimate(QuerySLAEnergyPlacedWorker &worker,
 		worker.normal_safe_throughput = accepted.safe_throughput;
 		return true;
 	}
-	if (PlannerSameHardware(worker.normal_hardware, worker.preferred_hardware)) {
+	if (worker.normal_hardware == worker.preferred_hardware) {
 		worker.normal_safe_throughput = accepted.safe_throughput;
 		worker.normal_active_power_w = accepted.active_power_w;
 		worker.normal_normalized_edp = accepted.normalized_edp;
@@ -449,7 +429,7 @@ static bool ResolveNormalWorkerEstimate(QuerySLAEnergyPlacedWorker &worker,
 	if (!candidate.valid) {
 		return false;
 	}
-	if (PlannerSameHardware(worker.normal_hardware, query.reference_hardware)) {
+	if (worker.normal_hardware == query.reference_hardware) {
 		auto ordinal = worker.worker_ordinal;
 		if (ordinal + 1 >= query.reference_model.service_rates.size()) {
 			return false;
@@ -534,7 +514,7 @@ static bool RebuildQueryAllocationsFromNormalHardware(
 		reconstructed_power[query_index] += static_cast<long double>(worker.normal_active_power_w);
 		all_workers_at_preferred_pair[query_index] =
 		    all_workers_at_preferred_pair[query_index] &&
-		    PlannerSameHardware(worker.normal_hardware, worker.preferred_hardware);
+		    (worker.normal_hardware == worker.preferred_hardware);
 		allocation.mandatory_workers += worker.mandatory ? 1 : 0;
 		allocation.optional_workers += worker.optional ? 1 : 0;
 		if (!PlannerIsLifecycleEvent(input.queries[query_index].reference_model.event_kind)) {
@@ -574,7 +554,7 @@ static bool RebuildQueryAllocationsFromNormalHardware(
 		allocation.predicted_sla_cost = evaluation.mandatory_cost;
 		allocation.predicted_optional_risk = evaluation.optional_risk;
 		allocation.predicted_epoch_energy_j =
-		    PlannerPredictedEpochEnergy(input.queries[query_index].sla_input, allocation.aggregate_service_rate,
+		    QuerySLAPredictedEpochEnergy(input.queries[query_index].sla_input, allocation.aggregate_service_rate,
 		                                allocation.aggregate_active_power_w);
 		auto worker_count = allocation.workers.size();
 		auto reference_cost = target.predicted_sla_cost;
@@ -1210,7 +1190,7 @@ QuerySLAEnergyEpochPlan PlanQuerySLAEnergyEpoch(const QuerySLAEnergyPlannerInput
 	}
 	for (const auto &query : input.queries) {
 		for (const auto &profile : query.hardware_profiles) {
-			if (profile.valid && !profile.mature && !PlannerSameHardware(profile.hardware, query.reference_hardware)) {
+			if (profile.valid && !profile.mature && !(profile.hardware == query.reference_hardware)) {
 				result.diagnostics.immature_pair_rejections++;
 			}
 		}

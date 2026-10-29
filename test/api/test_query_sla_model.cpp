@@ -196,6 +196,7 @@ public:
 		work.continuation_estimate.valid = true;
 		work.continuation_estimate.kind = ContinuationEstimateKind::NS_PER_WORK_UNIT;
 		work.continuation_estimate.p90 = continuation_p90_ns_per_unit;
+		work.continuation_estimate.p95 = continuation_p90_ns_per_unit;
 	}
 	void Schedule() override {
 	}
@@ -1201,6 +1202,31 @@ TEST_CASE("SLA energy hardware manager derives its frequency grid from calibrati
 	db.instance->GetFileSystem().RemoveFile(power_model_path);
 }
 
+TEST_CASE("Total-package calibration requires the explicit hierarchy schema", "[api][sla][total_package]") {
+    auto path=TestCreatePath("total_package_calibration_schema.csv");
+    bool hierarchical=false;
+    SECTION("Legacy rows with nine columns remain legacy") { hierarchical=false; }
+    SECTION("Matched operational hierarchy is recognized") { hierarchical=true; }
+    {
+        std::ofstream output(path);
+        output << (hierarchical ? "socket_id,core_frequency_hz,uncore_frequency_hz,calibration_kind,base_power_w,idle_power_w,socket_awake_power_w,core_awake_power_w\n"
+                                : "socket_id,core_freq_hz,uncore_freq_hz,smt_state,base_power_w,duration_s,rapl_delta_uj,sample,notes\n");
+        for (int s=0;s<2;s++) for (auto f:{1200000000ULL,2400000000ULL,3500000000ULL}) {
+            output << s << ',' << f << ",2800000000,0,40," << (hierarchical ? "20,4,2\n" : "5,200000000,0,measured\n");
+        }
+    }
+    DBConfig config;config.options.query_sla_energy_hardware_control_enabled=false;
+    config.options.query_sla_total_package=true;config.options.query_sla_energy_power_model_path=path;
+    DuckDB db(nullptr,&config);QueryHardwareManager manager(*db.instance);manager.RegisterWorker(0,0);manager.Activate();
+    REQUIRE(manager.CoreFrequencyLevelsKHz()==vector<uint32_t>{1200000,2400000,3500000});
+    REQUIRE(manager.UncoreFrequencyLevelsKHz()==vector<uint32_t>{2800000});
+    for(const auto &row:manager.GetPowerModelSnapshot().entries) {
+        REQUIRE(row.hierarchy_valid==hierarchical);
+        if(hierarchical) { REQUIRE(row.idle_w==20);REQUIRE(row.awake_w==4);REQUIRE(row.physical_core_w==2); }
+    }
+    manager.Deactivate();db.instance->GetFileSystem().RemoveFile(path);
+}
+
 TEST_CASE("SLA energy hardware diagnostics classify worker target transitions",
           "[api][sla][energy_hardware]") {
 	DBConfig config;
@@ -1324,17 +1350,91 @@ TEST_CASE("Finishing events reuse the owner's suffix in SLA and energy epochs", 
  }
 }
 
-TEST_CASE("SLA energy activation and epochs use the mature maximum-pair throughput",
+TEST_CASE("SLA energy activation and epochs agree on mature and cold reference throughput",
           "[api][sla][energy_model][point_suffix]") {
+	for (bool mature : {false, true}) {
+		for (bool exploration : {false, true}) {
+			INFO("mature=" << mature << ", exploration=" << exploration);
+			DBConfig config;
+			config.options.maximum_threads = 1;
+			config.options.query_sla_energy_hardware_control_enabled = false;
+			config.options.query_sla_energy_exploration_enabled = exploration;
+			DuckDB db(nullptr, &config);
+			Connection con(db);
+			Executor executor(*con.context);
+			auto producer = db.instance->GetScheduler().CreateProducer();
+			auto &store = db.instance->GetQueryRequestProfileStore();
+			auto profile = LifecycleProfile(17);
+			store.SetSuffixBootstrapMode(true, 15);
+			SeedLifecycleSuffix(store, profile, 600000000000ULL);
+			store.SetSuffixBootstrapMode(false);
+			PipelineProfileIdentity identity;
+			identity.valid = true;
+			identity.pipeline_id = profile.pipeline_id;
+			identity.pipeline_signature_hash = profile.pipeline_signature_hash;
+			auto reference_hardware = TestHardware(3500000, 2800000);
+			const auto sample_count = mature ? PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES : idx_t(1);
+			for (idx_t i = 0; i < sample_count; i++) {
+				store.RecordPipelineHardwareThroughput(919, 10, identity, reference_hardware, 10, 1000000000, true);
+				store.RecordPipelineHardwareEnergy(919, 10, identity, reference_hardware, 1000000000, 10, 0, true);
+			}
+			auto hardware_profiles = store.GetPipelineHardwareProfiles(919, 10, identity);
+			REQUIRE(hardware_profiles.size() == 1);
+			REQUIRE(hardware_profiles[0].mature == mature);
+			db.instance->config.options.query_sla_suffix_model = QuerySLASuffixModel::POINT;
+			db.instance->config.options.query_sla_scheduler_epoch_ms = 50;
+			db.instance->SetQuerySchedulerPolicy(QuerySchedulerPolicy::SLA_ENERGY);
+			auto &scheduler = db.instance->GetQuerySLAScheduler();
+			scheduler.RegisterWorker(0, 0);
+			auto metadata = BaseModelInput().metadata;
+			metadata.db_query_id = 9917;
+			metadata.template_id = 919;
+			metadata.scale_factor = 10;
+			metadata.query_start_ns = LifecycleNowNs();
+			metadata.deadline_ns = LifecycleNowNs() + 60000000000ULL;
+			scheduler.RegisterQuery(metadata, *producer, true);
+			auto event = make_shared_ptr<LifecycleTestEvent>(executor, QueryActivationEventKind::PIPELINE, profile);
+			event->SetModeledWork(20, 2, 100000000);
+			scheduler.OnEventScheduled(metadata.db_query_id, event, 2);
+			REQUIRE(scheduler.GetSnapshot()[0].selected_throughput == Approx(mature ? 10 : 2));
+			scheduler.RequestInitialEpoch();
+			shared_ptr<Task> task;
+			REQUIRE(scheduler.TryDequeueTask(0, task) == QuerySLADequeueResult::NO_TASK);
+			auto trace = scheduler.GetEpochTrace();
+			REQUIRE_FALSE(trace.empty());
+			REQUIRE(trace.back().selected_throughput == Approx(mature ? 10 : 2));
+			scheduler.OnEventFinished(metadata.db_query_id, *event);
+			scheduler.UnregisterQuery(metadata.db_query_id);
+			scheduler.UnregisterWorker(0);
+		}
+	}
+}
+
+TEST_CASE("Total-package activation and epochs prefer isolated profiles over online observations",
+          "[api][sla][total_package]") {
+	auto path = TestCreatePath("sla_total_isolated_profile_selection.csv");
+	auto profile = LifecycleProfile(27);
+	{
+		std::ofstream output(path);
+		output << "template_id,scale_factor,pipeline_id,pipeline_signature_hash,core_khz,uncore_khz,"
+		          "units,worker_ns,wall_ns,energy_j,baseline_w,valid\n";
+		for (idx_t i = 0; i < 15; i++) {
+			output << "919,10," << profile.pipeline_id << ',' << profile.pipeline_signature_hash
+			       << ",3500000,2800000,10,1000000000,1000000000,10,0,1\n";
+		}
+	}
+
 	DBConfig config;
 	config.options.maximum_threads = 1;
 	config.options.query_sla_energy_hardware_control_enabled = false;
+	config.options.query_sla_total_package = true;
+	config.options.query_sla_total_reference_only = true;
+	config.options.query_sla_total_isolated_profiles_path = path;
 	DuckDB db(nullptr, &config);
 	Connection con(db);
 	Executor executor(*con.context);
 	auto producer = db.instance->GetScheduler().CreateProducer();
 	auto &store = db.instance->GetQueryRequestProfileStore();
-	auto profile = LifecycleProfile(17);
 	store.SetSuffixBootstrapMode(true, 15);
 	SeedLifecycleSuffix(store, profile, 600000000000ULL);
 	store.SetSuffixBootstrapMode(false);
@@ -1344,19 +1444,17 @@ TEST_CASE("SLA energy activation and epochs use the mature maximum-pair throughp
 	identity.pipeline_signature_hash = profile.pipeline_signature_hash;
 	auto reference_hardware = TestHardware(3500000, 2800000);
 	for (idx_t i = 0; i < PIPELINE_HARDWARE_PROFILE_MIN_STABLE_SAMPLES; i++) {
-		store.RecordPipelineHardwareThroughput(919, 10, identity, reference_hardware, 10, 1000000000, true);
+		store.RecordPipelineHardwareThroughput(919, 10, identity, reference_hardware, 100, 1000000000, true);
 		store.RecordPipelineHardwareEnergy(919, 10, identity, reference_hardware, 1000000000, 10, 0, true);
 	}
-	auto hardware_profiles = store.GetPipelineHardwareProfiles(919, 10, identity);
-	REQUIRE(hardware_profiles.size() == 1);
-	REQUIRE(hardware_profiles[0].mature);
+	REQUIRE(store.GetPipelineHardwareProfiles(919, 10, identity)[0].safe_work_units_per_s == Approx(100));
 	db.instance->config.options.query_sla_suffix_model = QuerySLASuffixModel::POINT;
 	db.instance->config.options.query_sla_scheduler_epoch_ms = 50;
 	db.instance->SetQuerySchedulerPolicy(QuerySchedulerPolicy::SLA_ENERGY);
 	auto &scheduler = db.instance->GetQuerySLAScheduler();
 	scheduler.RegisterWorker(0, 0);
 	auto metadata = BaseModelInput().metadata;
-	metadata.db_query_id = 9917;
+	metadata.db_query_id = 9927;
 	metadata.template_id = 919;
 	metadata.scale_factor = 10;
 	metadata.query_start_ns = LifecycleNowNs();
@@ -1375,6 +1473,7 @@ TEST_CASE("SLA energy activation and epochs use the mature maximum-pair throughp
 	scheduler.OnEventFinished(metadata.db_query_id, *event);
 	scheduler.UnregisterQuery(metadata.db_query_id);
 	scheduler.UnregisterWorker(0);
+	db.instance->GetFileSystem().RemoveFile(path);
 }
 
 TEST_CASE("Point defaults resolve by policy and explicit choices survive ordering", "[api][sla][point_suffix]") {
@@ -1422,4 +1521,90 @@ TEST_CASE("Point and a matching point mass drive identical energy allocations", 
  }
  REQUIRE(a.queries[0].dynamic_mandatory_workers.size() == b.queries[0].dynamic_mandatory_workers.size());
  REQUIRE(a.queries[0].dynamic_optional_workers.size() == b.queries[0].dynamic_optional_workers.size());
+}
+
+
+#include "duckdb/parallel/query_total_package.hpp"
+
+TEST_CASE("Total-package efficiency retains static energy in candidate selection", "[api][sla][total_package]") {
+    // Above-idle efficiency chooses the slow candidate (0.6/8 > 1/20).
+    // Complete-package efficiency correctly chooses reference (1/100 > 0.6/88).
+    REQUIRE_FALSE(TotalPackagePreferCandidate(0.6, 88, 1, 100, 0.05));
+    REQUIRE(TotalPackagePreferCandidate(0.95, 80, 1, 100, 0.05));
+    REQUIRE_FALSE(TotalPackagePreferCandidate(1, 0, 1, 100, 0.05));
+    REQUIRE_FALSE(TotalPackagePreferCandidate(1, -1, 1, 100, 0.05));
+    REQUIRE_FALSE(TotalPackagePreferCandidate(1, 100, 1, 100, 0));
+}
+
+TEST_CASE("Total-package projection clips work and never regrows a successor lease", "[api][sla][total_package]") {
+    TotalPackageStage first; first.remaining_reference_work_s = .09; first.parallelism_cap = 2;
+    first.relative_rates = {.9}; first.work_j_per_reference_s = {2};
+    TotalPackageStage second; second.remaining_reference_work_s = .035; second.parallelism_cap = 1;
+    second.relative_rates = {.7}; second.work_j_per_reference_s = {3};
+    TotalPackageStage third; third.remaining_reference_work_s = 1; third.parallelism_cap = 4;
+    third.relative_rates = {1}; third.work_j_per_reference_s = {4};
+    auto p = ProjectTotalPackageChain({first, second, third}, 2, {0,0}, .15, 40, 3, {1});
+    REQUIRE(p.valid);
+    REQUIRE(p.completed_stages == 2);
+    REQUIRE(p.final_lease == 1);
+    REQUIRE(p.useful_reference_s == Approx(.175));
+    REQUIRE(p.idle_j == Approx(6));
+    REQUIRE(p.total_package_j == Approx(p.idle_j+p.socket_j+p.core_j+p.work_j));
+    auto empty = ProjectTotalPackageChain({first}, 0, {}, .1, 40, 3, {1});
+    REQUIRE(empty.valid);
+    REQUIRE(empty.useful_reference_s == 0);
+    REQUIRE(empty.total_package_j == Approx(4));
+}
+
+TEST_CASE("Total-package diagnostics expose non-diminishing PDF worker benefits", "[api][sla][total_package]") {
+    vector<double> a {.109375,.103125,.075};
+    vector<double> b {.2,.19,.18};
+    REQUIRE_FALSE(TotalPackageDiminishingBenefits(a));
+    REQUIRE(TotalPackageDiminishingBenefits(b));
+    REQUIRE(TotalPackageExactAllocationCost({a,b},2) == Approx(.275));
+    REQUIRE(.109375+.18 > TotalPackageExactAllocationCost({a,b},2));
+}
+
+TEST_CASE("Total-package planner preserves grants and chooses a measured safe frequency", "[api][sla][total_package]") {
+    QuerySLAEnergyPlannerInput input;
+    input.worker_budget=1;input.epoch_ns=100000000;input.epoch_generation=1;
+    input.core_frequency_levels_khz={1200000,2400000,3500000};
+    QueryHardwareWorkerTopology topology;topology.worker_id=0;topology.logical_cpu=0;topology.socket_id=0;topology.physical_core_id=0;
+    input.topology.push_back(topology);input.logical_allocation.mandatory={1};
+    QuerySLAEnergyModelInput q;q.sla_input=BaseModelInput();q.sla_input.total_package=true;
+    q.sla_input.work.remaining_chunks_equiv=1000;q.sla_input.work.total_chunks_equiv=1000;
+    q.sla_input.work.preferred_parallelism=1;q.sla_input.work.parallelism_valid=true;
+    q.sla_input.work.selected_single_worker_chunks_per_s=1000;q.sla_input.work.selected_throughput_valid=true;
+    q.sla_input.work.continuation_estimate.valid=true;
+    q.sla_input.work.continuation_estimate.kind=ContinuationEstimateKind::NS_PER_WORK_UNIT;
+    q.sla_input.work.continuation_estimate.p95=1000000;
+    q.sla_input.suffix.valid=true;q.sla_input.suffix.bucket_count=1;
+    q.sla_input.suffix.buckets[0].lower_ns=0;q.sla_input.suffix.buckets[0].upper_ns=0;q.sla_input.suffix.buckets[0].probability=1;
+    q.sla_input.metadata.deadline_ns=q.sla_input.now_ns+2000000000ULL;
+    q.reference_hardware.core_frequency_khz=3500000;q.reference_hardware.uncore_frequency_khz=2800000;
+    q.reference_model=BuildQuerySLAModel(q.sla_input);REQUIRE(q.reference_model.valid);
+    for (auto f:{2400000U,3500000U}) {
+        QueryRequestPipelineHardwareProfileEstimate p;p.mature=true;p.valid=true;p.hardware.core_frequency_khz=f;p.hardware.uncore_frequency_khz=2800000;
+        p.safe_work_units_per_s=f==3500000?1000:900;p.mean_active_power_w=f==3500000?30:5;q.hardware_profiles.push_back(p);
+    }
+    input.queries.push_back(q);
+    vector<TotalPackageSocketCalibration> calibration;
+    for(int s=0;s<2;s++){TotalPackageSocketCalibration c;c.socket_id=s;c.idle_w=20;c.awake_w=5;c.physical_core_w={1,1,1};calibration.push_back(c);}
+    vector<TotalPackageCandidateTrace> trace;
+    auto plan=PlanTotalPackageEpoch(input,calibration,false,false,.05,trace);
+    REQUIRE(plan.valid);REQUIRE(plan.workers.size()==1);
+    REQUIRE(plan.workers[0].execution_hardware.core_frequency_khz==2400000);
+    REQUIRE(plan.queries[0].mandatory_workers==1);
+    REQUIRE(plan.queries[0].optional_workers==0);
+    trace.clear();plan=PlanTotalPackageEpoch(input,calibration,false,false,.05,trace,true);
+    REQUIRE(plan.workers[0].execution_hardware.core_frequency_khz==3500000);
+    bool shadow_candidate=false;
+    for (const auto &row:trace) {
+        if (row.shadow_selected && row.candidate_id!=0) shadow_candidate=true;
+        if (row.selected) REQUIRE(row.candidate_id==0);
+    }
+    REQUIRE(shadow_candidate);
+    trace.clear();plan=PlanTotalPackageEpoch(input,{},false,false,.05,trace);
+    REQUIRE(plan.valid);REQUIRE(plan.workers[0].execution_hardware.core_frequency_khz==3500000);
+    REQUIRE(trace[0].reason.find("calibration")!=string::npos);
 }

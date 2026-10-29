@@ -65,6 +65,9 @@ struct QuerySLAEnergyAllocation {
 	string error;
 };
 
+//! Active-work energy clipped to the epoch duration and the remaining pipeline work.
+double QuerySLAPredictedEpochEnergy(const QuerySLAModelInput &input, double service_rate, double power_w);
+
 QuerySLAModel BuildQuerySLAEnergyReferenceModel(const QuerySLAEnergyModelInput &input);
 QuerySLAEnergyWorkerAssignment SelectQuerySLAMandatoryAddition(const QuerySLAEnergyModelInput &input,
 	                                                           const QuerySLAModel &reference_model,
