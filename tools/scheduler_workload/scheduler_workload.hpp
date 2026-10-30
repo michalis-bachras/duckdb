@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/query_admission_policy.hpp"
 #include "duckdb/common/enums/query_sla_suffix_model.hpp"
 #include "duckdb/common/enums/query_scheduler_policy.hpp"
 
@@ -55,6 +56,7 @@ struct WorkloadConfig {
 	string hardware_profile_snapshot_in;
 	string profile_snapshot_out;
 	QuerySchedulerPolicy scheduler_policy = QuerySchedulerPolicy::DEFAULT;
+	QueryAdmissionPolicy admission_policy = QueryAdmissionPolicy::FIFO;
 	QuerySLASuffixModel sla_suffix_model = QuerySLASuffixModel::MODEL_DEFAULT;
 	bool sla_suffix_bootstrap = false;
 	idx_t sla_suffix_bootstrap_observations = 15;
@@ -117,6 +119,8 @@ struct RequestResult {
 
 struct RunSummary {
 	string scheduler;
+	string admission_policy;
+	idx_t admission_cap = 0;
 	string schedule_hash;
 	uint64_t run_start_ns = 0;
 	idx_t request_count = 0;
@@ -124,6 +128,9 @@ struct RunSummary {
 	idx_t error_count = 0;
 	idx_t queued_count = 0;
 	idx_t max_admission_waiters = 0;
+	idx_t late_at_admission_count = 0;
+	double mean_arrival_to_admission_s = 0;
+	double p95_arrival_to_admission_s = 0;
 	idx_t notification_queue_high_water_mark = 0;
 	double makespan_s = 0;
 	double throughput_qps = 0;

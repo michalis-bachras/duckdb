@@ -79,6 +79,41 @@ done
 
 Each summary contains the schedule SHA-256. Comparisons are valid only when those hashes match and every run reports `"valid": true`.
 
+## Admission Ordering
+
+Admission ordering is independent of worker scheduling. `--admission-policy fifo|edf` defaults to `fifo`, and
+`--admission-cap` continues to default to 128. For example:
+
+```bash
+scheduler_workload run \
+  --database 10=/data/tpch_sf10.duckdb \
+  --queries-dir /repo/workloads/tpch/queries/duckdb \
+  --threads 8 --admission-cap 128 --admission-policy edf \
+  --schedule schedule.csv --scheduler sla \
+  --profile-input profiles.bin --output-dir results/sla_edf
+```
+
+FIFO selects the oldest admission ticket. EDF selects the earliest absolute deadline and uses the admission ticket
+to break ties. Requests without a deadline sort last under EDF. Overdue requests keep their original deadline;
+they are neither dropped nor demoted. A newly registered request joins the same ordered queue as existing waiters.
+Already admitted queries retain their slots, and the existing per-request capacity checks still apply. The head
+request must be eligible under its cap before any lower-priority waiter can enter.
+
+The SQL setting is database-wide: `SET GLOBAL query_admission_policy='edf'` or `'fifo'`.
+`RESET GLOBAL query_admission_policy` restores FIFO. Changing the policy requires no admitted or waiting requests;
+setting the current value again is allowed while busy. Cancellation removes a waiting request directly and admits
+the next eligible candidate. Both blocking and nonblocking clients use this controller.
+
+Summaries and run metadata record `admission_policy` and `admission_cap`. Summaries additionally expose
+`late_at_admission_count`, `mean_arrival_to_admission_s`, and `p95_arrival_to_admission_s`. Arrival-to-admission
+latency starts at the scheduled arrival and therefore includes driver handoff and database registration as well
+as admission waiting. It is separate from response time, which ends at the terminal result.
+
+To separate admission effects from worker-allocation effects, compare DEFAULT/FIFO, DEFAULT/EDF, SLA/FIFO, and
+SLA/EDF with the same schedule, initial profiles, worker count, cap, and memory limit. Verify that admission waiting
+actually occurs: EDF cannot reorder requests when every request is admitted immediately. Keep total tardiness and
+deadline-miss counts separate; EDF admission does not guarantee an improvement in either metric.
+
 ## SLA-Energy Training And Evaluation
 
 SLA-energy evaluation has two separate stages. Exploration is enabled only during profile training. A measured run imports the resulting exact hardware-pair profiles and disables exploration, so probes do not perturb the reported policy.

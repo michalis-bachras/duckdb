@@ -175,6 +175,7 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 		ExecuteSetting(root, "SET memory_limit=" + QuoteSQLString(config.memory_limit));
 	}
 	ExecuteSetting(root, "SET external_threads=0");
+	ExecuteSetting(root, "SET GLOBAL query_admission_policy=" + QuoteSQLString(QueryAdmissionPolicyName(config.admission_policy)));
 	ExecuteSetting(root, "SET query_sla_suffix_model=" + QuoteSQLString(config.architecture == "total_package" ? "histogram" : QuerySLASuffixModelName(config.sla_suffix_model)));
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
 	ExecuteSetting(root, string("SET query_sla_residual_policy=") +
@@ -259,7 +260,9 @@ static void ExportProfiles(DuckDB &db, const WorkloadConfig &config) {
           << r.issued_count << ',' << r.resolved_count << ',' << r.discarded_count << ',' << r.outstanding_count << ','
           << r.missing_key_count << ',' << r.duplicate_feedback_count << ',' << r.unmatched_feedback_count << ',' << r.bootstrap_target << '\n';
   metadata << "{\n  \"snapshot_version\": 12,\n  \"scheduler\": \"" << SchedulerName(config.scheduler_policy)
-           << "\",\n  \"suffix_model_requested\": \"" << QuerySLASuffixModelName(config.sla_suffix_model)
+           << "\",\n  \"admission_policy\": \"" << QueryAdmissionPolicyName(config.admission_policy)
+           << "\",\n  \"admission_cap\": " << config.admission_cap
+           << ",\n  \"suffix_model_requested\": \"" << QuerySLASuffixModelName(config.sla_suffix_model)
            << "\",\n  \"suffix_model\": \"" << QuerySLASuffixModelName(ResolveQuerySLASuffixModel(db.instance->config.options.query_sla_suffix_model, db.instance->GetQuerySchedulerPolicy()))
            << "\",\n  \"bootstrap_target\": " << r.bootstrap_target << ",\n  \"seed\": " << config.seed << "\n}\n";
  }
@@ -440,12 +443,15 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 	                        idx_t max_waiters) {
 	RunSummary summary;
 	summary.scheduler = SchedulerName(config.scheduler_policy);
+	summary.admission_policy = QueryAdmissionPolicyName(config.admission_policy);
+	summary.admission_cap = config.admission_cap;
 	summary.schedule_hash = ScheduleHash(schedule);
 	summary.run_start_ns = run_start_ns;
 	summary.request_count = schedule.size();
 	summary.max_admission_waiters = max_waiters;
 	summary.notification_queue_high_water_mark = queue_high_water;
 	vector<double> response_s;
+	vector<double> arrival_to_admission_s;
 	vector<double> arrival_dispatch_lag_ms;
 	vector<double> driver_handoff_lag_ms;
 	vector<double> submitter_queue_lag_ms;
@@ -466,6 +472,13 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 		}
 		if (result.admitted_ns > 0 && result.admitted_ns > result.submit_end_ns) {
 			summary.queued_count++;
+		}
+		if (result.admitted_ns > 0) {
+			auto scheduled_ns = run_start_ns + result.request.scheduled_offset_ns;
+			arrival_to_admission_s.push_back(result.admitted_ns > scheduled_ns
+			                                     ? static_cast<double>(result.admitted_ns - scheduled_ns) / 1e9
+			                                     : 0);
+			summary.late_at_admission_count += result.admitted_ns > run_start_ns + result.request.deadline_offset_ns;
 		}
 		if (result.result_ready_ns == 0) {
 			continue;
@@ -511,6 +524,11 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 	summary.p90_response_s = Percentile(response_s, 0.90);
 	summary.p95_response_s = Percentile(response_s, 0.95);
 	summary.p99_response_s = Percentile(response_s, 0.99);
+	summary.mean_arrival_to_admission_s = arrival_to_admission_s.empty()
+	                                          ? 0
+	                                          : std::accumulate(arrival_to_admission_s.begin(), arrival_to_admission_s.end(), 0.0) /
+	                                                arrival_to_admission_s.size();
+	summary.p95_arrival_to_admission_s = Percentile(arrival_to_admission_s, 0.95);
 	summary.mean_arrival_dispatch_lag_ms =
 	    arrival_dispatch_lag_ms.empty() ? 0 : arrival_lag_total / arrival_dispatch_lag_ms.size();
 	summary.p99_arrival_dispatch_lag_ms = Percentile(arrival_dispatch_lag_ms, 0.99);

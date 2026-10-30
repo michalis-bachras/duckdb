@@ -76,6 +76,28 @@ int main() {
             else setenv("OLAP_PIPELINE_PMU_GROUP",saved.c_str(),1);
         }
 		WorkloadConfig config;
+		Require(config.admission_policy == QueryAdmissionPolicy::FIFO && config.admission_cap == 128,
+		        "FIFO admission and 128 active queries remain the defaults");
+		for (auto scheduler : {"default", "sla", "stride"}) {
+			for (auto admission : {"fifo", "edf"}) {
+				const char *args[] = {"scheduler_workload", "run", "--database", "10=/tmp/db", "--queries-dir", "/tmp/q",
+				                      "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/out", "--scheduler", scheduler,
+				                      "--admission-policy", admission};
+				auto parsed = ParseConfig(sizeof(args) / sizeof(args[0]), const_cast<char **>(args));
+				Require(string(QueryAdmissionPolicyName(parsed.admission_policy)) == admission,
+				        "admission policy is independent of the worker scheduler");
+			}
+		}
+		const char *invalid_admission[] = {"scheduler_workload", "run", "--database", "10=/tmp/db", "--queries-dir", "/tmp/q",
+		                                  "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/out",
+		                                  "--admission-policy", "unknown"};
+		bool rejected_admission = false;
+		try {
+			ParseConfig(sizeof(invalid_admission) / sizeof(invalid_admission[0]), const_cast<char **>(invalid_admission));
+		} catch (InvalidInputException &) {
+			rejected_admission = true;
+		}
+		Require(rejected_admission, "unknown admission policies are rejected");
 		config.command = WorkloadCommand::GENERATE;
 		config.seed = 42;
 		config.duration_s = 1000;
@@ -294,6 +316,33 @@ int main() {
         lag_result.admission_dispatched_ns = 1030000000;
         Require(!SummarizeRun(lag_config, {lag_result.request}, {lag_result}, 1000000000, 0, 0).valid,
                 "delayed admission notification invalidates energy runs");
+		WorkloadConfig admission_config;
+		admission_config.admission_policy = QueryAdmissionPolicy::EDF;
+		RequestResult on_time, late;
+		on_time.status = late.status = "ok";
+		on_time.request.request_id = 1;
+		late.request.request_id = 2;
+		on_time.request.deadline_offset_ns = 100000000;
+		late.request.deadline_offset_ns = 200000000;
+		on_time.request.sla_penalty_per_s = late.request.sla_penalty_per_s = 1;
+		on_time.arrival_ns = late.arrival_ns = 1000000000;
+		on_time.submit_begin_ns = late.submit_begin_ns = 1000000000;
+		on_time.submit_end_ns = late.submit_end_ns = 1010000000;
+		on_time.admitted_ns = on_time.execution_started_ns = 1050000000;
+		late.admitted_ns = late.execution_started_ns = 1300000000;
+		on_time.result_ready_ns = 1100000000;
+		late.result_ready_ns = 1400000000;
+		auto admission_summary = SummarizeRun(admission_config, {on_time.request, late.request}, {on_time, late},
+		                                     1000000000, 1, 1);
+		Require(admission_summary.valid && admission_summary.admission_policy == "edf" && admission_summary.admission_cap == 128,
+		        "summary identifies the independent admission policy and cap");
+		Require(admission_summary.late_at_admission_count == 1 && admission_summary.queued_count == 2,
+		        "late admission is distinct from queueing and terminal deadline misses");
+		Require(std::abs(admission_summary.mean_arrival_to_admission_s - .175) < 1e-12 &&
+		            std::abs(admission_summary.p95_arrival_to_admission_s - .2875) < 1e-12,
+		        "arrival-to-admission latency uses scheduled arrivals and interpolated percentiles");
+		Require(std::abs(admission_summary.total_sla_cost - .2) < 1e-12 && admission_summary.sla_miss_count == 1,
+		        "admission diagnostics preserve the end-to-end tardiness objective");
         Require(ResultFingerprintsMatch("v2:2:123:2:100:20:30:5000", "v2:2:123:2:100:20.000000000001:30:5000"),
                 "floating aggregation order tolerates small numeric jitter");
         Require(!ResultFingerprintsMatch("v2:2:123:2:100:20:30:5000", "v2:2:124:2:100:20:30:5000"),

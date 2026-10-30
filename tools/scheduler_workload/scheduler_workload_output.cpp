@@ -88,12 +88,17 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 		output << "  \"format\": \"scheduler_workload_summary_v1\",\n";
 		output << "  \"architecture\": " << JSONString(config.architecture) << ",\n  \"measurement_energy_scope\": \"total_package\",\n  \"scheduler\": " << JSONString(summary.scheduler) << ",\n";
 		output << "  \"schedule_hash\": " << JSONString(summary.schedule_hash) << ",\n";
+		output << "  \"admission_policy\": " << JSONString(summary.admission_policy) << ",\n";
+		output << "  \"admission_cap\": " << summary.admission_cap << ",\n";
 		output << "  \"run_start_ns\": " << summary.run_start_ns << ",\n";
 		output << "  \"request_count\": " << summary.request_count << ",\n";
 		output << "  \"completed_count\": " << summary.completed_count << ",\n";
 		output << "  \"error_count\": " << summary.error_count << ",\n";
 		output << "  \"queued_count\": " << summary.queued_count << ",\n";
 		output << "  \"max_admission_waiters\": " << summary.max_admission_waiters << ",\n";
+		output << "  \"late_at_admission_count\": " << summary.late_at_admission_count << ",\n";
+		output << "  \"mean_arrival_to_admission_s\": " << summary.mean_arrival_to_admission_s << ",\n";
+		output << "  \"p95_arrival_to_admission_s\": " << summary.p95_arrival_to_admission_s << ",\n";
 		output << "  \"notification_queue_high_water_mark\": "
 		       << summary.notification_queue_high_water_mark << ",\n";
 		output << "  \"makespan_s\": " << summary.makespan_s << ",\n";

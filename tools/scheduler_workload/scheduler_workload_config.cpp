@@ -247,6 +247,7 @@ Core options:
   --queries all|Q1,Q2,...     Query templates (default: all).
   --threads N                 DuckDB hardware worker threads (default: hardware concurrency).
   --admission-cap N           Database admission cap (default: 128).
+  --admission-policy POLICY   Waiting-query ordering: fifo (default) or edf; independent of scheduler.
   --repetitions N             Calibration/training repetitions (default: 3).
 
 Schedule options:
@@ -439,6 +440,15 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.completion_threads = ParseUint(value, name);
 		} else if (name == "admission-cap") {
 			config.admission_cap = ParseUint(value, name);
+		} else if (name == "admission-policy") {
+			auto policy = StringUtil::Lower(value);
+			if (policy == "fifo") {
+				config.admission_policy = QueryAdmissionPolicy::FIFO;
+			} else if (policy == "edf") {
+				config.admission_policy = QueryAdmissionPolicy::EDF;
+			} else {
+				throw InvalidInputException("--admission-policy must be fifo or edf");
+			}
 		} else if (name == "repetitions") {
 			config.repetitions = ParseUint(value, name);
 		} else if (name == "seed") {
