@@ -16,7 +16,7 @@
 namespace duckdb {
 namespace scheduler_workload {
 
-enum class WorkloadCommand : uint8_t { INVALID = 0, CALIBRATE, TRAIN_PROFILES, GENERATE, RUN };
+enum class WorkloadCommand : uint8_t { INVALID = 0, CALIBRATE, TRAIN_PROFILES, GENERATE, RUN, STEADY };
 
 struct ScaleDatabase {
 	uint64_t scale_factor = 0;
@@ -77,6 +77,19 @@ struct WorkloadConfig {
 	idx_t energy_attribution_period_ms = 100;
 	idx_t energy_attribution_idle_period_ms = 0;
 	string energy_power_model_path;
+	idx_t warmup_repetitions = 0;
+	bool profile_timing_export = false;
+	bool profile_execution_gate = false;
+	idx_t profile_query_warmups = 0;
+	string memory_limit;
+	bool package_energy = false;
+	bool models_validated = false;
+	uint32_t profile_core_khz = 0;
+	double profile_base_power_w = 0;
+	string isolated_profiles_path;
+	string architecture = "legacy";
+	string energy_controller = "efficiency";
+	string energy_mode = "enforce";
 	bool sla_energy_exploration = false;
 	bool sla_energy_hardware_control = true;
 	bool energy_attribution_enabled = false;
@@ -92,10 +105,12 @@ struct RequestResult {
 	uint64_t submit_end_ns = 0;
 	uint64_t database_registration_cpu_ns = 0;
 	uint64_t admitted_ns = 0;
+	uint64_t admission_dispatched_ns = 0;
 	uint64_t execution_started_ns = 0;
 	uint64_t execution_ready_ns = 0;
 	uint64_t result_ready_ns = 0;
 	uint64_t admission_released_ns = 0;
+	string result_fingerprint;
 	string status;
 	string error;
 };
@@ -115,6 +130,7 @@ struct RunSummary {
 	double mean_response_s = 0;
 	double p50_response_s = 0;
 	double p90_response_s = 0;
+	double p95_response_s = 0;
 	double p99_response_s = 0;
 	double mean_arrival_dispatch_lag_ms = 0;
 	double p99_arrival_dispatch_lag_ms = 0;
@@ -125,11 +141,15 @@ struct RunSummary {
 	double mean_submission_lag_ms = 0;
 	double p99_submission_lag_ms = 0;
 	double p99_admission_resume_lag_ms = 0;
+	double p99_admission_notification_dispatch_lag_ms = 0;
 	double total_sla_cost = 0;
 	idx_t sla_miss_count = 0;
 	bool valid = false;
 	vector<string> validity_errors;
 };
+
+void RunSteady(const WorkloadConfig &config);
+bool ResultFingerprintsMatch(const string &a, const string &b);
 
 WorkloadConfig ParseConfig(int argc, char **argv);
 string Usage();

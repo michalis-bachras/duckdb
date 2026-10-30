@@ -32,11 +32,13 @@
 #include <deque>
 #include <dirent.h>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
@@ -46,10 +48,52 @@
 #include <fcntl.h>
 #include <linux/perf_event.h>
 #include <sched.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+// BEGIN ENERGY SAMPLER AFFINITY HELPERS (compiled verbatim by the standalone tests)
+namespace duckdb {
+namespace energy_attribution {
+int ParseEnergySamplerCPU(const char *text) {
+	if (!text) return -1; // Unset preserves the existing inherited-affinity behaviour.
+	if (!*text) throw std::invalid_argument("DUCKDB_ENERGY_SAMPLER_CPU must be a CPU number");
+	for (const char *p = text; *p; ++p)
+		if (*p < '0' || *p > '9') throw std::invalid_argument("Invalid DUCKDB_ENERGY_SAMPLER_CPU");
+	errno = 0;
+	char *end = nullptr;
+	auto cpu = std::strtol(text, &end, 10);
+#ifdef __linux__
+	if (errno || *end || cpu < 0 || cpu >= CPU_SETSIZE)
+		throw std::invalid_argument("DUCKDB_ENERGY_SAMPLER_CPU exceeds the supported CPU mask");
+#else
+	throw std::invalid_argument("Explicit energy sampler affinity requires Linux");
+#endif
+	return static_cast<int>(cpu);
+}
+void ApplyEnergySamplerCPU(int cpu) {
+#ifdef __linux__
+	auto name_error = pthread_setname_np(pthread_self(), "ea-sampler");
+	if (name_error) throw std::runtime_error("Cannot identify energy sampler thread");
+	if (cpu == -1) return;
+	if (cpu < 0 || cpu >= CPU_SETSIZE) throw std::invalid_argument("Invalid energy sampler CPU");
+	cpu_set_t requested, actual;
+	CPU_ZERO(&requested);
+	CPU_SET(cpu, &requested);
+	auto error = pthread_setaffinity_np(pthread_self(), sizeof(requested), &requested);
+	if (error) throw std::runtime_error(std::string("Cannot pin energy sampler: ") + std::strerror(error));
+	error = pthread_getaffinity_np(pthread_self(), sizeof(actual), &actual);
+	if (error || !CPU_EQUAL(&requested, &actual) || sched_getcpu() != cpu)
+		throw std::runtime_error("Energy sampler CPU affinity verification failed");
+#else
+	if (cpu != -1) throw std::invalid_argument("Explicit energy sampler affinity requires Linux");
+#endif
+}
+} // namespace energy_attribution
+} // namespace duckdb
+// END ENERGY SAMPLER AFFINITY HELPERS
 
 namespace duckdb {
 
@@ -2626,6 +2670,7 @@ private:
 	}
 
 	void StartLocked(DatabaseInstance &db, const EnergyAttributionSettings &settings_p) {
+		const auto sampler_cpu = energy_attribution::ParseEnergySamplerCPU(std::getenv("DUCKDB_ENERGY_SAMPLER_CPU"));
 		active_db = &db;
 		settings = settings_p;
 		period_ms = MaxValue<uint64_t>(1, settings.period_ms);
@@ -2726,7 +2771,27 @@ private:
 		process_collector_status = "ok";
 		runtime_generation.fetch_add(1, std::memory_order_acq_rel);
 		runtime_active.store(true, std::memory_order_release);
-		worker = std::thread([this]() { Run(); });
+		auto placement = std::make_shared<std::promise<void>>();
+		auto placed = placement->get_future();
+		worker = std::thread([this, sampler_cpu, placement]() {
+			try {
+				energy_attribution::ApplyEnergySamplerCPU(sampler_cpu);
+				placement->set_value();
+			} catch (...) {
+				placement->set_exception(std::current_exception());
+				return;
+			}
+			Run();
+		});
+		try {
+			placed.get(); // Run() can acquire the runtime lock after StartLocked returns.
+		} catch (...) {
+			worker.join();
+			runtime_active.store(false, std::memory_order_release);
+			running = false;
+			process_collector.reset();
+			throw;
+		}
 	}
 
 	void Run() {
@@ -4492,6 +4557,11 @@ EnergySegmentScope::EnergySegmentScope(Pipeline &pipeline, EnergySegmentPhase ph
 		record.core_freq_hz = topology.core_freq_hz;
 	}
 	record.uncore_freq_hz = GetQueryUncoreFrequency(*query, record.socket_id);
+    const auto fixed_profile_core = DatabaseInstance::GetDatabase(*query->context).config.options.query_profile_fixed_core_khz;
+    if (fixed_profile_core && DatabaseInstance::GetDatabase(*query->context).GetQuerySchedulerPolicy() == QuerySchedulerPolicy::DEFAULT) {
+        record.target_core_frequency_khz = fixed_profile_core;
+        record.target_uncore_frequency_khz = static_cast<uint32_t>(std::llround(record.uncore_freq_hz / 1000.0));
+    }
 	if (DatabaseInstance::GetDatabase(*query->context).GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY) {
 		auto target = DatabaseInstance::GetDatabase(*query->context)
 		                  .GetQuerySLAScheduler()

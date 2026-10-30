@@ -108,6 +108,10 @@ private:
 	mutex thread_lock;
 	//! The active background threads of the task scheduler
 	vector<unique_ptr<SchedulerThread>> threads;
+	//! Worker CPU pool is independent of whichever thread performs query cleanup.
+	vector<int> pinned_worker_cpus;
+	bool worker_pinning_enabled = false;
+	int previous_worker_pin_mode = -1;
 	//! Markers used by the various threads, if the markers are set to "false" the thread execution is stopped
 	vector<unique_ptr<atomic<bool>>> markers;
 	//! The threshold after which to flush the allocator after completing a task

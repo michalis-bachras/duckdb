@@ -66,7 +66,7 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 		output << "request_id,template_id,scale_factor,scheduled_offset_ns,deadline_offset_ns,sla_tag,"
 		          "sla_penalty_per_s,arrival_ns,"
 		          "submit_begin_ns,submit_end_ns,database_registration_cpu_ns,admitted_ns,execution_started_ns,execution_ready_ns,"
-		          "admission_released_ns,result_ready_ns,status,error\n";
+		          "admission_released_ns,result_ready_ns,admission_dispatched_ns,result_fingerprint,status,error\n";
 		for (const auto &result : results) {
 			output << result.request.request_id << ',' << result.request.template_id << ','
 			       << result.request.scale_factor << ',' << result.request.scheduled_offset_ns << ','
@@ -75,7 +75,7 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 			       << result.submit_begin_ns << ',' << result.submit_end_ns << ',' << result.database_registration_cpu_ns << ',' << result.admitted_ns << ','
 			       << result.execution_started_ns << ',' << result.execution_ready_ns << ','
 			       << result.admission_released_ns << ',' << result.result_ready_ns << ','
-			       << CSVString(result.status) << ',' << CSVString(result.error) << '\n';
+			       << result.admission_dispatched_ns << ',' << CSVString(result.result_fingerprint) << ',' << CSVString(result.status) << ',' << CSVString(result.error) << '\n';
 		}
 	}
 	{
@@ -86,7 +86,7 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 		output << std::setprecision(17);
 		output << "{\n";
 		output << "  \"format\": \"scheduler_workload_summary_v1\",\n";
-		output << "  \"scheduler\": " << JSONString(summary.scheduler) << ",\n";
+		output << "  \"architecture\": " << JSONString(config.architecture) << ",\n  \"measurement_energy_scope\": \"total_package\",\n  \"scheduler\": " << JSONString(summary.scheduler) << ",\n";
 		output << "  \"schedule_hash\": " << JSONString(summary.schedule_hash) << ",\n";
 		output << "  \"run_start_ns\": " << summary.run_start_ns << ",\n";
 		output << "  \"request_count\": " << summary.request_count << ",\n";
@@ -101,6 +101,7 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 		output << "  \"mean_response_s\": " << summary.mean_response_s << ",\n";
 		output << "  \"p50_response_s\": " << summary.p50_response_s << ",\n";
 		output << "  \"p90_response_s\": " << summary.p90_response_s << ",\n";
+		output << "  \"p95_response_s\": " << summary.p95_response_s << ",\n";
 		output << "  \"p99_response_s\": " << summary.p99_response_s << ",\n";
 		output << "  \"mean_arrival_dispatch_lag_ms\": " << summary.mean_arrival_dispatch_lag_ms << ",\n";
 		output << "  \"p99_arrival_dispatch_lag_ms\": " << summary.p99_arrival_dispatch_lag_ms << ",\n";
@@ -114,6 +115,7 @@ void WriteRunOutputs(const WorkloadConfig &config, const RunSummary &summary,
 		output << "  \"p99_database_registration_cpu_ms\": " << summary.p99_database_registration_cpu_ms << ",\n";
 		output << "  \"mean_submission_lag_ms\": " << summary.mean_submission_lag_ms << ",\n";
 		output << "  \"p99_submission_lag_ms\": " << summary.p99_submission_lag_ms << ",\n";
+		output << "  \"p99_admission_notification_dispatch_lag_ms\": " << summary.p99_admission_notification_dispatch_lag_ms << ",\n";
 		output << "  \"p99_admission_resume_lag_ms\": " << summary.p99_admission_resume_lag_ms << ",\n";
 		output << "  \"sla_miss_count\": " << summary.sla_miss_count << ",\n";
 		output << "  \"total_sla_cost\": " << summary.total_sla_cost << ",\n";

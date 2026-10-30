@@ -1,4 +1,5 @@
 #include "scheduler_workload.hpp"
+#include "package_energy.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/energy_attribution/energy_attribution.hpp"
@@ -10,10 +11,12 @@
 #include "duckdb/parallel/query_hardware_manager.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
+#include "duckdb/main/query_profiler.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <random>
 #include <numeric>
@@ -66,6 +69,54 @@ static string ReadTextFile(const string &path) {
 	return string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
 }
 
+static string ResultFingerprint(QueryResult &result) {
+    vector<string> rows;
+    uint64_t numeric_count=0;
+    long double numeric_abs=0,probe1=0,probe2=0,squares=0;
+    auto hash_text=[](const string &text) {
+        uint64_t value=14695981039346656037ULL;
+        for(auto c:text){value^=static_cast<unsigned char>(c);value*=1099511628211ULL;}
+        return value;
+    };
+    auto mix=[](uint64_t value) {
+        value=(value^(value>>30))*0xbf58476d1ce4e5b9ULL;
+        value=(value^(value>>27))*0x94d049bb133111ebULL;
+        return value^(value>>31);
+    };
+    while (auto chunk = result.Fetch()) {
+        if (!chunk->size()) break;
+        for (idx_t row=0; row<chunk->size(); row++) {
+            std::ostringstream canonical;
+            vector<std::pair<idx_t,double>> numeric;
+            for (idx_t col=0; col<chunk->ColumnCount(); col++) {
+                auto value = chunk->GetValue(col,row);
+                auto type = value.type().id(); string text;
+                if (!value.IsNull() && (type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE)) {
+                    auto number=value.GetValue<double>();
+                    if (std::isfinite(number)) {numeric.emplace_back(col,number);text="<numeric>";}
+                    else text=value.ToString();
+                } else { text=value.ToString(); }
+                canonical << int(type) << ':' << text.size() << ':' << text << ';';
+            }
+            auto exact=canonical.str();auto key=hash_text(exact);
+            for(const auto &entry:numeric) {
+                long double number=entry.second;
+                auto seed=key ^ (uint64_t(entry.first+1)*0x9e3779b97f4a7c15ULL);
+                auto w1=static_cast<long double>(mix(seed)&0xffffffffULL)/2147483647.5L-1;
+                auto w2=static_cast<long double>(mix(seed^0xd1b54a32d192ed03ULL)&0xffffffffULL)/2147483647.5L-1;
+                numeric_count++;numeric_abs+=std::abs(number);probe1+=number*w1;probe2+=number*w2;squares+=number*number;
+            }
+            rows.push_back(std::move(exact));
+        }
+    }
+    std::sort(rows.begin(),rows.end()); uint64_t hash=14695981039346656037ULL;
+    for (const auto &row:rows) { for (auto c:row) { hash ^= static_cast<unsigned char>(c); hash *= 1099511628211ULL; } hash ^= 255; hash *= 1099511628211ULL; }
+    std::ostringstream fingerprint;
+    fingerprint << "v2:" << rows.size() << ':' << hash << ':' << numeric_count << ':' << std::scientific << std::setprecision(20)
+                << numeric_abs << ':' << probe1 << ':' << probe2 << ':' << squares;
+    return fingerprint.str();
+}
+
 static void CheckResult(unique_ptr<MaterializedQueryResult> result, const string &operation) {
 	if (!result || result->HasError()) {
 		throw InvalidInputException("%s failed: %s", operation, result ? result->GetError() : "no result");
@@ -111,9 +162,20 @@ static void ExportRelation(Connection &root, const string &query, const string &
 }
 
 static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, QuerySchedulerPolicy policy) {
+	auto &architecture_options = DatabaseInstance::GetDatabase(*root.context).config.options;
+	architecture_options.query_sla_total_package = config.architecture == "total_package";
+	architecture_options.query_sla_total_reference_only = config.energy_controller == "reference" || config.energy_mode == "observe";
+	architecture_options.query_sla_total_lowest_safe = config.energy_controller == "lowest_safe";
+	architecture_options.query_sla_total_shadow = config.energy_mode != "enforce";
+	architecture_options.query_sla_total_models_validated = config.models_validated;
+	architecture_options.query_profile_fixed_core_khz = config.profile_core_khz;
+	architecture_options.query_sla_total_isolated_profiles_path = config.isolated_profiles_path;
 	ExecuteSetting(root, "SET threads=" + std::to_string(config.threads));
+	if (!config.memory_limit.empty()) {
+		ExecuteSetting(root, "SET memory_limit=" + QuoteSQLString(config.memory_limit));
+	}
 	ExecuteSetting(root, "SET external_threads=0");
-	ExecuteSetting(root, "SET query_sla_suffix_model=" + QuoteSQLString(QuerySLASuffixModelName(config.sla_suffix_model)));
+	ExecuteSetting(root, "SET query_sla_suffix_model=" + QuoteSQLString(config.architecture == "total_package" ? "histogram" : QuerySLASuffixModelName(config.sla_suffix_model)));
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
 	ExecuteSetting(root, string("SET query_sla_residual_policy=") +
 	                         QuoteSQLString(config.sla_residual_workers_enabled ? "work_conserving" : "park"));
@@ -123,7 +185,7 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 	auto pin_threads =
 	    policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled ? "on" : config.pin_threads;
 	ExecuteSetting(root, "SET pin_threads=" + QuoteSQLString(pin_threads));
-	if (policy == QuerySchedulerPolicy::SLA_ENERGY) {
+	if (config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
 		ExecuteSetting(root, string("SET query_sla_energy_hardware_control_enable=") +
 		                         (config.sla_energy_hardware_control ? "true" : "false"));
 		ExecuteSetting(root, string("SET query_sla_energy_exploration_enable=") +
@@ -143,6 +205,15 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 static void ConfigureRequestConnection(Connection &connection, const WorkloadConfig &config, uint64_t scale_factor,
 	                                   bool nonblocking, bool scheduler_trace) {
 	ExecuteSetting(connection, "SET query_request_profiling_enable=true");
+    if (config.profile_timing_export) {
+        ExecuteSetting(connection,"PRAGMA custom_profiling_settings='{\"DEFAULT\":\"false\",\"PIPELINE_INFO\":\"true\",\"PIPELINE_THROUGHPUT\":\"true\"}'");
+        ExecuteSetting(connection,"SET enable_profiling='no_output'");
+    }
+    if (config.profile_base_power_w > 0) {
+        if (config.threads != 1 || !config.profile_core_khz) throw InvalidInputException("Isolated calibration requires one worker and a verified fixed clock");
+        ExecuteSetting(connection,"PRAGMA custom_profiling_settings='{\"DEFAULT\":\"false\",\"PIPELINE_INFO\":\"true\",\"PIPELINE_DVFS_METRICS\":\"true\",\"PIPELINE_THROUGHPUT\":\"true\"}'");
+        ExecuteSetting(connection,"SET enable_profiling='no_output'");
+    }
 	ExecuteSetting(connection, "SET query_activation_scheduler_enable=true");
 	ExecuteSetting(connection, string("SET query_activation_debug_enable=") + (scheduler_trace ? "true" : "false"));
 	ExecuteSetting(connection, "SET query_admission_max_active=" + std::to_string(config.admission_cap));
@@ -175,13 +246,21 @@ static void ExportProfiles(DuckDB &db, const WorkloadConfig &config) {
           << row.observation_count << ',' << row.generation << ',' << row.running_mean_ns << ',' << row.latest_ns << ','
           << row.prediction_ns << ',' << row.histogram_sample_count << '\n';
   }
+  std::ofstream pipeline_reference(config.output_dir+"/pipeline_reference_profiles.csv");
+  pipeline_reference << std::setprecision(17) << "template_id,scale_factor,pipeline_id,pipeline_signature_hash,sample_count,work_units,parallelism_cap,throughput_per_worker,continuation_p95_ns_per_unit,lifecycle_mean_ns\n";
+  for (const auto &row:store.GetPipelineProfilesSnapshot()) {
+      const auto &p=row.estimate;
+      pipeline_reference << row.template_id << ',' << row.scale_factor << ',' << p.pipeline_id << ',' << p.pipeline_signature_hash << ','
+                         << p.sample_count << ',' << p.mean_planned_input_chunks_equiv << ',' << p.mean_source_max_threads << ','
+                         << p.mean_single_worker_chunks_per_s << ',' << p.p95_effective_ns_per_work_unit << ',' << MaxValue<double>(0,p.mean_lifecycle_runtime_ns-p.mean_task_runtime_ns) << '\n';
+  }
   auto r = store.GetSuffixModelRuntimeSnapshot();
   runtime << "issued_count,resolved_count,discarded_count,outstanding_count,missing_key_count,duplicate_feedback_count,unmatched_feedback_count,bootstrap_target\n"
           << r.issued_count << ',' << r.resolved_count << ',' << r.discarded_count << ',' << r.outstanding_count << ','
           << r.missing_key_count << ',' << r.duplicate_feedback_count << ',' << r.unmatched_feedback_count << ',' << r.bootstrap_target << '\n';
-  metadata << "{\n  \"snapshot_version\": 11,\n  \"scheduler\": \"" << SchedulerName(config.scheduler_policy)
+  metadata << "{\n  \"snapshot_version\": 12,\n  \"scheduler\": \"" << SchedulerName(config.scheduler_policy)
            << "\",\n  \"suffix_model_requested\": \"" << QuerySLASuffixModelName(config.sla_suffix_model)
-           << "\",\n  \"suffix_model\": \"" << QuerySLASuffixModelName(ResolveQuerySLASuffixModel(config.sla_suffix_model, config.scheduler_policy))
+           << "\",\n  \"suffix_model\": \"" << QuerySLASuffixModelName(ResolveQuerySLASuffixModel(db.instance->config.options.query_sla_suffix_model, db.instance->GetQuerySchedulerPolicy()))
            << "\",\n  \"bootstrap_target\": " << r.bootstrap_target << ",\n  \"seed\": " << config.seed << "\n}\n";
  }
 
@@ -249,6 +328,7 @@ struct RequestState {
 	unique_ptr<Connection> connection;
 	unique_ptr<PreparedStatement> prepared;
 	unique_ptr<PendingQueryResult> pending;
+	unique_ptr<QueryResult> completed_result;
 	shared_ptr<PendingQueryNotification> notification;
 	std::mutex lock;
 	std::condition_variable submitted_cv;
@@ -373,6 +453,7 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 	vector<double> database_registration_cpu_ms;
 	vector<double> submission_lag_ms;
 	vector<double> admission_resume_lag_ms;
+	vector<double> admission_notification_dispatch_lag_ms;
 	double response_total = 0;
 	double arrival_lag_total = 0;
 	double submission_lag_total = 0;
@@ -405,6 +486,9 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 		response_s.push_back(response);
 		arrival_dispatch_lag_ms.push_back(arrival_lag);
 		submission_lag_ms.push_back(submission_lag);
+        if (result.admitted_ns > 0 && result.admission_dispatched_ns >= result.admitted_ns) {
+            admission_notification_dispatch_lag_ms.push_back((result.admission_dispatched_ns-result.admitted_ns)/1e6);
+        }
 		if (result.admitted_ns > 0 && result.execution_started_ns >= result.admitted_ns) {
 			admission_resume_lag_ms.push_back(
 			    static_cast<double>(result.execution_started_ns - result.admitted_ns) / 1000000.0);
@@ -425,6 +509,7 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 	summary.mean_response_s = response_s.empty() ? 0 : response_total / response_s.size();
 	summary.p50_response_s = Percentile(response_s, 0.50);
 	summary.p90_response_s = Percentile(response_s, 0.90);
+	summary.p95_response_s = Percentile(response_s, 0.95);
 	summary.p99_response_s = Percentile(response_s, 0.99);
 	summary.mean_arrival_dispatch_lag_ms =
 	    arrival_dispatch_lag_ms.empty() ? 0 : arrival_lag_total / arrival_dispatch_lag_ms.size();
@@ -442,6 +527,7 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 	summary.p99_database_registration_cpu_ms = Percentile(database_registration_cpu_ms, 0.99);
 
 	summary.p99_admission_resume_lag_ms = Percentile(admission_resume_lag_ms, 0.99);
+	summary.p99_admission_notification_dispatch_lag_ms = Percentile(admission_notification_dispatch_lag_ms, 0.99);
 	if (summary.completed_count != summary.request_count) {
 		summary.validity_errors.push_back("not_all_requests_completed_successfully");
 	}
@@ -451,7 +537,10 @@ static RunSummary SummarizeInternal(const WorkloadConfig &config, const vector<S
 	if (summary.p99_driver_handoff_lag_ms > config.max_driver_lag_ms) {
 		summary.validity_errors.push_back("p99_driver_handoff_lag_exceeded_limit");
 	}
-	if (summary.p99_admission_resume_lag_ms > config.max_driver_lag_ms) {
+    if (config.package_energy && summary.p99_admission_notification_dispatch_lag_ms > config.max_driver_lag_ms) {
+        summary.validity_errors.push_back("p99_admission_notification_dispatch_lag_exceeded_limit");
+    }
+	if (!config.package_energy && summary.p99_admission_resume_lag_ms > config.max_driver_lag_ms) {
 		summary.validity_errors.push_back("p99_admission_resume_lag_exceeded_limit");
 	}
 	summary.valid = summary.validity_errors.empty();
@@ -473,6 +562,59 @@ static unique_ptr<QueryResult> ExecutePrepared(PreparedStatement &prepared, cons
 
 } // namespace
 
+bool ResultFingerprintsMatch(const string &a,const string &b) {
+    if(a==b)return true;
+    vector<string> x,y;string part;std::stringstream left(a),right(b);
+    while(std::getline(left,part,':'))x.push_back(part);
+    while(std::getline(right,part,':'))y.push_back(part);
+    if(x.size()!=8 || y.size()!=8 || x[0]!="v2" || y[0]!="v2")return false;
+    for(idx_t i=0;i<4;i++)if(x[i]!=y[i])return false;
+    try {
+        auto scale=MaxValue<long double>(1,std::max(std::stold(x[4]),std::stold(y[4])));
+        for(idx_t i=4;i<8;i++) {
+            auto u=std::stold(x[i]),v=std::stold(y[i]);
+            auto bound=i==7?MaxValue<long double>(1,std::max(std::abs(u),std::abs(v))):scale;
+            if(!std::isfinite(u)||!std::isfinite(v)||std::abs(u-v)>1e-12L*bound)return false;
+        }
+        return true;
+    } catch(...) {return false;}
+}
+
+void RunSteady(const WorkloadConfig &config) {
+    if (config.databases.size()!=1 || config.query_templates.size()!=1 || config.threads!=1)
+        throw InvalidInputException("steady requires one database, one query and one worker");
+    DuckDB db;Connection root(db);ConfigureDatabase(root,config,QuerySchedulerPolicy::DEFAULT);
+    Connection connection(db);ConfigureRequestConnection(connection,config,config.databases[0].scale_factor,false,false);
+    auto prepared=connection.Prepare(ReadTextFile(QueryPath(config,config.query_templates[0])));
+    if(prepared->HasError()) throw InvalidInputException("steady prepare failed: %s",prepared->GetError());
+    unique_ptr<QueryResult> last_result;
+    auto execute=[&](bool check) {
+        auto start=TimestampNs();
+        auto metadata=BuildMetadata(1,config.query_templates[0],config.databases[0].scale_factor,3,1,start+86400000000000ULL);
+        auto result=ExecutePrepared(*prepared,metadata);
+        if(!result || result->HasError()) throw InvalidInputException("steady execution failed");
+        auto elapsed=(TimestampNs()-start)/1e9;
+        string signature;
+        if(check)signature=ResultFingerprint(*result);
+        else last_result=std::move(result);
+        return std::make_pair(signature,elapsed);
+    };
+    auto reference=execute(true).first;
+    std::cout << "READY " << reference << std::endl;
+    char command;std::cin.get(command);
+    if(command!='G') return;
+    std::cout << "RUNNING" << std::endl;
+    auto start=TimestampNs();idx_t completed=0;double service=0;
+    do {
+        auto r=execute(false);
+        service+=r.second;completed++;
+    } while((TimestampNs()-start)/1e9<config.duration_s);
+    auto elapsed=(TimestampNs()-start)/1e9;
+    if(!last_result || !ResultFingerprintsMatch(ResultFingerprint(*last_result),reference))throw InvalidInputException("steady result fingerprint changed");
+    std::cout << std::setprecision(17) << "{\"completed\":" << completed << ",\"elapsed_s\":" << elapsed
+              << ",\"mean_query_s\":" << service/completed << ",\"fingerprint\":\"" << reference << "\",\"correct\":true}" << std::endl;
+}
+
 vector<CalibrationEntry> Calibrate(const WorkloadConfig &config) {
 	DuckDB db;
 	Connection root(db);
@@ -490,6 +632,10 @@ vector<CalibrationEntry> Calibrate(const WorkloadConfig &config) {
 				                            database.scale_factor, prepared->GetError());
 			}
 			double total_s = 0;
+			for (idx_t warmup=0;warmup<config.warmup_repetitions;warmup++) {
+				auto result=prepared->Execute();
+				if(!result || result->HasError())throw InvalidInputException("Calibration warmup failed");
+			}
 			for (idx_t repetition = 0; repetition < config.repetitions; repetition++) {
 				auto start_ns = TimestampNs();
 				auto metadata = BuildMetadata(request_id++, template_id, database.scale_factor, config.sla_tag,
@@ -523,7 +669,35 @@ void TrainProfiles(const WorkloadConfig &config) {
  Connection root(db);
  ConfigureDatabase(root, config, config.scheduler_policy);
  ConfigureEnergyAttribution(root, config);
+ if(config.warmup_repetitions) {
+     for(idx_t repetition=0;repetition<config.warmup_repetitions;repetition++) {
+         for(const auto &database:config.databases) {
+             Connection warm(db);ConfigureRequestConnection(warm,config,database.scale_factor,false,false);
+             for(auto query:config.query_templates) {
+                 auto result=warm.Query(ReadTextFile(QueryPath(config,query)));
+                 if(!result || result->HasError())throw InvalidInputException("Profile warmup failed");
+             }
+         }
+     }
+     db.instance->GetQueryRequestProfileStore().Clear();
+ }
  ImportProfiles(db, config);
+ std::ofstream isolated;
+ std::ofstream query_timings, pipeline_timings;
+ if (config.profile_timing_export) {
+     db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
+     query_timings.open(config.output_dir+"/query_timing_samples.csv");
+     pipeline_timings.open(config.output_dir+"/pipeline_timing_samples.csv");
+     if (!query_timings || !pipeline_timings) throw IOException("Could not open timing exports");
+     query_timings << std::setprecision(17) << "request_id,repetition,template_id,scale_factor,phase,start_ns,end_ns,duration_s,fingerprint,correct\n";
+     pipeline_timings << "request_id,repetition,template_id,scale_factor,pipeline_id,pipeline_signature_hash,pipeline_structure_hash,source_type,sink_type,start_ns,tasks_done_ns,finish_done_ns,wall_ns,worker_ns,worker_tasks,planned_work_units,source_tuples,source_chunks,pipeline_input_tuples,pipeline_input_chunks,valid_timing\n";
+     query_timings.flush();pipeline_timings.flush();
+ }
+ if (config.profile_base_power_w > 0) {
+     db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
+     isolated.open(config.output_dir+"/isolated_pipeline_samples.csv");
+     isolated << std::setprecision(17) << "template_id,scale_factor,pipeline_id,pipeline_signature_hash,core_khz,uncore_khz,work_units,worker_ns,wall_ns,package_energy_j,matched_baseline_w,valid\n";
+ }
  auto &store = db.instance->GetQueryRequestProfileStore();
  if (config.sla_suffix_bootstrap) { store.SetSuffixBootstrapMode(true, config.sla_suffix_bootstrap_observations); }
  vector<std::pair<idx_t, uint64_t>> tasks;
@@ -541,10 +715,59 @@ void TrainProfiles(const WorkloadConfig &config) {
    ConfigureRequestConnection(connection, config, database.scale_factor, false, false);
    auto prepared = connection.Prepare(ReadTextFile(QueryPath(config, template_id)));
    if (prepared->HasError()) { throw InvalidInputException("Could not prepare profile training query: %s", prepared->GetError()); }
+   string reference;
+   for (idx_t warmup=0;warmup<config.profile_query_warmups;warmup++) {
+       auto warm_start=TimestampNs();auto warm_id=request_id++;
+       std::cout << "profile_warmup_started Q" << template_id << " SF" << database.scale_factor << std::endl;
+       auto warm_metadata=BuildMetadata(warm_id,template_id,database.scale_factor,config.sla_tag,config.sla_penalty_per_s,warm_start+86400ULL*1000000000ULL);
+       auto warm_result=ExecutePrepared(*prepared,warm_metadata);auto warm_end=TimestampNs();
+       if (!warm_result || warm_result->HasError()) throw InvalidInputException("Per-query profile warmup failed");
+       auto fingerprint=ResultFingerprint(*warm_result);
+       if (!reference.empty() && !ResultFingerprintsMatch(reference,fingerprint)) throw InvalidInputException("Warmup fingerprint changed");
+       reference=fingerprint;
+       query_timings << warm_id << ',' << repetition << ',' << template_id << ',' << database.scale_factor << ",warmup," << warm_start << ',' << warm_end << ',' << (warm_end-warm_start)/1e9 << ',' << fingerprint << ",true\n";
+       query_timings.flush();
+   }
+   if (config.profile_execution_gate) {
+       std::cout << "profile_execution_ready Q" << template_id << std::endl;
+       string command;
+       if (!(std::cin >> command) || command!="G") throw InvalidInputException("Expected G at profile execution gate");
+   }
+   auto timing_start=TimestampNs();auto timing_id=request_id;
+   if (config.profile_timing_export) std::cout << "profile_measurement_started Q" << template_id << " SF" << database.scale_factor << std::endl;
    auto metadata = BuildMetadata(request_id++, template_id, database.scale_factor, config.sla_tag,
                                  config.sla_penalty_per_s, TimestampNs() + 86400ULL * 1000000000ULL);
    auto result = ExecutePrepared(*prepared, metadata);
+   auto timing_end=TimestampNs();
    if (!result || result->HasError()) { throw InvalidInputException("Profile training failed: %s", result ? result->GetError() : "no result"); }
+   if (config.profile_timing_export) {
+       auto fingerprint=ResultFingerprint(*result);
+       bool correct=!reference.empty() && ResultFingerprintsMatch(reference,fingerprint);
+       if (!reference.empty() && !correct) throw InvalidInputException("Measured result differs from warmup");
+       query_timings << timing_id << ',' << repetition << ',' << template_id << ',' << database.scale_factor << ",measured," << timing_start << ',' << timing_end << ',' << (timing_end-timing_start)/1e9 << ',' << fingerprint << ',' << (correct?"true":"unchecked") << '\n';
+       query_timings.flush();
+       for (const auto &p : QueryProfiler::Get(*connection.context).GetPipelineProfilesSnapshot()) {
+           auto wall=p.tasks_done_ns>=p.start_ns?p.tasks_done_ns-p.start_ns:0;
+           bool valid=p.start_ns>0 && p.tasks_done_ns>=p.start_ns && wall>0;
+           pipeline_timings << timing_id << ',' << repetition << ',' << template_id << ',' << database.scale_factor << ',' << p.pipeline_id << ',' << p.pipeline_signature_hash << ',' << p.pipeline_structure_hash << ',' << p.source_type << ',' << p.sink_type << ',' << p.start_ns << ',' << p.tasks_done_ns << ',' << p.finish_done_ns << ',' << wall << ',' << p.worker_task_duration_ns << ',' << p.worker_task_count << ',' << p.planned_input_chunks_equiv << ',' << p.source_tuples_touched << ',' << p.source_chunks_touched << ',' << p.pipeline_input_tuples << ',' << p.pipeline_input_chunks << ',' << (valid?"true":"false") << '\n';
+       }
+       pipeline_timings.flush();
+       std::cout << "profile_measurement_completed Q" << template_id << " seconds=" << (timing_end-timing_start)/1e9 << std::endl;
+       if (config.profile_execution_gate) {
+           std::cout << "profile_execution_finished Q" << template_id << std::endl;
+           string command;
+           if (!(std::cin >> command) || command!="C") throw InvalidInputException("Expected C after profile execution");
+       }
+   }
+   if (isolated.is_open()) {
+       for (const auto &p : QueryProfiler::Get(*connection.context).GetPipelineProfilesSnapshot()) {
+           auto wall_ns=p.tasks_done_ns>p.start_ns?p.tasks_done_ns-p.start_ns:0;
+           bool valid=p.rapl_supported && wall_ns>0 && wall_ns<200000000000ULL && p.worker_task_duration_ns>0 && p.planned_input_chunks_equiv>0;
+           isolated << template_id << ',' << database.scale_factor << ',' << p.pipeline_id << ',' << p.pipeline_signature_hash << ','
+                    << config.profile_core_khz << ",2800000," << p.planned_input_chunks_equiv << ',' << p.worker_task_duration_ns << ',' << wall_ns << ','
+                    << p.cpu_package_j << ',' << config.profile_base_power_w << ',' << valid << '\n';
+       }
+   }
   }
  }
  if (config.sla_suffix_bootstrap && !store.SuffixBootstrapComplete()) { throw InvalidInputException("Incomplete exact-key suffix bootstrap; no snapshot exported"); }
@@ -561,8 +784,24 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	                   vector<RequestResult> &results) {
 	DuckDB db;
 	Connection root(db);
-	ConfigureDatabase(root, config, config.scheduler_policy);
+	ConfigureDatabase(root, config, config.warmup_repetitions ? QuerySchedulerPolicy::DEFAULT : config.scheduler_policy);
+    if (config.warmup_repetitions) {
+        for (idx_t repetition=0;repetition<config.warmup_repetitions;repetition++) {
+            for (const auto &database:config.databases) {
+                Connection warm(db);ConfigureRequestConnection(warm,config,database.scale_factor,false,false);
+                for (auto query:config.query_templates) {
+                    auto prepared=warm.Prepare(ReadTextFile(QueryPath(config,query)));
+                    if(prepared->HasError())throw InvalidInputException("Warmup prepare failed");
+                    auto metadata=BuildMetadata(1,query,database.scale_factor,3,1,TimestampNs()+86400000000000ULL);
+                    auto result=ExecutePrepared(*prepared,metadata);
+                    if(!result || result->HasError())throw InvalidInputException("Warmup query failed");
+                    (void)ResultFingerprint(*result);
+                }
+            }
+        }
+    }
 	ImportProfiles(db, config);
+    if (config.warmup_repetitions) ExecuteSetting(root,"SET scheduler_policy='"+SchedulerName(config.scheduler_policy)+"'");
 
 	std::unordered_map<uint64_t, string> query_sql;
 	for (const auto template_id : config.query_templates) {
@@ -609,6 +848,7 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	std::atomic<idx_t> max_waiters(0);
 	std::mutex done_lock;
 	std::condition_variable done_cv;
+	PackageEnergyMeter package_meter(config.package_energy);
 	auto run_start_ns = TimestampNs() + 100000000ULL;
 
 	vector<std::thread> submitters;
@@ -664,6 +904,7 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 				}
 				case PendingQueryEventType::ADMITTED:
 					request.result.admitted_ns = event.timestamp_ns;
+					request.result.admission_dispatched_ns = TimestampNs();
 					if (request.admission_queued) {
 						request.admission_queued = false;
 						--current_waiters;
@@ -683,7 +924,7 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 						auto query_result = request.pending->Execute();
 						if (!query_result || query_result->HasError()) {
 							request.result.error = query_result ? query_result->GetError() : "no query result";
-						}
+						} else { request.completed_result = std::move(query_result); }
 					}
 					break;
 				case PendingQueryEventType::ADMISSION_RELEASED:
@@ -696,12 +937,15 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 						request.admission_queued = false;
 						--current_waiters;
 					}
-					request.result.result_ready_ns = event.timestamp_ns;
+					request.result.result_ready_ns = config.package_energy ? TimestampNs() : event.timestamp_ns;
 					if (!event.error.empty()) {
 						request.result.error = event.error;
 					}
 					request.result.status = event.type == PendingQueryEventType::RESULT_READY ? "ok" : "error";
 					if (!request.done) {
+						std::lock_guard<std::mutex> boundary_guard(done_lock);
+						if (config.package_energy && done_count.load()+1 == requests.size()) package_meter.Stop();
+						if (config.package_energy) request.result.result_ready_ns = TimestampNs();
 						request.done = true;
 						done_count++;
 						done_cv.notify_all();
@@ -713,6 +957,10 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	}
 
 	std::thread arrivals([&]() {
+		if (config.package_energy) {
+			std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(run_start_ns)));
+			run_start_ns = package_meter.Start();
+		}
 		for (idx_t request_idx = 0; request_idx < requests.size(); request_idx++) {
 			auto target = std::chrono::steady_clock::time_point(
 			    std::chrono::nanoseconds(run_start_ns + requests[request_idx]->schedule.scheduled_offset_ns));
@@ -774,6 +1022,9 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	results.clear();
 	results.reserve(requests.size());
 	for (auto &request : requests) {
+		// Correctness checking consumes materialized results after the final
+		// terminal-result energy boundary; it must not distort latency or energy.
+		if (request->completed_result) request->result.result_fingerprint = ResultFingerprint(*request->completed_result);
 		results.push_back(std::move(request->result));
 	}
 	auto summary = SummarizeInternal(config, schedule, results, run_start_ns, notification_queue->HighWaterMark(),
@@ -787,6 +1038,14 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
  }
 	FinalizeEnergyAttribution(db, root, config);
 	db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
+	package_meter.Write(config.output_dir);
+    if (config.architecture == "total_package") {
+        std::ofstream output(config.output_dir + "/total_package_candidates.csv");
+        output << std::setprecision(17) << "epoch_generation,candidate_id,reference_work_s,total_package_energy_j,reference_efficiency,candidate_efficiency,modeled_cost,selected,shadow_selected,greedy_allocation_cost,exact_allocation_cost,non_diminishing_queries,reason\n";
+        for (const auto &row : db.instance->GetQuerySLAScheduler().GetTotalPackageTrace()) {
+            output << row.epoch_generation << ',' << row.candidate_id << ',' << row.reference_work_s << ',' << row.package_energy_j << ',' << row.reference_efficiency << ',' << row.candidate_efficiency << ',' << row.modeled_cost << ',' << row.selected << ',' << row.shadow_selected << ',' << row.greedy_allocation_cost << ',' << row.exact_allocation_cost << ',' << row.non_diminishing_queries << ',' << row.reason << '\n';
+        }
+    }
 	if (!config.scheduler_trace_templates.empty()) {
 		auto trace_path = config.output_dir + "/query_sla_scheduler_epochs.csv";
 		ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_scheduler_epochs()", trace_path,

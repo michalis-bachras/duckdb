@@ -290,3 +290,28 @@ TEST_CASE("Scheduler profile snapshots round trip bounded model state", "[api][s
 	REQUIRE(global_estimate.tail_to_pipeline_end.level == PipelineLifecycleTailEstimateLevel::GLOBAL);
 	db.instance->GetFileSystem().RemoveFile(path);
 }
+
+#ifdef __linux__
+#include <sched.h>
+#include <dirent.h>
+#include <fstream>
+#include <thread>
+#include <set>
+TEST_CASE("Query cleanup retains the worker CPU pool from a housekeeping caller", "[api][scheduler_workload][pinning]") {
+ cpu_set_t original;CPU_ZERO(&original);REQUIRE(sched_getaffinity(0,sizeof(original),&original)==0);
+ vector<int> cpus;for(int c=0;c<CPU_SETSIZE;c++)if(CPU_ISSET(c,&original))cpus.push_back(c);
+ if(cpus.size()<3){WARN("Pinning regression needs three available logical CPUs");return;}
+ struct Restore {cpu_set_t saved;~Restore(){sched_setaffinity(0,sizeof(saved),&saved);}} restore{original};
+ cpu_set_t pool;CPU_ZERO(&pool);CPU_SET(cpus[0],&pool);CPU_SET(cpus[1],&pool);REQUIRE(sched_setaffinity(0,sizeof(pool),&pool)==0);
+ DuckDB db;Connection connection(db);REQUIRE_NO_FAIL(connection.Query("SET threads=2"));
+ REQUIRE_NO_FAIL(connection.Query("SET external_threads=0"));REQUIRE_NO_FAIL(connection.Query("SET pin_threads='on'"));
+ auto workers=[&](){std::set<int> result;DIR *directory=opendir("/proc/self/task");REQUIRE(directory);
+  while(auto *entry=readdir(directory)){int tid=atoi(entry->d_name);if(tid<=0)continue;cpu_set_t mask;CPU_ZERO(&mask);
+   if(!sched_getaffinity(tid,sizeof(mask),&mask)&&CPU_COUNT(&mask)==1&&(CPU_ISSET(cpus[0],&mask)||CPU_ISSET(cpus[1],&mask)))result.insert(tid);}
+  closedir(directory);return result;};
+ auto before=workers();REQUIRE(before.size()>=2);
+ cpu_set_t housekeeping;CPU_ZERO(&housekeeping);CPU_SET(cpus[2],&housekeeping);REQUIRE(sched_setaffinity(0,sizeof(housekeeping),&housekeeping)==0);
+ for(int i=0;i<3;i++)REQUIRE_NO_FAIL(connection.Query("SELECT SUM(i) FROM range(100000) t(i)"));
+ auto after=workers();for(auto tid:before)REQUIRE(after.count(tid)==1);
+}
+#endif

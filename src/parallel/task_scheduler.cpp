@@ -771,13 +771,21 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n, bool destroy) {
 		pin_thread_mode = Settings::Get<PinThreadsSetting>(db);
 	}
 
+	const bool pin_enabled = !destroy && (pin_thread_mode == ThreadPinMode::ON ||
+	    (pin_thread_mode == ThreadPinMode::AUTO && std::thread::hardware_concurrency() > 64));
+	if (pin_enabled && (!worker_pinning_enabled || previous_worker_pin_mode != static_cast<int>(pin_thread_mode))) {
+		pinned_worker_cpus = GetAffinityCPUs();
+	}
+	if (!pin_enabled) { pinned_worker_cpus.clear(); }
+	worker_pinning_enabled = pin_enabled;
+	previous_worker_pin_mode = static_cast<int>(pin_thread_mode);
 	if (threads.size() == new_thread_count) {
 		static constexpr idx_t THREAD_PIN_THRESHOLD = 64;
 		const auto pin_threads =
 		    pin_thread_mode == ThreadPinMode::ON ||
 		    (pin_thread_mode == ThreadPinMode::AUTO && std::thread::hardware_concurrency() > THREAD_PIN_THRESHOLD);
 		if (pin_threads) {
-			auto affinity_cpus = GetAffinityCPUs();
+			auto &affinity_cpus = pinned_worker_cpus;
 			if (!affinity_cpus.empty()) {
 				for (idx_t thread_idx = 0; thread_idx < threads.size(); thread_idx++) {
 					auto cpu_idx = thread_idx % affinity_cpus.size();
@@ -812,7 +820,7 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n, bool destroy) {
 		const auto pin_threads =
 		    pin_thread_mode == ThreadPinMode::ON ||
 		    (pin_thread_mode == ThreadPinMode::AUTO && std::thread::hardware_concurrency() > THREAD_PIN_THRESHOLD);
-		auto affinity_cpus = pin_threads ? GetAffinityCPUs() : vector<int>();
+		auto affinity_cpus = pin_threads ? pinned_worker_cpus : vector<int>();
 		for (idx_t i = 0; i < create_new_threads; i++) {
 			// launch a thread and assign it a cancellation marker
 			auto marker = unique_ptr<atomic<bool>>(new atomic<bool>(true));

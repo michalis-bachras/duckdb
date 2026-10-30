@@ -74,6 +74,7 @@ static QuerySchedulerPolicy ParseScheduler(const string &value) {
 }
 
 static WorkloadCommand ParseCommand(const string &value) {
+	if (value == "steady") return WorkloadCommand::STEADY;
 	if (value == "calibrate") {
 		return WorkloadCommand::CALIBRATE;
 	}
@@ -125,6 +126,10 @@ static void ValidateConfig(WorkloadConfig &config) {
 	if (config.admission_cap == 0) {
 		throw InvalidInputException("--admission-cap must be positive");
 	}
+	if ((config.profile_timing_export || config.profile_query_warmups || config.profile_execution_gate) &&
+	    (config.command != WorkloadCommand::TRAIN_PROFILES || !config.profile_timing_export || config.output_dir.empty())) {
+		throw InvalidInputException("Timing export requires train-profiles, --profile-timing-export on and --output-dir");
+	}
 	if (config.sla_epoch_ms == 0) {
 		throw InvalidInputException("--sla-epoch-ms must be positive");
 	}
@@ -145,7 +150,7 @@ static void ValidateConfig(WorkloadConfig &config) {
 		    "SLA tag must be positive; penalty, driver-lag limit, and diagnostic interval must be non-negative");
 	}
 	if (config.command == WorkloadCommand::CALIBRATE || config.command == WorkloadCommand::TRAIN_PROFILES ||
-	    config.command == WorkloadCommand::RUN) {
+	    config.command == WorkloadCommand::RUN || config.command == WorkloadCommand::STEADY) {
 		if (config.databases.empty() || config.queries_dir.empty()) {
 			throw InvalidInputException("This command requires --database SF=PATH and --queries-dir PATH");
 		}
@@ -253,15 +258,22 @@ Schedule options:
   --output PATH               Calibration or schedule output path.
 
 Run options:
+  --architecture legacy|total_package  Explicit architecture; legacy remains selectable.
+  --energy-controller reference|lowest_safe|efficiency
+  --energy-mode observe|shadow|enforce
   --schedule PATH             Saved schedule CSV.
 	  --scheduler default|stride|sla|sla_energy
 	  --pin-threads auto|on|off  Worker pinning mode (default: auto; attribution forces on).
   --sla-suffix-model MODEL    model_default, point, histogram (energy default: point; SLA default: histogram).
   --sla-suffix-bootstrap on|off  Train both predictors in fresh DEFAULT train-profiles.
   --sla-suffix-bootstrap-observations N  Exact-key target, 1-100 (default: 15).
-  --profile-input PATH        Optional version-11 scheduler profile snapshot.
+  --profile-input PATH        Optional version-12 scheduler profile snapshot.
   --hardware-profile-input PATH  Load hardware calibration only, after --profile-input.
   --profile-output PATH       Export updated profile state after training/run.
+  --profile-timing-export on|off  Export per-execution query and pipeline timings during train-profiles.
+  --profile-query-warmups N   Warm each query immediately before its measured profile execution.
+  --profile-execution-gate on|off  Wait for G before execution and C after timing export (train-profiles only).
+  --memory-limit SIZE        Optional DuckDB memory limit, e.g. 160GiB.
   --output-dir PATH           Run timeline and summary directory.
   --submitter-threads N       Fixed native submission pool size (default: 2).
 	  --completion-threads N      Fixed event/completion pool size (default: 2).
@@ -382,6 +394,36 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.profile_snapshot_in = value;
 		} else if (name == "profile-output") {
 			config.profile_snapshot_out = value;
+		} else if (name == "warmup-repetitions") {
+			config.warmup_repetitions = ParseUint(value,name);
+		} else if (name == "profile-timing-export") {
+			config.profile_timing_export = ParseBool(value,name);
+		} else if (name == "profile-query-warmups") {
+			config.profile_query_warmups = ParseUint(value,name);
+		} else if (name == "profile-execution-gate") {
+			config.profile_execution_gate = ParseBool(value,name);
+		} else if (name == "memory-limit") {
+			config.memory_limit = value;
+		} else if (name == "models-validated") {
+			config.models_validated = ParseBool(value,name);
+		} else if (name == "isolated-profiles") {
+			config.isolated_profiles_path = value;
+		} else if (name == "profile-base-power-w") {
+			config.profile_base_power_w = ParseDouble(value,name);
+		} else if (name == "profile-core-khz") {
+			config.profile_core_khz = ParseUint(value,name);
+			if (config.profile_core_khz!=1200000 && config.profile_core_khz!=2400000 && config.profile_core_khz!=3500000) throw InvalidInputException("Unsupported profile clock");
+		} else if (name == "package-energy") {
+			config.package_energy = ParseBool(value, name);
+		} else if (name == "architecture") {
+			if (value != "legacy" && value != "total_package") throw InvalidInputException("--architecture must be legacy or total_package");
+			config.architecture = value;
+		} else if (name == "energy-controller") {
+			if (value != "efficiency" && value != "reference" && value != "lowest_safe") throw InvalidInputException("invalid --energy-controller");
+			config.energy_controller = value;
+		} else if (name == "energy-mode") {
+			if (value != "observe" && value != "shadow" && value != "enforce") throw InvalidInputException("invalid --energy-mode");
+			config.energy_mode = value;
 		} else if (name == "scheduler") {
 			config.scheduler_policy = ParseScheduler(value);
 		} else if (name == "pin-threads") {

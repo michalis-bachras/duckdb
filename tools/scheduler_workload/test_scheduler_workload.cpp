@@ -4,7 +4,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 
 using namespace duckdb;
 using namespace duckdb::scheduler_workload;
@@ -64,8 +66,19 @@ int main() {
 		const string path = "/tmp/duckdb_scheduler_workload_schedule_test.csv";
 		WriteSchedule(path, first);
 		auto round_trip = ReadSchedule(path);
-		std::remove(path.c_str());
 		Require(ScheduleHash(first) == ScheduleHash(round_trip), "schedule CSV round trip");
+		std::ifstream input(path);
+		std::ostringstream crlf;
+		string line;
+		while (std::getline(input, line)) {
+			crlf << line << "\r\n";
+		}
+		input.close();
+		std::ofstream windows_output(path, std::ios::binary);
+		windows_output << crlf.str();
+		windows_output.close();
+		Require(ScheduleHash(first) == ScheduleHash(ReadSchedule(path)), "CRLF schedule preserves immutable requests");
+		std::remove(path.c_str());
 
 		const char *arguments[] = {
 		    "scheduler_workload", "run", "--database", "10=/tmp/sf10.duckdb", "--queries-dir", "/tmp/queries",
@@ -214,6 +227,23 @@ int main() {
         lag_result.submit_begin_ns = 1020000000;
         Require(!SummarizeRun(lag_config, {lag_result.request}, {lag_result}, 1000000000, 0, 0).valid,
                 "actual driver lag invalidates the run");
+        lag_config.package_energy = true;
+        lag_result.submit_begin_ns = 1002000000;
+        lag_result.admitted_ns = 1010000000;
+        lag_result.admission_dispatched_ns = 1011000000;
+        lag_result.execution_started_ns = 1250000000;
+        auto energy_lag_summary = SummarizeRun(lag_config, {lag_result.request}, {lag_result}, 1000000000, 0, 0);
+        Require(energy_lag_summary.valid && energy_lag_summary.p99_admission_resume_lag_ms == 240,
+                "database initialization and scheduler wait remain diagnostic, not notification delay");
+        lag_result.admission_dispatched_ns = 1030000000;
+        Require(!SummarizeRun(lag_config, {lag_result.request}, {lag_result}, 1000000000, 0, 0).valid,
+                "delayed admission notification invalidates energy runs");
+        Require(ResultFingerprintsMatch("v2:2:123:2:100:20:30:5000", "v2:2:123:2:100:20.000000000001:30:5000"),
+                "floating aggregation order tolerates small numeric jitter");
+        Require(!ResultFingerprintsMatch("v2:2:123:2:100:20:30:5000", "v2:2:124:2:100:20:30:5000"),
+                "a changed non-floating row hash fails correctness");
+        Require(!ResultFingerprintsMatch("v2:2:123:2:100:20:30:5000", "v2:2:123:2:100:21:30:5000"),
+                "changed keyed numeric probes fail correctness");
 		std::cout << "scheduler_workload tests passed\n";
 		return 0;
 	} catch (std::exception &ex) {

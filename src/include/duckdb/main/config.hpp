@@ -124,6 +124,7 @@ struct DBConfigOptions {
 	bool query_sla_total_lowest_safe = false;
 	bool query_sla_total_shadow = false;
 	bool query_sla_total_models_validated = false;
+	uint32_t query_profile_fixed_core_khz = 0;
 	string query_sla_total_isolated_profiles_path;
 	double query_sla_total_margin = 0.05;
 	QuerySLASuffixModel query_sla_suffix_model = QuerySLASuffixModel::MODEL_DEFAULT;

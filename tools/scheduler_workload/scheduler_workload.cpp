@@ -15,6 +15,8 @@ int main(int argc, char **argv) {
 		}
 		auto config = ParseConfig(argc, argv);
 		switch (config.command) {
+		case WorkloadCommand::STEADY:
+			RunSteady(config); return 0;
 		case WorkloadCommand::CALIBRATE: {
 			auto calibration = Calibrate(config);
 			WriteCalibration(config.output_path, calibration);

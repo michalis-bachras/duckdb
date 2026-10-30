@@ -78,11 +78,14 @@ vector<CalibrationEntry> ReadCalibration(const string &path) {
 		throw IOException("Could not open calibration file: %s", path);
 	}
 	string line;
-	if (!std::getline(input, line) || line != "template_id,scale_factor,sample_count,mean_runtime_s") {
+	if (!std::getline(input, line)) throw InvalidInputException("Missing schedule CSV header");
+	if (!line.empty() && line.back()=='\r') line.pop_back();
+	if ( line != "template_id,scale_factor,sample_count,mean_runtime_s") {
 		throw InvalidInputException("Unsupported calibration CSV header in %s", path);
 	}
 	vector<CalibrationEntry> result;
 	while (std::getline(input, line)) {
+		if (!line.empty() && line.back()=='\r') line.pop_back();
 		if (line.empty()) {
 			continue;
 		}
@@ -196,7 +199,9 @@ vector<ScheduleEntry> ReadSchedule(const string &path) {
 		throw IOException("Could not open schedule file: %s", path);
 	}
 	string line;
-	if (!std::getline(input, line) ||
+	if (!std::getline(input, line)) throw InvalidInputException("Missing schedule CSV header");
+	if (!line.empty() && line.back()=='\r') line.pop_back();
+	if (
 	    line != "request_id,template_id,scale_factor,scheduled_offset_ns,deadline_offset_ns,sla_tag,"
 	            "sla_penalty_per_s") {
 		throw InvalidInputException("Unsupported schedule CSV header in %s", path);
@@ -205,6 +210,7 @@ vector<ScheduleEntry> ReadSchedule(const string &path) {
 	std::set<uint64_t> request_ids;
 	uint64_t previous_offset = 0;
 	while (std::getline(input, line)) {
+		if (!line.empty() && line.back()=='\r') line.pop_back();
 		if (line.empty()) {
 			continue;
 		}
