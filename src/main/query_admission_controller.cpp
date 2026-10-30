@@ -11,6 +11,7 @@
 #include "duckdb/main/database.hpp"
 
 #include <chrono>
+#include <limits>
 
 namespace duckdb {
 
@@ -48,7 +49,29 @@ void QueryAdmissionHandle::Wait() {
 	controller->Wait(*this);
 }
 
-QueryAdmissionController::QueryAdmissionController(DatabaseInstance &db_p) : db(db_p) {
+QueryAdmissionController::QueryAdmissionController(DatabaseInstance &db_p)
+    : db(db_p), policy(db_p.config.options.query_admission_policy) {
+}
+
+void QueryAdmissionController::SetPolicy(QueryAdmissionPolicy new_policy) {
+	lock_guard<mutex> guard(admission_lock);
+	if (new_policy != policy && (!active.empty() || !waiters.empty())) {
+		throw InvalidInputException("query_admission_policy cannot change while requests are admitted or waiting");
+	}
+	policy = new_policy;
+}
+
+QueryAdmissionPolicy QueryAdmissionController::GetPolicy() const {
+	lock_guard<mutex> guard(admission_lock);
+	return policy;
+}
+
+QueryAdmissionController::WaiterKey QueryAdmissionController::WaitingKey(const QueryAdmissionHandle &request) const {
+	uint64_t deadline = 0;
+	if (policy == QueryAdmissionPolicy::EDF) {
+		deadline = request.metadata.deadline_ns ? request.metadata.deadline_ns : std::numeric_limits<uint64_t>::max();
+	}
+	return {deadline, request.ticket};
 }
 
 uint64_t QueryAdmissionController::TimestampNs() {
@@ -130,12 +153,14 @@ unique_ptr<QueryAdmissionHandle> QueryAdmissionController::EnqueueOrAcquire(Clie
 		if (waiters.empty() && active.size() < max_active) {
 			AdmitRequest(*request, notifications);
 		} else {
-			waiters.push_back(request.get());
+			waiters.emplace(WaitingKey(*request), request.get());
 			LogEventLocked(request->metadata, "queued", request->ticket, 0, request->max_active, request->queued_ns, 0,
 			               0, request->debug_enabled);
 			if (request->notification) {
 				notifications.push_back({request->notification, PendingQueryEventType::ADMISSION_QUEUED});
 			}
+			// A new EDF head may be eligible even when the previous head's local cap blocked admission.
+			TryAdmitWaiters(notifications);
 		}
 	}
 	PublishNotifications(notifications);
@@ -169,11 +194,12 @@ void QueryAdmissionController::ReleaseLocked(idx_t slot_id, vector<AdmissionNoti
 
 void QueryAdmissionController::TryAdmitWaiters(vector<AdmissionNotification> &notifications) {
 	while (!waiters.empty()) {
-		auto *request = waiters.front();
+		auto entry = waiters.begin();
+		auto *request = entry->second;
 		if (active.size() >= request->max_active) {
 			break;
 		}
-		waiters.pop_front();
+		waiters.erase(entry);
 		AdmitRequest(*request, notifications);
 	}
 }
@@ -195,15 +221,13 @@ void QueryAdmissionController::CancelOrRelease(QueryAdmissionHandle &request) {
 			}
 			ReleaseLocked(slot_id, notifications);
 		} else {
-			for (auto entry = waiters.begin(); entry != waiters.end(); entry++) {
-				if (*entry == &request) {
-					waiters.erase(entry);
-					LogEventLocked(request.metadata, "cancelled", request.ticket, 0, request.max_active,
-					               request.queued_ns, 0, 0, request.debug_enabled);
-					if (request.notification) {
-						notifications.push_back({request.notification, PendingQueryEventType::CANCELLED});
-					}
-					break;
+			auto entry = waiters.find(WaitingKey(request));
+			if (entry != waiters.end()) {
+				waiters.erase(entry);
+				LogEventLocked(request.metadata, "cancelled", request.ticket, 0, request.max_active,
+				               request.queued_ns, 0, 0, request.debug_enabled);
+				if (request.notification) {
+					notifications.push_back({request.notification, PendingQueryEventType::CANCELLED});
 				}
 			}
 			request.controller = nullptr;
@@ -241,7 +265,8 @@ vector<QueryAdmissionSnapshot> QueryAdmissionController::GetSnapshot() const {
 		snapshot.admitted_ns = active_entry.admitted_ns;
 		result.push_back(std::move(snapshot));
 	}
-	for (auto *request : waiters) {
+	for (const auto &entry : waiters) {
+		auto *request = entry.second;
 		const auto &metadata = request->metadata;
 		QueryAdmissionSnapshot snapshot;
 		snapshot.state = "waiting";

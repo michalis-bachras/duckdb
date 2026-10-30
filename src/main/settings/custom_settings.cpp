@@ -25,6 +25,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/query_admission_controller.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
@@ -1680,6 +1681,30 @@ void QueryRequestProfilingEnableSetting::ResetLocal(ClientContext &context) {
 
 Value QueryRequestProfilingEnableSetting::GetSetting(const ClientContext &context) {
 	return Value::BOOLEAN(ClientConfig::GetConfig(context).query_request_profiling_enabled);
+}
+
+void QueryAdmissionPolicySetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {
+	auto value = StringUtil::Lower(input.ToString());
+	QueryAdmissionPolicy policy;
+	if (value == "fifo") {
+		policy = QueryAdmissionPolicy::FIFO;
+	} else if (value == "edf") {
+		policy = QueryAdmissionPolicy::EDF;
+	} else {
+		throw InvalidInputException("query_admission_policy must be one of: fifo, edf");
+	}
+	if (db) {
+		db->GetQueryAdmissionController().SetPolicy(policy);
+	}
+	config.options.query_admission_policy = policy;
+}
+
+void QueryAdmissionPolicySetting::ResetGlobal(DatabaseInstance *db, DBConfig &config) {
+	SetGlobal(db, config, Value(QueryAdmissionPolicyName(DBConfigOptions().query_admission_policy)));
+}
+
+Value QueryAdmissionPolicySetting::GetSetting(const ClientContext &context) {
+	return Value(QueryAdmissionPolicyName(context.db->GetQueryAdmissionController().GetPolicy()));
 }
 
 void QueryAdmissionMaxActiveSetting::SetLocal(ClientContext &context, const Value &input) {

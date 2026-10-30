@@ -3,11 +3,15 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/pending_query_notification.hpp"
+#include "duckdb/main/query_admission_controller.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 
 #include <chrono>
+#include <future>
+#include <thread>
 
 using namespace duckdb;
 
@@ -69,6 +73,222 @@ static bool HasEvent(const vector<PendingQueryEvent> &events, uint64_t token, Pe
 }
 
 } // namespace
+
+TEST_CASE("Admission ordering is configurable across connections only while idle", "[api][query_admission]") {
+	DuckDB db;
+	Connection first(db), second(db);
+	auto &controller = db.instance->GetQueryAdmissionController();
+	REQUIRE(controller.GetPolicy() == QueryAdmissionPolicy::FIFO);
+	REQUIRE_NO_FAIL(first.Query("SET GLOBAL query_admission_policy='EDF'"));
+	REQUIRE(second.Query("SELECT current_setting('query_admission_policy')")->GetValue(0, 0).ToString() == "edf");
+	REQUIRE(first.Query("SET GLOBAL query_admission_policy='unknown'")->HasError());
+	REQUIRE(controller.GetPolicy() == QueryAdmissionPolicy::EDF);
+	auto held = controller.EnqueueOrAcquire(*first.context, Metadata(1), 1);
+	auto waiting = controller.EnqueueOrAcquire(*second.context, Metadata(2), 1);
+	REQUIRE(first.Query("SET GLOBAL query_admission_policy='fifo'")->HasError());
+	REQUIRE(first.Query("RESET GLOBAL query_admission_policy")->HasError());
+	REQUIRE_NO_FAIL(first.Query("SET GLOBAL query_admission_policy='edf'"));
+	waiting.reset();
+	REQUIRE(first.Query("SET GLOBAL query_admission_policy='fifo'")->HasError());
+	held.reset();
+	REQUIRE_NO_FAIL(first.Query("RESET GLOBAL query_admission_policy"));
+	REQUIRE(controller.GetPolicy() == QueryAdmissionPolicy::FIFO);
+	REQUIRE(second.Query("SELECT current_setting('query_admission_policy')")->GetValue(0, 0).ToString() == "fifo");
+
+	DBConfig config;
+	config.SetOptionByName("query_admission_policy", Value("edf"));
+	DuckDB configured(nullptr, &config);
+	REQUIRE(configured.instance->GetQueryAdmissionController().GetPolicy() == QueryAdmissionPolicy::EDF);
+}
+
+TEST_CASE("EDF reorders waiters by deadline with FIFO ties and unknown deadlines last", "[api][query_admission]") {
+	for (auto policy : {QueryAdmissionPolicy::FIFO, QueryAdmissionPolicy::EDF}) {
+		DuckDB db;
+		Connection connection(db);
+		auto &controller = db.instance->GetQueryAdmissionController();
+		controller.SetPolicy(policy);
+		auto held = controller.EnqueueOrAcquire(*connection.context, Metadata(1), 1);
+		auto queue = make_shared_ptr<PendingQueryNotificationQueue>();
+		vector<unique_ptr<QueryAdmissionHandle>> requests;
+		// Fixed deadlines are already overdue: EDF still admits them, without expiry or rejection.
+		for (auto deadline : {uint64_t(30), uint64_t(10), uint64_t(10), uint64_t(0)}) {
+			auto id = requests.size() + 2;
+			auto metadata = Metadata(id);
+			metadata.deadline_ns = deadline;
+			requests.push_back(controller.EnqueueOrAcquire(*connection.context, metadata, 1,
+			                                              make_shared_ptr<PendingQueryNotification>(id, queue)));
+			REQUIRE(!requests.back()->IsAdmitted());
+		}
+		auto initial = Drain(*queue);
+		REQUIRE(initial.size() == 4);
+		for (const auto &event : initial) {
+			REQUIRE(event.type == PendingQueryEventType::ADMISSION_QUEUED);
+		}
+		vector<idx_t> order = policy == QueryAdmissionPolicy::EDF ? vector<idx_t> {1, 2, 0, 3}
+		                                                       : vector<idx_t> {0, 1, 2, 3};
+		held.reset();
+		for (auto index : order) {
+			REQUIRE(requests[index]->IsAdmitted());
+			auto events = Drain(*queue);
+			REQUIRE(events.size() == (index == order[0] ? 1 : 2));
+			REQUIRE(events.back().type == PendingQueryEventType::ADMITTED);
+			REQUIRE(events.back().request_token == index + 2);
+			requests[index].reset();
+		}
+		auto last = Drain(*queue);
+		REQUIRE(last.size() == 1);
+		REQUIRE(last[0].type == PendingQueryEventType::ADMISSION_RELEASED);
+		REQUIRE(controller.GetSnapshot().empty());
+	}
+}
+
+TEST_CASE("Cancelling the EDF head removes it and wakes the next eligible waiter", "[api][query_admission]") {
+	DuckDB db;
+	Connection connection(db);
+	auto &controller = db.instance->GetQueryAdmissionController();
+	controller.SetPolicy(QueryAdmissionPolicy::EDF);
+	auto held = controller.EnqueueOrAcquire(*connection.context, Metadata(1), 1);
+	auto queue = make_shared_ptr<PendingQueryNotificationQueue>();
+	auto early_metadata = Metadata(2);
+	early_metadata.deadline_ns = 10;
+	auto late_metadata = Metadata(3);
+	late_metadata.deadline_ns = 20;
+	auto early = controller.EnqueueOrAcquire(*connection.context, early_metadata, 1,
+	                                        make_shared_ptr<PendingQueryNotification>(2, queue));
+	auto late = controller.EnqueueOrAcquire(*connection.context, late_metadata, 2,
+	                                       make_shared_ptr<PendingQueryNotification>(3, queue));
+	REQUIRE(!early->IsAdmitted());
+	REQUIRE(!late->IsAdmitted());
+	Drain(*queue);
+	early.reset();
+	REQUIRE(late->IsAdmitted());
+	auto events = Drain(*queue);
+	REQUIRE(events.size() == 2);
+	REQUIRE(events[0].type == PendingQueryEventType::CANCELLED);
+	REQUIRE(events[0].request_token == 2);
+	REQUIRE(events[1].type == PendingQueryEventType::ADMITTED);
+	REQUIRE(events[1].request_token == 3);
+	late.reset();
+	held.reset();
+	REQUIRE(controller.GetSnapshot().empty());
+}
+
+TEST_CASE("A new EDF head competes with existing waiters without bypassing its cap", "[api][query_admission]") {
+	DuckDB db;
+	Connection connection(db);
+	auto &controller = db.instance->GetQueryAdmissionController();
+	controller.SetPolicy(QueryAdmissionPolicy::EDF);
+	auto held = controller.EnqueueOrAcquire(*connection.context, Metadata(1), 1);
+	auto metadata = Metadata(2);
+	metadata.deadline_ns = 20;
+	auto blocked = controller.EnqueueOrAcquire(*connection.context, metadata, 1);
+	metadata.request_id = 3;
+	metadata.deadline_ns = 10;
+	auto incoming = controller.EnqueueOrAcquire(*connection.context, metadata, 2);
+	REQUIRE(incoming->IsAdmitted());
+	REQUIRE(!blocked->IsAdmitted());
+	REQUIRE(controller.GetSnapshot().size() == 3);
+	held.reset();
+	REQUIRE(!blocked->IsAdmitted());
+	incoming.reset();
+	REQUIRE(blocked->IsAdmitted());
+}
+
+TEST_CASE("Admission enforces the 128-slot boundary under FIFO and EDF", "[api][query_admission]") {
+	for (auto policy : {QueryAdmissionPolicy::FIFO, QueryAdmissionPolicy::EDF}) {
+		DuckDB db;
+		Connection connection(db);
+		auto &controller = db.instance->GetQueryAdmissionController();
+		controller.SetPolicy(policy);
+		vector<unique_ptr<QueryAdmissionHandle>> held;
+		for (idx_t i = 0; i < 128; i++) {
+			held.push_back(controller.EnqueueOrAcquire(*connection.context, Metadata(i + 1), 128));
+			REQUIRE(held.back()->IsAdmitted());
+		}
+		auto later_metadata = Metadata(129);
+		later_metadata.deadline_ns = 20;
+		auto later = controller.EnqueueOrAcquire(*connection.context, later_metadata, 128);
+		auto earlier_metadata = Metadata(130);
+		earlier_metadata.deadline_ns = 10;
+		auto earlier = controller.EnqueueOrAcquire(*connection.context, earlier_metadata, 128);
+		REQUIRE(!later->IsAdmitted());
+		REQUIRE(!earlier->IsAdmitted());
+		held.pop_back();
+		REQUIRE(later->IsAdmitted() == (policy == QueryAdmissionPolicy::FIFO));
+		REQUIRE(earlier->IsAdmitted() == (policy == QueryAdmissionPolicy::EDF));
+		idx_t active = 0;
+		for (const auto &entry : controller.GetSnapshot()) {
+			active += entry.state == "active";
+		}
+		REQUIRE(active == 128);
+		// Cancel the remaining waiter before releasing the admitted candidate.
+		if (policy == QueryAdmissionPolicy::FIFO) {
+			earlier.reset();
+		} else {
+			later.reset();
+		}
+	}
+}
+
+TEST_CASE("Blocking admission wakes through the common EDF controller", "[api][query_admission]") {
+	DuckDB db;
+	Connection connection(db);
+	auto &controller = db.instance->GetQueryAdmissionController();
+	controller.SetPolicy(QueryAdmissionPolicy::EDF);
+	auto held = controller.EnqueueOrAcquire(*connection.context, Metadata(1), 1);
+	auto queue = make_shared_ptr<PendingQueryNotificationQueue>();
+	auto pending = std::async(std::launch::async, [&]() {
+		return controller.Acquire(*connection.context, Metadata(2), 1,
+		                          make_shared_ptr<PendingQueryNotification>(2, queue));
+	});
+	PendingQueryEvent event;
+	bool queued = false;
+	auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (std::chrono::steady_clock::now() < until && !queued) {
+		queued = queue->TryPop(event);
+		std::this_thread::yield();
+	}
+	held.reset();
+	auto admitted = pending.get();
+	REQUIRE(queued);
+	REQUIRE(event.type == PendingQueryEventType::ADMISSION_QUEUED);
+	REQUIRE(admitted->IsAdmitted());
+}
+
+TEST_CASE("Pending query notifications follow EDF admission rather than submission order", "[api][query_admission]") {
+	DuckDB db;
+	Connection root(db), first(db), second(db);
+	REQUIRE_NO_FAIL(root.Query("SET threads=2"));
+	REQUIRE_NO_FAIL(root.Query("SET external_threads=0"));
+	REQUIRE_NO_FAIL(root.Query("SET query_worker_only_execution_enable=true"));
+	REQUIRE_NO_FAIL(root.Query("SET GLOBAL query_admission_policy='edf'"));
+	Configure(first, 1);
+	Configure(second, 1);
+	auto &controller = db.instance->GetQueryAdmissionController();
+	auto held = controller.EnqueueOrAcquire(*root.context, Metadata(1), 1);
+	auto first_prepared = first.Prepare("SELECT 42");
+	auto second_prepared = second.Prepare("SELECT 43");
+	auto later_metadata = Metadata(2);
+	later_metadata.deadline_ns += 1000000000ULL;
+	auto earlier_metadata = Metadata(3);
+	auto queue = make_shared_ptr<PendingQueryNotificationQueue>();
+	auto later = TypedPending(*first_prepared, later_metadata, make_shared_ptr<PendingQueryNotification>(2, queue));
+	auto earlier = TypedPending(*second_prepared, earlier_metadata, make_shared_ptr<PendingQueryNotification>(3, queue));
+	REQUIRE(later->CheckPulse() == PendingExecutionResult::WAITING_FOR_ADMISSION);
+	REQUIRE(earlier->CheckPulse() == PendingExecutionResult::WAITING_FOR_ADMISSION);
+	Drain(*queue);
+	held.reset();
+	auto events = Drain(*queue);
+	REQUIRE(events.size() == 1);
+	REQUIRE(events[0].request_token == 3);
+	REQUIRE(events[0].type == PendingQueryEventType::ADMITTED);
+	REQUIRE_NO_FAIL(*earlier->Execute());
+	REQUIRE_NO_FAIL(*later->Execute());
+	events = Drain(*queue);
+	REQUIRE(HasEvent(events, 3, PendingQueryEventType::RESULT_READY));
+	REQUIRE(HasEvent(events, 2, PendingQueryEventType::ADMITTED));
+	REQUIRE(HasEvent(events, 2, PendingQueryEventType::RESULT_READY));
+}
 
 TEST_CASE("Pending query notifications are ordered and published once", "[api][scheduler_workload]") {
 	auto queue = make_shared_ptr<PendingQueryNotificationQueue>();

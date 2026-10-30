@@ -8,12 +8,13 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/query_admission_policy.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/pending_query_notification.hpp"
 
 #include <condition_variable>
-#include <deque>
+#include <map>
 #include <unordered_map>
 
 namespace duckdb {
@@ -98,6 +99,8 @@ class QueryAdmissionController {
 
 public:
 	explicit QueryAdmissionController(DatabaseInstance &db);
+	void SetPolicy(QueryAdmissionPolicy policy);
+	QueryAdmissionPolicy GetPolicy() const;
 
 	unique_ptr<QueryAdmissionHandle> EnqueueOrAcquire(ClientContext &context, const QueryRequestMetadata &metadata,
 	                                                  idx_t max_active,
@@ -126,6 +129,8 @@ private:
 	};
 
 private:
+	using WaiterKey = std::pair<uint64_t, idx_t>;
+	WaiterKey WaitingKey(const QueryAdmissionHandle &request) const;
 	static uint64_t TimestampNs();
 	void AdmitRequest(QueryAdmissionHandle &request, vector<AdmissionNotification> &notifications);
 	void CancelOrRelease(QueryAdmissionHandle &request);
@@ -140,7 +145,8 @@ private:
 private:
 	DatabaseInstance &db;
 	mutable mutex admission_lock;
-	std::deque<QueryAdmissionHandle *> waiters;
+	QueryAdmissionPolicy policy;
+	std::map<WaiterKey, QueryAdmissionHandle *> waiters;
 	std::unordered_map<idx_t, ActiveEntry> active;
 	idx_t next_ticket = 1;
 	idx_t next_slot_id = 1;

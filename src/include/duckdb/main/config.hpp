@@ -11,6 +11,7 @@
 #include "duckdb/common/enums/query_sla_suffix_model.hpp"
 
 #include "duckdb/common/enums/query_scheduler_policy.hpp"
+#include "duckdb/common/enums/query_admission_policy.hpp"
 
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
 #include "duckdb/storage/storage_info.hpp"
@@ -117,6 +118,8 @@ struct DBConfigOptions {
 	bool query_worker_only_execution_enabled = false;
 	//! Database-scoped worker scheduling policy for tagged analytical queries.
 	QuerySchedulerPolicy query_scheduler_policy = QuerySchedulerPolicy::DEFAULT;
+	//! Database-scoped ordering of tagged requests waiting for admission.
+	QueryAdmissionPolicy query_admission_policy = QueryAdmissionPolicy::FIFO;
 	//! SLA scheduler epoch length in milliseconds.
 	idx_t query_sla_scheduler_epoch_ms = 200;
 	bool query_sla_total_package = false;

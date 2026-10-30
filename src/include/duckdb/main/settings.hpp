@@ -918,6 +918,16 @@ struct QueryRequestProfilingEnableSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct QueryAdmissionPolicySetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "query_admission_policy";
+	static constexpr const char *Description = "Database-scoped query admission ordering: fifo or edf";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct QueryAdmissionMaxActiveSetting {
 	using RETURN_TYPE = idx_t;
 	static constexpr const char *Name = "query_admission_max_active";
