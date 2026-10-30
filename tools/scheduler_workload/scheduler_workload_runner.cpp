@@ -683,7 +683,7 @@ void TrainProfiles(const WorkloadConfig &config) {
  }
  ImportProfiles(db, config);
  std::ofstream isolated;
- std::ofstream query_timings, pipeline_timings;
+ std::ofstream query_timings, pipeline_timings, task_pmu;
  if (config.profile_timing_export) {
      db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
      query_timings.open(config.output_dir+"/query_timing_samples.csv");
@@ -691,6 +691,9 @@ void TrainProfiles(const WorkloadConfig &config) {
      if (!query_timings || !pipeline_timings) throw IOException("Could not open timing exports");
      query_timings << std::setprecision(17) << "request_id,repetition,template_id,scale_factor,phase,start_ns,end_ns,duration_s,fingerprint,correct\n";
      pipeline_timings << "request_id,repetition,template_id,scale_factor,pipeline_id,pipeline_signature_hash,pipeline_structure_hash,source_type,sink_type,start_ns,tasks_done_ns,finish_done_ns,wall_ns,worker_ns,worker_tasks,planned_work_units,source_tuples,source_chunks,pipeline_input_tuples,pipeline_input_chunks,valid_timing\n";
+     task_pmu.open(config.output_dir+"/pipeline_task_pmu.csv");
+     if (!task_pmu) throw IOException("Could not open task PMU export");
+     task_pmu << "request_id,repetition,template_id,scale_factor,pipeline_id,task_id,thread_id,start_cpu,end_cpu,start_ns,end_ns,pmu_group,valid,error,time_enabled_ns,time_running_ns,cycles,instructions,event2,event3,event4,phase,task_type,event_position,activation_group_id,ownership,shared_pipeline_ids,outcome\n";
      query_timings.flush();pipeline_timings.flush();
  }
  if (config.profile_base_power_w > 0) {
@@ -752,6 +755,21 @@ void TrainProfiles(const WorkloadConfig &config) {
            pipeline_timings << timing_id << ',' << repetition << ',' << template_id << ',' << database.scale_factor << ',' << p.pipeline_id << ',' << p.pipeline_signature_hash << ',' << p.pipeline_structure_hash << ',' << p.source_type << ',' << p.sink_type << ',' << p.start_ns << ',' << p.tasks_done_ns << ',' << p.finish_done_ns << ',' << wall << ',' << p.worker_task_duration_ns << ',' << p.worker_task_count << ',' << p.planned_input_chunks_equiv << ',' << p.source_tuples_touched << ',' << p.source_chunks_touched << ',' << p.pipeline_input_tuples << ',' << p.pipeline_input_chunks << ',' << (valid?"true":"false") << '\n';
        }
        pipeline_timings.flush();
+       for (const auto &task : QueryProfiler::Get(*connection.context).GetPipelinePMUSegmentsSnapshot()) {
+           if (task.pmu.group.empty()) continue;
+           const auto &pmu=task.pmu;
+           task_pmu << timing_id << ',' << repetition << ',' << template_id << ',' << database.scale_factor << ','
+                    << task.pipeline_id << ',' << task.task_id << ',' << task.thread_id << ',' << task.start_cpu << ','
+                    << task.end_cpu << ',' << task.start_ns << ',' << task.end_ns << ',' << pmu.group << ','
+                    << (pmu.valid?"true":"false") << ',' << pmu.error << ',' << pmu.time_enabled << ',' << pmu.time_running;
+           for (idx_t i=0;i<5;i++) {
+               task_pmu << ',';
+               if (i<pmu.values.size()) task_pmu << pmu.values[i];
+           }
+           task_pmu << ',' << task.phase << ',' << task.task_type << ',' << task.event_position << ','
+                    << task.activation_group_id << ',' << task.ownership << ',' << task.shared_pipeline_ids << ',' << task.outcome << '\n';
+       }
+       task_pmu.flush();
        std::cout << "profile_measurement_completed Q" << template_id << " seconds=" << (timing_end-timing_start)/1e9 << std::endl;
        if (config.profile_execution_gate) {
            std::cout << "profile_execution_finished Q" << template_id << std::endl;

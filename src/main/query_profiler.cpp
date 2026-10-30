@@ -110,6 +110,7 @@ void QueryProfiler::Reset() {
 	tree_map.clear();
 	pipeline_profiles.clear();
 	pipeline_task_profiles.clear();
+	pipeline_pmu_segments.clear();
 	internal_event_profiles.clear();
 	pipeline_profile_index.clear();
 	pipeline_task_profile_index.clear();
@@ -573,6 +574,38 @@ void QueryProfiler::EndQuery() {
 vector<PipelineProfilingInfo> QueryProfiler::GetPipelineProfilesSnapshot() const {
 	lock_guard<std::mutex> guard(lock);
 	return pipeline_profiles;
+}
+
+vector<PipelineTaskProfilingInfo> QueryProfiler::GetPipelineTaskProfilesSnapshot() const {
+	lock_guard<std::mutex> guard(lock);
+	return pipeline_task_profiles;
+}
+
+bool QueryProfiler::BeginPipelinePMUSegment(idx_t pipeline_id) {
+	lock_guard<std::mutex> guard(lock);
+	if (!running || !GetPipelineProfile(pipeline_id)) {
+		return false;
+	}
+	active_pipeline_pmu_segments++;
+	return true;
+}
+
+void QueryProfiler::FinishPipelinePMUSegment(PipelineTaskProfilingInfo segment) {
+	lock_guard<std::mutex> guard(lock);
+	segment.task_id = pipeline_pmu_segments.size() + 1;
+	pipeline_pmu_segments.push_back(std::move(segment));
+	D_ASSERT(active_pipeline_pmu_segments > 0);
+	active_pipeline_pmu_segments--;
+	pipeline_pmu_condition.notify_all();
+}
+
+vector<PipelineTaskProfilingInfo> QueryProfiler::GetPipelinePMUSegmentsSnapshot() const {
+	std::unique_lock<std::mutex> guard(lock);
+	if (!pipeline_pmu_condition.wait_for(guard, std::chrono::seconds(10),
+	                                     [this]() { return active_pipeline_pmu_segments == 0; })) {
+		throw InternalException("Timed out waiting for pipeline PMU segment completion");
+	}
+	return pipeline_pmu_segments;
 }
 
 static string InternalEventProfileMapKey(idx_t pipeline_id, idx_t event_position, const string &event_type) {

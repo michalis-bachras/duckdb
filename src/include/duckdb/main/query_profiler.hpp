@@ -29,6 +29,7 @@
 #include "duckdb/main/pipeline_dvfs_profiler.hpp"
 #include "duckdb/main/profiling_node.hpp"
 #include "duckdb/main/profiling_utils.hpp"
+#include <condition_variable>
 
 namespace duckdb {
 
@@ -91,6 +92,15 @@ struct OperatorInformation {
 
 //! One PipelineTask execution interval, used to align external per-core PMU samples with active pipelines.
 struct PipelineTaskProfilingInfo {
+	PipelineTaskPMUSnapshot pmu_start;
+	PipelineTaskPMUSnapshot pmu;
+	string phase;
+	string task_type;
+	string outcome;
+	string ownership;
+	string shared_pipeline_ids;
+	idx_t event_position = 0;
+	idx_t activation_group_id = 0;
 	idx_t task_id = 0;
 	idx_t pipeline_id = 0;
 	string task_signature_key;
@@ -314,6 +324,10 @@ public:
 	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks);
 	DUCKDB_API vector<PipelineProfilingInfo> GetPipelineProfilesSnapshot() const;
+	DUCKDB_API vector<PipelineTaskProfilingInfo> GetPipelineTaskProfilesSnapshot() const;
+	DUCKDB_API bool BeginPipelinePMUSegment(idx_t pipeline_id);
+	DUCKDB_API void FinishPipelinePMUSegment(PipelineTaskProfilingInfo segment);
+	DUCKDB_API vector<PipelineTaskProfilingInfo> GetPipelinePMUSegmentsSnapshot() const;
 	DUCKDB_API void RecordInternalEventStart(idx_t pipeline_id, uint64_t pipeline_signature_hash,
 	                                        idx_t event_position, const string &event_type,
 	                                        const string &native_unit, idx_t total_work_units);
@@ -390,6 +404,9 @@ private:
 	vector<PipelineProfilingInfo> pipeline_profiles;
 	//! Pipeline task execution intervals emitted alongside the operator tree.
 	vector<PipelineTaskProfilingInfo> pipeline_task_profiles;
+	vector<PipelineTaskProfilingInfo> pipeline_pmu_segments;
+	idx_t active_pipeline_pmu_segments = 0;
+	mutable std::condition_variable pipeline_pmu_condition;
 	vector<InternalEventProfilingInfo> internal_event_profiles;
 	//! Fast lookup for pipeline records by stable id.
 	unordered_map<idx_t, idx_t> pipeline_profile_index;

@@ -1,6 +1,12 @@
 #include "scheduler_workload.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/pipeline_dvfs_profiler.hpp"
+#include "duckdb.hpp"
+#include "duckdb/main/query_profiler.hpp"
+#include "duckdb/main/query_request_metadata.hpp"
+#include "duckdb/main/pending_query_result.hpp"
+#include <cstdlib>
 
 #include <cmath>
 #include <cstdio>
@@ -19,6 +25,56 @@ static void Require(bool condition, const string &message) {
 
 int main() {
 	try {
+        PipelineTaskPMUSnapshot pmu_a,pmu_b;
+        pmu_a.valid=pmu_b.valid=true;pmu_a.group=pmu_b.group="A";
+        pmu_a.time_enabled=100;pmu_a.time_running=100;pmu_a.values={10,20};
+        pmu_b.time_enabled=200;pmu_b.time_running=200;pmu_b.values={40,80};
+        auto delta=PipelineTaskPMUDelta(pmu_a,pmu_b);
+        Require(delta.valid && delta.values[0]==30 && delta.values[1]==60,"task PMU delta");
+        pmu_b.time_running=150;
+        Require(!PipelineTaskPMUDelta(pmu_a,pmu_b).valid,"PMU scheduling coverage must be reported");
+        pmu_b.time_running=200;pmu_b.values[0]=1;
+        Require(!PipelineTaskPMUDelta(pmu_a,pmu_b).valid,"counter regression must be detected");
+        Require(!PipelineTaskPMUDelta(PipelineTaskPMUSnapshot(),PipelineTaskPMUSnapshot()).valid,"disabled PMU");
+        {
+            auto previous=std::getenv("OLAP_PIPELINE_PMU_GROUP");
+            string saved=previous?previous:"";
+            setenv("OLAP_PIPELINE_PMU_GROUP","off",1);
+            DuckDB database(nullptr);
+            Connection connection(database);
+            auto setting=connection.Query("PRAGMA custom_profiling_settings='{\"DEFAULT\":\"false\",\"PIPELINE_INFO\":\"true\",\"PIPELINE_THROUGHPUT\":\"true\"}'");
+            Require(!setting->HasError(),"configure lifecycle profiling");
+            Require(!connection.Query("SET enable_profiling='no_output'")->HasError(),"enable lifecycle profiling");
+            Require(!connection.Query("SET query_activation_scheduler_enable=true")->HasError(),"enable event identities");
+            PendingQueryParameters parameters;
+            parameters.query_parameters.output_type=QueryResultOutputType::FORCE_MATERIALIZED;
+            parameters.has_request_metadata=true;
+            parameters.request_metadata.valid=true;
+            parameters.request_metadata.parse_status="typed";
+            parameters.request_metadata.request_id=1;
+            parameters.request_metadata.template_id=16;
+            parameters.request_metadata.scale_factor=300;
+            parameters.request_metadata.deadline_ns=PipelineDVFSProfiler::TimestampNs()+3600000000000ULL;
+            auto pending=connection.PendingQuery("SELECT i%8 AS g,count(DISTINCT i%1000) FROM range(100000) t(i) GROUP BY g",std::move(parameters));
+            Require(!pending->HasError(),"prepare distinct lifecycle query");
+            auto result=pending->Execute();
+            Require(!result->HasError(),"distinct lifecycle query");
+            auto segments=QueryProfiler::Get(*connection.context).GetPipelinePMUSegmentsSnapshot();
+            bool distinct=false,normal=false,finish=false;
+            idx_t normal_count=0,expected=0;
+            for (const auto &segment:segments) {
+                distinct|=segment.phase=="hash_aggregate_distinct_finalize";
+                normal|=segment.phase=="pipeline";
+                finish|=segment.phase=="finish";
+                normal_count+=segment.phase=="pipeline";
+                Require(segment.end_ns>=segment.start_ns && segment.outcome=="finished","completed lifecycle segment");
+            }
+            for (const auto &pipeline:QueryProfiler::Get(*connection.context).GetPipelineProfilesSnapshot()) expected+=pipeline.worker_task_count;
+            Require(distinct && normal && finish,"ordinary and distinct-finalization task coverage");
+            Require(normal_count==expected,"ordinary tasks must not be counted twice");
+            if (saved.empty()) unsetenv("OLAP_PIPELINE_PMU_GROUP");
+            else setenv("OLAP_PIPELINE_PMU_GROUP",saved.c_str(),1);
+        }
 		WorkloadConfig config;
 		config.command = WorkloadCommand::GENERATE;
 		config.seed = 42;

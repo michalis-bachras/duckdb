@@ -14,6 +14,20 @@ namespace duckdb {
 struct PipelineProfilingSettings;
 struct PipelineProfilingInfo;
 
+//! Per-worker counters. These are task-local deltas, not pipeline wall-window counters.
+struct PipelineTaskPMUSnapshot {
+	bool valid = false;
+	string group;
+	string error;
+	uint64_t time_enabled = 0;
+	uint64_t time_running = 0;
+	vector<uint64_t> values;
+};
+
+DUCKDB_API PipelineTaskPMUSnapshot ReadPipelineTaskPMU();
+DUCKDB_API PipelineTaskPMUSnapshot PipelineTaskPMUDelta(const PipelineTaskPMUSnapshot &start,
+                                                     const PipelineTaskPMUSnapshot &end);
+
 //! Snapshot of one grouped perf counter set used by pipeline-level DVFS profiling.
 struct PipelinePerfGroupSnapshot {
 	bool valid = false;

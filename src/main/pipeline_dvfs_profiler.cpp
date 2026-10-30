@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <cerrno>
 #include <fstream>
 #include <limits>
 
@@ -21,9 +23,119 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
 #endif
 
 namespace duckdb {
+
+PipelineTaskPMUSnapshot PipelineTaskPMUDelta(const PipelineTaskPMUSnapshot &start,
+                                            const PipelineTaskPMUSnapshot &end) {
+	PipelineTaskPMUSnapshot result;
+	result.group = end.group;
+	if (end.group.empty()) {
+		return result;
+	}
+	if (!start.valid || !end.valid || start.group != end.group || start.values.size() != end.values.size() ||
+	    end.time_enabled < start.time_enabled || end.time_running < start.time_running) {
+		result.error = !end.error.empty() ? end.error : (!start.error.empty() ? start.error : "invalid_snapshot");
+		return result;
+	}
+	result.time_enabled = end.time_enabled - start.time_enabled;
+	result.time_running = end.time_running - start.time_running;
+	for (idx_t i = 0; i < start.values.size(); i++) {
+		if (end.values[i] < start.values[i]) {
+			result.error = "counter_regressed";
+			return result;
+		}
+		result.values.push_back(end.values[i] - start.values[i]);
+	}
+	result.valid = result.time_enabled > 0 && result.time_running > 0 &&
+	               static_cast<double>(result.time_running) / result.time_enabled >= 0.99;
+	if (!result.valid) {
+		result.error = "insufficient_counter_running_time";
+	}
+	return result;
+}
+
+PipelineTaskPMUSnapshot ReadPipelineTaskPMU() {
+	// One group per process, selected before launch. FDs are opened once per worker,
+	// continuously enabled, and snapshotted at task boundaries (no per-task open/reset).
+	struct ThreadCounters {
+		string group;
+		string error;
+		vector<PipelinePerfFD> fds;
+		ThreadCounters() {
+			auto value = std::getenv("OLAP_PIPELINE_PMU_GROUP");
+			if (!value || string(value) == "off" || !*value) {
+				return;
+			}
+			group = value;
+			if (group != "A" && group != "B") {
+				error = "unknown_pmu_group";
+				return;
+			}
+#ifdef __linux__
+			// Raw event encodings below are for this campaign's Broadwell-EP host.
+#if defined(__x86_64__) || defined(__i386__)
+			unsigned int eax, ebx, ecx, edx;
+			if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx) || ((eax >> 8) & 15) != 6 ||
+			    (((eax >> 4) & 15) | ((eax >> 12) & 240)) != 79) {
+				error = "requires_family6_model79";
+				return;
+			}
+#else
+			error = "requires_x86_broadwell_ep";
+			return;
+#endif
+			const uint64_t raw_a[] = {0x040004a3, 0x060006a3, 0x050005a3};
+			const uint64_t raw_b[] = {0x000020d1, 0x000081d0, 0x000008a2};
+			for (idx_t i = 0; i < 5; i++) {
+				perf_event_attr attr {};
+				attr.size = sizeof(attr);
+				attr.type = i < 2 ? PERF_TYPE_HARDWARE : PERF_TYPE_RAW;
+				attr.config = i == 0 ? PERF_COUNT_HW_CPU_CYCLES :
+				              (i == 1 ? PERF_COUNT_HW_INSTRUCTIONS : (group == "A" ? raw_a[i-2] : raw_b[i-2]));
+				attr.pinned = i == 0;
+				attr.exclude_kernel = 1;
+				attr.exclude_hv = 1;
+				attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+				auto fd = static_cast<int>(syscall(__NR_perf_event_open, &attr, 0, -1,
+				                                  fds.empty() ? -1 : fds[0].Get(), PERF_FLAG_FD_CLOEXEC));
+				if (fd < 0) {
+					error = "perf_event_open_errno_" + std::to_string(errno);
+					fds.clear();
+					return;
+				}
+				fds.emplace_back(fd);
+			}
+#else
+			error = "linux_required";
+#endif
+		}
+	};
+	static thread_local ThreadCounters counters;
+	PipelineTaskPMUSnapshot result;
+	result.group = counters.group;
+	result.error = counters.error;
+	if (result.group.empty() || !result.error.empty()) {
+		return result;
+	}
+#ifdef __linux__
+	uint64_t data[8] {};
+	auto size = read(counters.fds[0].Get(), data, sizeof(data));
+	if (size != sizeof(data) || data[0] != 5) {
+		result.error = "counter_group_not_scheduled_or_short_read";
+		return result;
+	}
+	result.time_enabled = data[1];
+	result.time_running = data[2];
+	result.values.assign(data + 3, data + 8);
+	result.valid = true;
+#endif
+	return result;
+}
 
 PipelinePerfFD::PipelinePerfFD() : fd(-1) {
 }
