@@ -30,6 +30,8 @@ constexpr double QueryStrideScheduler::TRACKING_DURATION_MS;
 constexpr double QueryStrideScheduler::REFRESH_DURATION_MS;
 
 struct QueryStrideSlot {
+	//! Assigned before publication, immutable until all slot pins have drained.
+	std::shared_ptr<QueryStrideTaskSetControl> task_control;
 	atomic<ProducerToken *> producer {nullptr};
 	atomic<uint64_t> generation {0};
 	atomic<idx_t> pins {0};
@@ -92,6 +94,8 @@ static void VisitMask(uint64_t mask, idx_t offset, FUNC &&callback) {
 } // namespace
 
 struct QueryStrideSchedulerState {
+	std::shared_ptr<QueryStrideTaskSetControl> task_control;
+	atomic<bool> has_task_control {false};
 	std::array<QueryStrideSlot, QUERY_STRIDE_MAX_SLOTS> slots;
 	mutable mutex registration_lock;
 	std::unordered_map<uint64_t, idx_t> query_slots;
@@ -383,6 +387,29 @@ bool QueryStrideScheduler::Enabled() const {
 	return db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::STRIDE;
 }
 
+void QueryStrideScheduler::SetTaskSetControl(std::shared_ptr<QueryStrideTaskSetControl> control) {
+	lock_guard<mutex> guard(state->registration_lock);
+	if (state->active_count.load() != 0) {
+		throw InvalidInputException("Install STRIDE task-set control only with no registered queries");
+	}
+	state->task_control = std::move(control);
+	state->has_task_control.store(bool(state->task_control), std::memory_order_release);
+}
+
+static QueryStrideTaskSetInfo TaskSetInfo(const QueryStrideSlot &slot, const Event &event) {
+	QueryStrideTaskSetInfo info;
+	info.request_id = slot.request_id;
+	info.db_query_id = slot.db_query_id;
+	info.query_generation = slot.generation.load();
+	info.task_set_generation = slot.task_set_generation.load();
+	info.pipeline_id = event.GetQueryActivationPipelineId();
+	info.kind = event.GetQueryActivationKind();
+	info.internal_type = event.GetInternalEventType();
+	info.internal_position = event.GetInternalEventPosition();
+	info.total_work_units = event.GetInternalTotalWork();
+	return info;
+}
+
 void QueryStrideScheduler::RegisterQuery(const QueryRequestMetadata &metadata, ProducerToken &producer,
                                          double user_priority) {
 	if (!Enabled()) {
@@ -411,6 +438,7 @@ void QueryStrideScheduler::RegisterQuery(const QueryRequestMetadata &metadata, P
 		slot.request_id = metadata.request_id;
 		slot.template_id = metadata.template_id;
 		slot.scale_factor = metadata.scale_factor;
+		slot.task_control = state->task_control;
 		slot.initial_priority.store(initial_priority, std::memory_order_relaxed);
 		slot.minimum_priority.store(minimum_priority, std::memory_order_relaxed);
 		slot.static_priority.store(static_priority, std::memory_order_relaxed);
@@ -441,24 +469,35 @@ void QueryStrideScheduler::RegisterQuery(const QueryRequestMetadata &metadata, P
 }
 
 void QueryStrideScheduler::UnregisterQuery(uint64_t db_query_id) {
-	lock_guard<mutex> guard(state->registration_lock);
-	auto entry = state->query_slots.find(db_query_id);
-	if (entry == state->query_slots.end()) {
-		return;
+	std::shared_ptr<QueryStrideTaskSetControl> control;
+	uint64_t request_id = 0, generation = 0;
+	{
+		lock_guard<mutex> guard(state->registration_lock);
+		auto entry = state->query_slots.find(db_query_id);
+		if (entry == state->query_slots.end()) {
+			return;
+		}
+		auto slot_index = entry->second;
+		auto &slot = state->slots[slot_index];
+		control = slot.task_control;
+		request_id = slot.request_id;
+		generation = slot.generation.load();
+		if (state->tracking_active) {
+			RecordTrackedSlotLocked(*state, slot_index, StrideNowMs());
+		}
+		slot.task_set_active.store(false, std::memory_order_release);
+		slot.producer.store(nullptr, std::memory_order_release);
+		slot.generation.fetch_add(1, std::memory_order_acq_rel);
+		state->query_slots.erase(entry);
+		state->active_count.fetch_sub(1, std::memory_order_release);
+		state->unregistered_queries.fetch_add(1, std::memory_order_relaxed);
+		while (slot.pins.load(std::memory_order_acquire) != 0) {
+			std::this_thread::yield();
+		}
+		slot.task_control.reset();
 	}
-	auto slot_index = entry->second;
-	auto &slot = state->slots[slot_index];
-	if (state->tracking_active) {
-		RecordTrackedSlotLocked(*state, slot_index, StrideNowMs());
-	}
-	slot.task_set_active.store(false, std::memory_order_release);
-	slot.producer.store(nullptr, std::memory_order_release);
-	slot.generation.fetch_add(1, std::memory_order_acq_rel);
-	state->query_slots.erase(entry);
-	state->active_count.fetch_sub(1, std::memory_order_release);
-	state->unregistered_queries.fetch_add(1, std::memory_order_relaxed);
-	while (slot.pins.load(std::memory_order_acquire) != 0) {
-		std::this_thread::yield();
+	if (control) {
+		control->OnUnregistered(request_id, generation);
 	}
 }
 
@@ -466,6 +505,8 @@ void QueryStrideScheduler::OnEventScheduled(uint64_t db_query_id, Event &event) 
 	idx_t slot_index;
 	uint64_t previous_generation;
 	bool lifecycle_serial;
+	QueryStrideTaskSetInfo info;
+	std::shared_ptr<QueryStrideTaskSetControl> control;
 	{
 		lock_guard<mutex> guard(state->registration_lock);
 		auto entry = state->query_slots.find(db_query_id);
@@ -481,6 +522,13 @@ void QueryStrideScheduler::OnEventScheduled(uint64_t db_query_id, Event &event) 
 		lifecycle_serial = event.GetQueryActivationKind() != QueryActivationEventKind::PIPELINE;
 		slot.lifecycle_serial.store(lifecycle_serial, std::memory_order_release);
 		state->activated_task_sets.fetch_add(1, std::memory_order_relaxed);
+		if (state->has_task_control.load(std::memory_order_acquire)) {
+			control = slot.task_control;
+			info = TaskSetInfo(slot, event);
+		}
+	}
+	if (control) {
+		control->OnReady(info);
 	}
 	if (previous_generation == 0) {
 		state->change_task_sets.fetch_add(1, std::memory_order_relaxed);
@@ -497,16 +545,28 @@ void QueryStrideScheduler::OnEventScheduled(uint64_t db_query_id, Event &event) 
 }
 
 void QueryStrideScheduler::OnEventFinished(uint64_t db_query_id, Event &event) {
-	(void)event;
-	lock_guard<mutex> guard(state->registration_lock);
-	auto entry = state->query_slots.find(db_query_id);
-	if (entry == state->query_slots.end()) {
-		return;
+	QueryStrideTaskSetInfo info;
+	std::shared_ptr<QueryStrideTaskSetControl> control;
+	{
+		lock_guard<mutex> guard(state->registration_lock);
+		auto entry = state->query_slots.find(db_query_id);
+		if (entry == state->query_slots.end()) {
+			return;
+		}
+		auto &slot = state->slots[entry->second];
+		if (slot.task_set_active.exchange(false, std::memory_order_acq_rel)) {
+			// Zero-task continuation events also finish, but never activated a
+			// task set. Do not report them as another completion of the last set.
+			if (state->has_task_control.load(std::memory_order_acquire)) {
+				control = slot.task_control;
+				info = TaskSetInfo(slot, event);
+			}
+			slot.lifecycle_serial.store(false, std::memory_order_release);
+			state->finished_task_sets.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
-	auto &slot = state->slots[entry->second];
-	if (slot.task_set_active.exchange(false, std::memory_order_acq_rel)) {
-		slot.lifecycle_serial.store(false, std::memory_order_release);
-		state->finished_task_sets.fetch_add(1, std::memory_order_relaxed);
+	if (control) {
+		control->OnFinished(info);
 	}
 }
 
@@ -602,7 +662,8 @@ QueryStrideDequeueResult QueryStrideScheduler::TryDequeueTask(idx_t worker_id, Q
 	auto worker_count = static_cast<idx_t>(db.GetScheduler().NumberOfThreads());
 	for (idx_t rank = 0; rank < worker.sorted_count; rank++) {
 		auto slot_index = worker.sorted_slots[rank];
-		if (!IsWorkerEligible(slot_index, worker_id, worker_count)) {
+		const auto controlled = state->has_task_control.load(std::memory_order_acquire);
+		if (!controlled && !IsWorkerEligible(slot_index, worker_id, worker_count)) {
 			continue;
 		}
 		auto &slot = state->slots[slot_index];
@@ -631,6 +692,18 @@ QueryStrideDequeueResult QueryStrideScheduler::TryDequeueTask(idx_t worker_id, Q
 				state->worker_lazy_deactivations.fetch_add(1, std::memory_order_relaxed);
 			}
 			continue;
+		}
+		// Pin and validate the slot before exposing request identity to an external
+		// controller. Unregistration cannot recycle it while this decision is made.
+		if (controlled) {
+			// The pin retains the slot's owner. No shared-pointer lock/refcount
+			// traffic is needed on every dispatch across competing workers.
+			auto control = slot.task_control.get();
+			if (control && !control->IsWorkerEligible(slot.request_id, expected_generation,
+			                                        slot.task_set_generation.load(), worker_id,
+			                                        slot.lifecycle_serial.load())) {
+				continue;
+			}
 		}
 		if (db.GetScheduler().GetTaskFromProducer(*producer, task)) {
 			selection.slot = slot_index;

@@ -16,12 +16,14 @@
 
 #include <array>
 #include <bitset>
+#include <memory>
 
 namespace duckdb {
 
 class DatabaseInstance;
 struct ProducerToken;
 class Task;
+class QueryStrideScheduler;
 struct QueryStrideSchedulerState;
 
 static constexpr idx_t QUERY_STRIDE_MAX_SLOTS = 128;
@@ -32,6 +34,27 @@ enum class QueryStrideDequeueResult : uint8_t { NOT_ACTIVE = 0, NO_TASK, TASK_FO
 struct QueryStrideTaskSelection {
 	idx_t slot = DConstants::INVALID_INDEX;
 	uint64_t generation = 0;
+};
+
+//! Immutable identity at a task-set boundary. Generations disambiguate reused slots.
+struct QueryStrideTaskSetInfo {
+	uint64_t request_id = 0, db_query_id = 0, query_generation = 0, task_set_generation = 0;
+	idx_t pipeline_id = 0, internal_position = 0, total_work_units = 0;
+	QueryActivationEventKind kind = QueryActivationEventKind::UNREGISTERED;
+	InternalEventType internal_type = InternalEventType::NONE;
+};
+
+//! Optional external dispatch control. The engine does not own an experiment protocol.
+//! Boundary callbacks run outside scheduler locks and must return promptly. Eligibility
+//! runs before task execution: a paused task never occupies a worker or PMU segment.
+class QueryStrideTaskSetControl {
+public:
+	virtual ~QueryStrideTaskSetControl() = default;
+	virtual void OnReady(const QueryStrideTaskSetInfo &info) = 0;
+	virtual void OnFinished(const QueryStrideTaskSetInfo &info) = 0;
+	virtual void OnUnregistered(uint64_t request_id, uint64_t query_generation) noexcept = 0;
+	virtual bool IsWorkerEligible(uint64_t request_id, uint64_t query_generation, uint64_t task_set_generation,
+	                              idx_t worker_id, bool lifecycle_serial) const noexcept = 0;
 };
 
 struct QueryStrideSchedulerSnapshot {
@@ -129,6 +152,8 @@ public:
 	QueryStrideScheduler &operator=(const QueryStrideScheduler &) = delete;
 
 	bool Enabled() const;
+	//! Install/remove only with no registered queries. Shared ownership covers callbacks.
+	void SetTaskSetControl(std::shared_ptr<QueryStrideTaskSetControl> control);
 	void RegisterQuery(const QueryRequestMetadata &metadata, ProducerToken &producer, double user_priority);
 	void UnregisterQuery(uint64_t db_query_id);
 	void OnEventScheduled(uint64_t db_query_id, Event &event);
