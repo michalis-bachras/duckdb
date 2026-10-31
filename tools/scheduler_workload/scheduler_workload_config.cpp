@@ -74,6 +74,7 @@ static QuerySchedulerPolicy ParseScheduler(const string &value) {
 }
 
 static WorkloadCommand ParseCommand(const string &value) {
+	if (value == "pair-profiles") return WorkloadCommand::PAIR_PROFILES;
 	if (value == "steady") return WorkloadCommand::STEADY;
 	if (value == "calibrate") {
 		return WorkloadCommand::CALIBRATE;
@@ -126,13 +127,37 @@ static void ValidateConfig(WorkloadConfig &config) {
 	if (config.admission_cap == 0) {
 		throw InvalidInputException("--admission-cap must be positive");
 	}
-	if ((config.profile_timing_export || config.profile_query_warmups || config.profile_execution_gate) &&
+	if (config.command != WorkloadCommand::PAIR_PROFILES &&
+	    (config.profile_timing_export || config.profile_query_warmups || config.profile_execution_gate) &&
 	    (config.command != WorkloadCommand::TRAIN_PROFILES || !config.profile_timing_export || config.output_dir.empty())) {
 		throw InvalidInputException("Timing export requires train-profiles, --profile-timing-export on and --output-dir");
+	}
+	if (config.command == WorkloadCommand::PAIR_PROFILES &&
+	    (config.databases.size()!=1 || config.query_templates.size()!=2 || config.output_dir.empty() ||
+	     !config.profile_timing_export ||
+	     (config.scheduler_policy!=QuerySchedulerPolicy::DEFAULT && config.scheduler_policy!=QuerySchedulerPolicy::STRIDE) ||
+	     (config.scheduler_policy==QuerySchedulerPolicy::DEFAULT ? config.admission_cap!=2 : config.admission_cap!=128) ||
+	     config.warmup_repetitions!=1 || config.profile_query_warmups ||
+	     config.energy_attribution_enabled || config.package_energy || config.pin_threads=="off")) {
+		throw InvalidInputException("pair-profiles requires one database, two queries, DEFAULT with admission cap 2 or STRIDE with capacity 128, one warmup, timing export and worker pinning; package sampling is external");
 	}
 	if (config.sla_epoch_ms == 0) {
 		throw InvalidInputException("--sla-epoch-ms must be positive");
 	}
+	if (!config.phase_pairs.empty()) {
+		if (config.command!=WorkloadCommand::PAIR_PROFILES || config.scheduler_policy!=QuerySchedulerPolicy::STRIDE ||
+		    config.pair_cpus_a.empty() || config.pair_cpus_b.empty())
+			throw InvalidInputException("Phase pairs require pair-profiles, STRIDE and two CPU assignments");
+		std::set<idx_t> cpus;
+		for (auto &assignment:{config.pair_cpus_a,config.pair_cpus_b})
+			for (auto cpu:assignment) if (!cpus.insert(cpu).second) throw InvalidInputException("Phase-pair CPU sets must be disjoint");
+		std::set<string> names;
+		for (auto &p:config.phase_pairs) if (p.name.empty() || !names.insert(p.name).second || p.name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-")!=string::npos ||
+		    !p.pipeline_a || !p.pipeline_b || p.phase_a.empty() || p.phase_b.empty())
+			throw InvalidInputException("Invalid or duplicate phase-pair specification");
+	}
+	if (config.phase_pairs.empty() && (!config.pair_cpus_a.empty() || !config.pair_cpus_b.empty()))
+		throw InvalidInputException("CPU assignments require an explicit phase pair");
  if (config.sla_suffix_bootstrap_observations < 1 || config.sla_suffix_bootstrap_observations > 100) {
   throw InvalidInputException("--sla-suffix-bootstrap-observations must be in [1, 100]");
  }
@@ -150,7 +175,8 @@ static void ValidateConfig(WorkloadConfig &config) {
 		    "SLA tag must be positive; penalty, driver-lag limit, and diagnostic interval must be non-negative");
 	}
 	if (config.command == WorkloadCommand::CALIBRATE || config.command == WorkloadCommand::TRAIN_PROFILES ||
-	    config.command == WorkloadCommand::RUN || config.command == WorkloadCommand::STEADY) {
+	    config.command == WorkloadCommand::RUN || config.command == WorkloadCommand::STEADY ||
+	    config.command == WorkloadCommand::PAIR_PROFILES) {
 		if (config.databases.empty() || config.queries_dir.empty()) {
 			throw InvalidInputException("This command requires --database SF=PATH and --queries-dir PATH");
 		}
@@ -234,6 +260,7 @@ string Usage() {
 	return R"USAGE(scheduler_workload COMMAND [OPTIONS]
 
 Commands:
+  pair-profiles   Compare sequential and concurrent queries in one persistent database instance.
   calibrate       Measure isolated template runtimes under the common execution environment.
   train-profiles  Execute every selected template under DEFAULT and export a scheduler profile snapshot.
   generate        Generate a deterministic paper-style Poisson schedule using lambda = alpha / mean_duration.
@@ -275,6 +302,11 @@ Run options:
   --profile-query-warmups N   Warm each query immediately before its measured profile execution.
   --profile-execution-gate on|off  Wait for G before execution and C after timing export (train-profiles only).
   --memory-limit SIZE        Optional DuckDB memory limit, e.g. 160GiB.
+  --pair-driver-cpu N        Move pair-mode control threads after creating the pinned worker pool.
+  --phase-pair NAME:PIPELINE_A:PHASE_A:PIPELINE_B:PHASE_B  Repeat for each controlled phase pair.
+  --pair-cpus-a CPUS         Reserved logical CPUs for the first query.
+  --pair-cpus-b CPUS         Reserved logical CPUs for the second query.
+  --scheduler-process-partial on|off  Yield unfinished pipeline tasks between chunks (default: off).
   --output-dir PATH           Run timeline and summary directory.
   --submitter-threads N       Fixed native submission pool size (default: 2).
 	  --completion-threads N      Fixed event/completion pool size (default: 2).
@@ -405,6 +437,19 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.profile_execution_gate = ParseBool(value,name);
 		} else if (name == "memory-limit") {
 			config.memory_limit = value;
+		} else if (name == "pair-driver-cpu") {
+			config.pair_driver_cpu = static_cast<int>(ParseUint(value,name));
+		} else if (name == "pair-cpus-a" || name == "pair-cpus-b") {
+			auto &cpus=name=="pair-cpus-a" ? config.pair_cpus_a : config.pair_cpus_b;
+			for (auto &cpu:Split(value)) cpus.push_back(ParseUint(cpu,name));
+		} else if (name == "phase-pair") {
+			vector<string> parts;std::stringstream stream(value);string part;
+			while (std::getline(stream,part,':')) parts.push_back(part);
+			if (parts.size()!=5) throw InvalidInputException("Expected NAME:PIPELINE_A:PHASE_A:PIPELINE_B:PHASE_B");
+			WorkloadConfig::PhasePair pair;pair.name=parts[0];pair.pipeline_a=ParseUint(parts[1],name);
+			pair.phase_a=parts[2];pair.pipeline_b=ParseUint(parts[3],name);pair.phase_b=parts[4];config.phase_pairs.push_back(pair);
+		} else if (name == "scheduler-process-partial") {
+			config.scheduler_process_partial = ParseBool(value,name);
 		} else if (name == "models-validated") {
 			config.models_validated = ParseBool(value,name);
 		} else if (name == "isolated-profiles") {

@@ -2,6 +2,7 @@ add_library(scheduler_workload_lib STATIC
             scheduler_workload_config.cpp
             scheduler_workload_schedule.cpp
             scheduler_workload_runner.cpp
+            phase_pair_controller.cpp
             scheduler_workload_output.cpp)
 
 target_include_directories(scheduler_workload_lib
@@ -15,6 +16,11 @@ target_link_libraries(scheduler_workload
                       duckdb_mbedtls
                       ${DUCKDB_EXTRA_LINK_FLAGS})
 link_extension_libraries(scheduler_workload "")
+
+add_executable(scheduler_workload_pairs scheduler_workload.cpp)
+target_link_libraries(scheduler_workload_pairs
+                      scheduler_workload_lib duckdb_static duckdb_mbedtls ${DUCKDB_EXTRA_LINK_FLAGS})
+link_extension_libraries(scheduler_workload_pairs "")
 
 add_executable(scheduler_workload_tests test_scheduler_workload.cpp)
 target_link_libraries(scheduler_workload_tests

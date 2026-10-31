@@ -1,5 +1,6 @@
 #include "scheduler_workload.hpp"
 #include "package_energy.hpp"
+#include "phase_pair_controller.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/energy_attribution/energy_attribution.hpp"
@@ -10,6 +11,7 @@
 #include "duckdb/main/pending_query_notification.hpp"
 #include "duckdb/parallel/query_hardware_manager.hpp"
 #include "duckdb/parallel/query_sla_scheduler.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/query_request_profile_store.hpp"
 #include "duckdb/main/query_profiler.hpp"
 
@@ -19,6 +21,7 @@
 #include <cmath>
 #include <ctime>
 #include <random>
+#include <set>
 #include <numeric>
 #include <iomanip>
 #include <condition_variable>
@@ -28,6 +31,10 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 namespace duckdb {
 namespace scheduler_workload {
@@ -175,6 +182,8 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 		ExecuteSetting(root, "SET memory_limit=" + QuoteSQLString(config.memory_limit));
 	}
 	ExecuteSetting(root, "SET external_threads=0");
+	ExecuteSetting(root, string("SET scheduler_process_partial=") +
+	                         (config.scheduler_process_partial ? "true" : "false"));
 	ExecuteSetting(root, "SET GLOBAL query_admission_policy=" + QuoteSQLString(QueryAdmissionPolicyName(config.admission_policy)));
 	ExecuteSetting(root, "SET query_sla_suffix_model=" + QuoteSQLString(config.architecture == "total_package" ? "histogram" : QuerySLASuffixModelName(config.sla_suffix_model)));
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
@@ -816,29 +825,11 @@ void TrainProfiles(const WorkloadConfig &config) {
  }
 }
 
-RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry> &schedule,
-	                   vector<RequestResult> &results) {
-	DuckDB db;
-	Connection root(db);
-	ConfigureDatabase(root, config, config.warmup_repetitions ? QuerySchedulerPolicy::DEFAULT : config.scheduler_policy);
-    if (config.warmup_repetitions) {
-        for (idx_t repetition=0;repetition<config.warmup_repetitions;repetition++) {
-            for (const auto &database:config.databases) {
-                Connection warm(db);ConfigureRequestConnection(warm,config,database.scale_factor,false,false);
-                for (auto query:config.query_templates) {
-                    auto prepared=warm.Prepare(ReadTextFile(QueryPath(config,query)));
-                    if(prepared->HasError())throw InvalidInputException("Warmup prepare failed");
-                    auto metadata=BuildMetadata(1,query,database.scale_factor,3,1,TimestampNs()+86400000000000ULL);
-                    auto result=ExecutePrepared(*prepared,metadata);
-                    if(!result || result->HasError())throw InvalidInputException("Warmup query failed");
-                    (void)ResultFingerprint(*result);
-                }
-            }
-        }
-    }
-	ImportProfiles(db, config);
-    if (config.warmup_repetitions) ExecuteSetting(root,"SET scheduler_policy='"+SchedulerName(config.scheduler_policy)+"'");
-
+static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const WorkloadConfig &config,
+    const vector<ScheduleEntry> &schedule, vector<RequestResult> &results, bool sequential=false,
+    std::map<uint64_t,unique_ptr<Connection>> *retained=nullptr,
+    std::shared_ptr<PhasePairController> phase_control=nullptr) {
+	auto effective_schedule=schedule;
 	std::unordered_map<uint64_t, string> query_sql;
 	for (const auto template_id : config.query_templates) {
 		query_sql[template_id] = ReadTextFile(QueryPath(config, template_id));
@@ -861,7 +852,7 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 		auto state = make_uniq<RequestState>();
 		state->schedule = entry;
 		state->result.request = entry;
-		state->connection = make_uniq<Connection>(db);
+		state->connection = retained ? std::move(retained->at(entry.template_id)) : make_uniq<Connection>(db);
 		auto scheduler_trace = std::find(config.scheduler_trace_templates.begin(),
 		                                 config.scheduler_trace_templates.end(), entry.template_id) !=
 		                       config.scheduler_trace_templates.end();
@@ -874,6 +865,11 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 		state->notification = make_shared_ptr<PendingQueryNotification>(i, notification_queue);
 		token_to_request[i] = i;
 		requests.push_back(std::move(state));
+	}
+	if (config.command==WorkloadCommand::PAIR_PROFILES && config.profile_execution_gate && !phase_control) {
+		std::cout << "pair_trial_ready " << config.output_dir << std::endl;
+		string command;
+		if (!(std::cin>>command) || command!="G") throw InvalidInputException("Expected G before pair trial");
 	}
 	// Keep database setup and request preparation outside the measured workload.
 	ConfigureEnergyAttribution(root, config);
@@ -903,6 +899,7 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 				    request.schedule.sla_tag, request.schedule.sla_penalty_per_s,
 				    run_start_ns + request.schedule.deadline_offset_ns);
 				parameters.has_request_metadata = true;
+				if (phase_control) parameters.request_metadata.stride_static_priority=1;
 				parameters.notification = request.notification;
 				auto registration_cpu_start = ThreadCpuNs();
 				request.pending = request.prepared->PendingQuery(values, std::move(parameters));
@@ -998,6 +995,14 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 			run_start_ns = package_meter.Start();
 		}
 		for (idx_t request_idx = 0; request_idx < requests.size(); request_idx++) {
+			if (sequential && request_idx>0) {
+				std::unique_lock<std::mutex> guard(done_lock);
+				done_cv.wait(guard,[&](){return requests[request_idx-1]->done;});
+				auto offset=TimestampNs()-run_start_ns;
+				effective_schedule[request_idx].scheduled_offset_ns=offset;
+				requests[request_idx]->schedule.scheduled_offset_ns=offset;
+				requests[request_idx]->result.request.scheduled_offset_ns=offset;
+			}
 			auto target = std::chrono::steady_clock::time_point(
 			    std::chrono::nanoseconds(run_start_ns + requests[request_idx]->schedule.scheduled_offset_ns));
 			std::this_thread::sleep_until(target);
@@ -1008,6 +1013,44 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	});
 
 	std::atomic<bool> watchdog_stop(false);
+	std::exception_ptr phase_error;
+	std::thread phase_coordinator;
+	if (phase_control) {
+		phase_coordinator=std::thread([&]() {
+			try {
+				auto signal_workers=[&]() {db.instance->GetScheduler().Signal(config.threads);};
+				// Preparation is identical even in a solo arm: the other query's state
+				// remains resident, but none of its target work executes in that window.
+				for (idx_t role=0;role<2;role++) {
+					phase_control->Prepare(role);signal_workers();phase_control->WaitReady(role);
+				}
+				for (auto &r:requests) QueryProfiler::Get(*r->connection->context).GetPipelinePMUSegmentsSnapshot();
+				phase_control->WriteTrace(config.output_dir+"/phase_control.csv");
+				std::cout<<"phase_targets_ready "<<config.output_dir<<std::endl;
+				string command;
+				if (config.profile_execution_gate && (!(std::cin>>command) || command!="G"))
+					throw InvalidInputException("Expected G before phase targets");
+				vector<idx_t> selected=config.pair_condition=="a_only" ? vector<idx_t>{0} :
+				    (config.pair_condition=="b_only" ? vector<idx_t>{1} : vector<idx_t>{0,1});
+				phase_control->Release(selected);signal_workers();phase_control->WaitFinished(selected);
+				// Completion is published from inside the last task. Wait for its PMU
+				// scope to close before draining; otherwise successor work can leak in.
+				for (auto &r:requests) QueryProfiler::Get(*r->connection->context).GetPipelinePMUSegmentsSnapshot();
+				phase_control->WriteTrace(config.output_dir+"/phase_control.csv");
+				std::cout<<"phase_window_finished "<<config.output_dir<<std::endl;
+				if (config.profile_execution_gate && (!(std::cin>>command) || command!="C"))
+					throw InvalidInputException("Expected C before draining phase pair");
+				for (idx_t role=0;role<2;role++) {
+					phase_control->Drain(role);signal_workers();phase_control->WaitUnregistered(role);
+				}
+				phase_control->WriteTrace(config.output_dir+"/phase_control.csv");
+			} catch (...) {
+				phase_error=std::current_exception();phase_control->Cancel();
+				db.instance->GetScheduler().Signal(config.threads);
+				for (auto &r:requests) r->connection->Interrupt();
+			}
+		});
+	}
 	std::thread watchdog;
 	if (config.no_progress_diagnostic_s > 0) {
 		watchdog = std::thread([&]() {
@@ -1054,6 +1097,8 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 	for (auto &thread : completers) {
 		thread.join();
 	}
+	if (phase_coordinator.joinable()) phase_coordinator.join();
+	if (phase_error) std::rethrow_exception(phase_error);
 
 	results.clear();
 	results.reserve(requests.size());
@@ -1063,7 +1108,45 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 		if (request->completed_result) request->result.result_fingerprint = ResultFingerprint(*request->completed_result);
 		results.push_back(std::move(request->result));
 	}
-	auto summary = SummarizeInternal(config, schedule, results, run_start_ns, notification_queue->HighWaterMark(),
+	if (config.command==WorkloadCommand::PAIR_PROFILES) {
+		db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
+		std::ofstream query(config.output_dir+"/query_timing_samples.csv");
+		std::ofstream pipes(config.output_dir+"/pipeline_timing_samples.csv");
+		std::ofstream tasks(config.output_dir+"/pipeline_task_pmu.csv");
+		if (!query || !pipes || !tasks) throw IOException("Could not open pair profiling exports");
+		query << std::setprecision(17) << "request_id,repetition,template_id,scale_factor,phase,start_ns,end_ns,duration_s,fingerprint,correct,submit_begin_ns,admitted_ns,result_ready_ns\n";
+		pipes << "request_id,repetition,template_id,scale_factor,pipeline_id,pipeline_signature_hash,pipeline_structure_hash,source_type,sink_type,start_ns,tasks_done_ns,finish_done_ns,wall_ns,worker_ns,worker_tasks,planned_work_units,source_tuples,source_chunks,pipeline_input_tuples,pipeline_input_chunks,valid_timing\n";
+		tasks << "request_id,repetition,template_id,scale_factor,pipeline_id,task_id,thread_id,start_cpu,end_cpu,start_ns,end_ns,pmu_group,valid,error,time_enabled_ns,time_running_ns,cycles,instructions,event2,event3,event4,phase,task_type,event_position,activation_group_id,ownership,shared_pipeline_ids,outcome\n";
+		for (idx_t i=0;i<requests.size();i++) {
+			auto &r=results[i];auto &context=*requests[i]->connection->context;
+			auto begin=r.execution_started_ns,end=r.execution_ready_ns;
+			query << r.request.request_id << ",1," << r.request.template_id << ',' << r.request.scale_factor
+			      << ",measured," << begin << ',' << end << ',' << (end-begin)/1e9 << ',' << r.result_fingerprint
+			      << ",unchecked," << r.submit_begin_ns << ',' << r.admitted_ns << ',' << r.result_ready_ns << '\n';
+			for (const auto &p:QueryProfiler::Get(context).GetPipelineProfilesSnapshot()) {
+				auto wall=p.tasks_done_ns>=p.start_ns?p.tasks_done_ns-p.start_ns:0;
+				pipes << r.request.request_id << ",1," << r.request.template_id << ',' << r.request.scale_factor << ','
+				      << p.pipeline_id << ',' << p.pipeline_signature_hash << ',' << p.pipeline_structure_hash << ',' << p.source_type << ','
+				      << p.sink_type << ',' << p.start_ns << ',' << p.tasks_done_ns << ',' << p.finish_done_ns << ',' << wall << ','
+				      << p.worker_task_duration_ns << ',' << p.worker_task_count << ',' << p.planned_input_chunks_equiv << ','
+				      << p.source_tuples_touched << ',' << p.source_chunks_touched << ',' << p.pipeline_input_tuples << ','
+				      << p.pipeline_input_chunks << ',' << (p.start_ns && wall?"true":"false") << '\n';
+			}
+			for (const auto &t:QueryProfiler::Get(context).GetPipelinePMUSegmentsSnapshot()) {
+				const auto &pmu=t.pmu;
+				tasks << r.request.request_id << ",1," << r.request.template_id << ',' << r.request.scale_factor << ','
+				      << t.pipeline_id << ',' << t.task_id << ',' << t.thread_id << ',' << t.start_cpu << ',' << t.end_cpu << ','
+				      << t.start_ns << ',' << t.end_ns << ',' << pmu.group << ',' << (pmu.valid?"true":"false") << ','
+				      << pmu.error << ',' << pmu.time_enabled << ',' << pmu.time_running;
+				for (idx_t k=0;k<5;k++) {tasks << ',';if (k<pmu.values.size()) tasks << pmu.values[k];}
+				tasks << ',' << t.phase << ',' << t.task_type << ',' << t.event_position << ',' << t.activation_group_id
+				      << ',' << t.ownership << ',' << t.shared_pipeline_ids << ',' << t.outcome << '\n';
+			}
+			(*retained)[r.request.template_id]=std::move(requests[i]->connection);
+		}
+		return SummarizeInternal(config,effective_schedule,results,run_start_ns,notification_queue->HighWaterMark(),max_waiters.load());
+	}
+	auto summary = SummarizeInternal(config, effective_schedule, results, run_start_ns, notification_queue->HighWaterMark(),
 	                         max_waiters.load());
  auto suffix_runtime = db.instance->GetQueryRequestProfileStore().GetSuffixModelRuntimeSnapshot();
  if (IsQuerySLAPolicy(config.scheduler_policy) && (suffix_runtime.outstanding_count || suffix_runtime.missing_key_count ||
@@ -1116,6 +1199,149 @@ RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry>
 		               "export post-restoration SLA-energy hardware state");
 	}
 	return summary;
+}
+
+RunSummary RunWorkload(const WorkloadConfig &config, const vector<ScheduleEntry> &schedule,
+                       vector<RequestResult> &results) {
+	DuckDB db;Connection root(db);
+	ConfigureDatabase(root,config,config.warmup_repetitions?QuerySchedulerPolicy::DEFAULT:config.scheduler_policy);
+	for (idx_t repetition=0;repetition<config.warmup_repetitions;repetition++) {
+		for (const auto &database:config.databases) {
+			Connection warm(db);ConfigureRequestConnection(warm,config,database.scale_factor,false,false);
+			for (auto query:config.query_templates) {
+				auto prepared=warm.Prepare(ReadTextFile(QueryPath(config,query)));
+				if (prepared->HasError()) throw InvalidInputException("Warmup prepare failed");
+				auto metadata=BuildMetadata(1,query,database.scale_factor,3,1,TimestampNs()+86400000000000ULL);
+				auto result=ExecutePrepared(*prepared,metadata);
+				if (!result || result->HasError()) throw InvalidInputException("Warmup query failed");
+				(void)ResultFingerprint(*result);
+			}
+		}
+	}
+	ImportProfiles(db,config);
+	if (config.warmup_repetitions) ExecuteSetting(root,"SET scheduler_policy='"+SchedulerName(config.scheduler_policy)+"'");
+	return ExecuteRequestBatch(db,root,config,schedule,results);
+}
+
+void RunPairProfiles(const WorkloadConfig &config) {
+	DuckDB db;Connection root(db);
+	ConfigureDatabase(root,config,config.scheduler_policy);
+	ExecuteSetting(root,"SET max_temp_directory_size='0B'");
+	auto partial_setting=root.Query("SELECT current_setting('scheduler_process_partial')");
+	if (partial_setting->HasError()) throw InvalidInputException("Could not verify partial-processing setting");
+	const auto partial_enabled=partial_setting->GetValue(0,0).GetValue<bool>();
+	if (partial_enabled!=config.scheduler_process_partial) throw InvalidInputException("Partial-processing setting mismatch");
+	const auto applied_policy=db.instance->GetQuerySchedulerPolicy();
+	if (applied_policy!=config.scheduler_policy) throw InvalidInputException("Pair scheduler policy mismatch");
+#ifdef __linux__
+	if (config.pair_driver_cpu>=0) {
+		if (config.pair_driver_cpu>=CPU_SETSIZE) throw InvalidInputException("Invalid pair driver CPU");
+		cpu_set_t cpus;CPU_ZERO(&cpus);CPU_SET(config.pair_driver_cpu,&cpus);
+		if (sched_setaffinity(0,sizeof(cpus),&cpus)!=0) throw IOException("Could not pin pair control thread");
+	}
+#endif
+	std::map<uint64_t,unique_ptr<Connection>> connections;
+	for (auto query:config.query_templates) connections[query]=make_uniq<Connection>(db);
+	db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
+	std::ofstream session(config.output_dir+"/pair_session.csv");
+	if (!session) throw IOException("Could not open pair session export");
+	session << "condition,trial,request_id,template_id,database_instance,connection_instance,worker_pool_size,scheduler_process_partial,scheduler\n";
+	std::map<uint64_t,string> fingerprints;
+	std::mt19937_64 rng(config.seed);uint64_t next_id=1;idx_t trial=0;
+	vector<string> conditions={"sequential","concurrent"};
+	std::shuffle(conditions.begin(),conditions.end(),rng);
+	struct PairTrial {string condition; vector<WorkloadConfig::PhasePair> targets;string arm;};
+	vector<PairTrial> order={{"warmup",{},""}};
+	for (idx_t repetition=0;repetition<config.repetitions;repetition++) {
+		if (config.phase_pairs.empty()) {
+			for (auto &condition:conditions) order.push_back({condition,{},""});
+		} else for (auto &pair:config.phase_pairs) {
+			vector<string> arms={"a_only","b_only","both"};std::shuffle(arms.begin(),arms.end(),rng);
+			for (auto &arm:arms) order.push_back({pair.name+"__"+arm,{pair},arm});
+		}
+	}
+	for (const auto &item:order) {
+		const auto &condition=item.condition;
+		auto queries=config.query_templates;
+		if (condition!="concurrent" && item.targets.empty()) std::shuffle(queries.begin(),queries.end(),rng);
+		vector<ScheduleEntry> schedule;
+		for (auto query:queries) {
+			ScheduleEntry entry;entry.request_id=next_id++;entry.template_id=query;
+			entry.scale_factor=config.databases[0].scale_factor;entry.deadline_offset_ns=86400000000000ULL;
+			entry.sla_tag=config.sla_tag;entry.sla_penalty_per_s=config.sla_penalty_per_s;schedule.push_back(entry);
+		}
+		WorkloadConfig batch=config;
+		batch.phase_pairs=item.targets;batch.pair_condition=item.arm;
+		batch.output_dir=config.output_dir+"/"+std::to_string(++trial)+"_"+condition;
+		db.instance->GetFileSystem().CreateDirectoriesRecursive(batch.output_dir);
+		std::shared_ptr<PhasePairController> control;
+		if (!item.targets.empty()) {
+			auto topology=db.instance->GetQuerySLAScheduler().GetHardwareManager().GetWorkerTopology();
+			auto map_workers=[&](const vector<idx_t> &cpus) {
+				vector<idx_t> workers;
+				for (auto cpu:cpus) {
+					auto found=std::find_if(topology.begin(),topology.end(),[&](const QueryHardwareWorkerTopology &t){return t.logical_cpu==int(cpu);});
+					if (found==topology.end()) throw InvalidInputException("Requested CPU is not a registered worker");
+					workers.push_back(found->worker_id);
+				}
+				return workers;
+			};
+			auto a=map_workers(config.pair_cpus_a),b=map_workers(config.pair_cpus_b);
+			auto &target=item.targets[0];
+			control=std::make_shared<PhasePairController>(vector<PhasePairTarget>{
+			    {schedule[0].request_id,target.pipeline_a,target.phase_a,a,a[0]},
+			    {schedule[1].request_id,target.pipeline_b,target.phase_b,b,b[0]}});
+			std::ofstream mapping(batch.output_dir+"/worker_assignments.csv");
+			mapping<<"role,request_id,worker_id,logical_cpu,lifecycle\n";
+			for (idx_t role=0;role<2;role++) {
+				auto &workers=role ? b : a;auto &cpus=role ? config.pair_cpus_b : config.pair_cpus_a;
+				for (idx_t i=0;i<workers.size();i++) mapping<<role<<','<<schedule[role].request_id<<','<<workers[i]<<','<<cpus[i]<<','<<(i==0 ? "true" : "false")<<'\n';
+			}
+			db.instance->GetQueryStrideScheduler().SetTaskSetControl(control);
+		}
+		vector<RequestResult> results;
+		RunSummary summary;
+		try {
+			summary=ExecuteRequestBatch(db,root,batch,schedule,results,item.targets.empty() && condition!="concurrent",&connections,control);
+		} catch (...) {
+			if (control) {control->Cancel();db.instance->GetQueryStrideScheduler().SetTaskSetControl(nullptr);}
+			throw;
+		}
+		if (control) db.instance->GetQueryStrideScheduler().SetTaskSetControl(nullptr);
+		WriteRunOutputs(batch,summary,results);
+		for (const auto &r:results) {
+			auto query=r.request.template_id;
+			if (condition=="warmup") fingerprints[query]=r.result_fingerprint;
+			else if (!ResultFingerprintsMatch(fingerprints.at(query),r.result_fingerprint)) {
+				throw InvalidInputException("Pair result differs from warmup");
+			}
+			session << condition << ',' << trial << ',' << r.request.request_id << ',' << query << ','
+			        << reinterpret_cast<uintptr_t>(db.instance.get()) << ','
+			        << reinterpret_cast<uintptr_t>(connections.at(query).get()) << ',' << config.threads << ','
+			        << (partial_enabled ? "true" : "false") << ',' << SchedulerName(applied_policy) << '\n';
+		}
+		session.flush();
+		if (!summary.valid) throw InvalidInputException("Pair request batch failed validation");
+		if (condition=="warmup" && !config.phase_pairs.empty()) {
+			// Resolve selectors before staging any measured query. A missing or
+			// ambiguous target is an immediate configuration error, not a gate timeout.
+			for (auto &pair:config.phase_pairs) for (idx_t role=0;role<2;role++) {
+				auto &context=*connections.at(config.query_templates[role])->context;
+				auto segments=QueryProfiler::Get(context).GetPipelinePMUSegmentsSnapshot();
+				auto pid=role ? pair.pipeline_b : pair.pipeline_a;auto phase=role ? pair.phase_b : pair.phase_a;
+				std::set<idx_t> positions;bool found=false;
+				for (auto &segment:segments) if (segment.pipeline_id==pid && segment.phase==phase) {
+					found=true;positions.insert(segment.event_position);
+				}
+				if (!found || positions.size()!=1) throw InvalidInputException("Phase-pair target is absent or ambiguous in warmup");
+			}
+		}
+		std::cout << "pair_trial_finished " << condition << std::endl;
+		if (config.profile_execution_gate) {
+			string command;
+			if (!(std::cin>>command) || command!="C") throw InvalidInputException("Expected C after pair trial");
+		}
+	}
 }
 
 } // namespace scheduler_workload

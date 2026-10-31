@@ -17,7 +17,7 @@
 namespace duckdb {
 namespace scheduler_workload {
 
-enum class WorkloadCommand : uint8_t { INVALID = 0, CALIBRATE, TRAIN_PROFILES, GENERATE, RUN, STEADY };
+enum class WorkloadCommand : uint8_t { INVALID = 0, CALIBRATE, TRAIN_PROFILES, GENERATE, RUN, STEADY, PAIR_PROFILES };
 
 struct ScaleDatabase {
 	uint64_t scale_factor = 0;
@@ -43,6 +43,10 @@ struct ScheduleEntry {
 };
 
 struct WorkloadConfig {
+	struct PhasePair { string name; idx_t pipeline_a=0,pipeline_b=0; string phase_a,phase_b; };
+	vector<PhasePair> phase_pairs;
+	vector<idx_t> pair_cpus_a,pair_cpus_b;
+	string pair_condition;
 	WorkloadCommand command = WorkloadCommand::INVALID;
 	vector<ScaleDatabase> databases;
 	vector<uint64_t> query_templates;
@@ -84,6 +88,8 @@ struct WorkloadConfig {
 	bool profile_execution_gate = false;
 	idx_t profile_query_warmups = 0;
 	string memory_limit;
+	int pair_driver_cpu = -1;
+	bool scheduler_process_partial = false;
 	bool package_energy = false;
 	bool models_validated = false;
 	uint32_t profile_core_khz = 0;
@@ -156,6 +162,7 @@ struct RunSummary {
 };
 
 void RunSteady(const WorkloadConfig &config);
+void RunPairProfiles(const WorkloadConfig &config);
 bool ResultFingerprintsMatch(const string &a, const string &b);
 
 WorkloadConfig ParseConfig(int argc, char **argv);

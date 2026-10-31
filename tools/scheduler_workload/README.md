@@ -16,6 +16,22 @@ The executable is `build/scheduler-workload/tools/scheduler_workload/scheduler_w
 
 ## Experimental Workflow
 
+The separate `scheduler_workload_pairs` target provides `pair-profiles` for sequential and concurrent
+execution of two templates inside one persistent database instance, shared worker pool and buffer manager.
+Build with `cmake --build build/sla_pdf_architecture --target scheduler_workload_pairs scheduler_workload_tests -j 4`.
+It requires `--queries A,B --admission-cap 2 --warmup-repetitions 1 --profile-timing-export on` and DEFAULT.
+`--profile-execution-gate on` accepts G before each warmup/sequential/concurrent batch and C after export.
+Both connections and the database persist across all batches. Warmup fingerprints validate measured results;
+fingerprinting and CSV exports occur after both requests finish. Temporary spilling is disabled.
+The optional `--pair-driver-cpu` moves control threads after constructing the pinned worker pool.
+
+The approved SF300 pilot is orchestrated by `experiments/energy_control/run_sf300_query_pairs.py` in the
+outer repository. It runs Q6 + Q13 once, with a ten-minute cap including restoration/reporting. Other pairs
+require separate approval. Outputs include per-request lifecycle PMU CSVs, query and pair comparisons,
+phase overlap, socket bandwidth and total energy across both packages. PMU counts span complete worker
+dispatches; they are not prorated across partial overlap. Worker sharing, SMT, caches and memory can all
+contribute to slowdown. Energy/bandwidth during a pipeline window include all coincident activity.
+
 Calibrate every query template in isolation under the common execution environment:
 
 ```bash
@@ -206,6 +222,17 @@ holds scheduler policy and worker topology fixed while measuring the complete pr
 
 ## Event-Driven Execution
 
+The shared-instance `pair-profiles` pilot enables `--scheduler-process-partial on` in both its sequential
+baseline and concurrent trial. It supports DEFAULT with admission cap 2 and STRIDE with its required
+admission capacity 128. Only two query requests are submitted per trial, so at most two can be active.
+The approved follow-up uses STRIDE in both trials
+so query selection can rotate after bounded task execution. The earlier DEFAULT pilot yielded tasks
+but still produced negligible worker overlap. An equal worker split is not guaranteed.
+`pair_session.csv` records the partial-processing setting read back from DuckDB and the applied scheduler.
+Actual concurrency must be checked using worker dispatch intervals, rather than query lifecycle overlap.
+Other modes default to partial processing disabled. SLA requires a separate experiment with meaningful
+deadlines and suitable pipeline forecasts; this pair protocol uses a placeholder 24-hour deadline.
+
 Each scheduled request owns a precompiled `ClientContext` and prepared statement. A fixed submission pool starts pending queries. DuckDB emits admission and execution transitions into a blocking native queue. An `ADMITTED` event initializes a query that was waiting in the database admission queue; an `EXECUTION_READY` or `EXECUTION_ERROR` event lets a fixed completion pool finalize the materialized result. No thread polls pending query state.
 
 The measured response time starts at the scheduled arrival, not at admission or execution start. It therefore includes driver lag, admission waiting, execution, lifecycle finalization, and result materialization.
@@ -249,6 +276,61 @@ Tracing is diagnostic instrumentation. Use it to validate a scheduler change on 
 schedule without `--scheduler-trace-queries` for the reported performance measurement.
 
 ## Tests
+
+### Controlled pipeline-phase pairs
+
+`pair-profiles` accepts repeatable `--phase-pair NAME:PIPELINE_A:PHASE_A:PIPELINE_B:PHASE_B`
+options, together with `--pair-cpus-a` and `--pair-cpus-b`. These select an optional
+experiment implemented in `phase_pair_controller.cpp`. It uses the generic
+`QueryStrideTaskSetControl` interface; the engine contains no experiment selectors,
+CPU numbers, trial sequencing, or measurement code. Controls may be installed or
+removed only while no tagged queries are registered. The ordinary STRIDE dispatch
+path retains its worker-eligibility rules when no control is installed.
+
+The controller publishes atomic eligibility decisions before dequeue. It does not
+sleep inside a task or hold a worker at a barrier. Task-set boundary notifications
+run outside scheduler locks. Query and task-set generations protect against stale
+permissions after registration-slot reuse. Lifecycle execution retains one worker,
+chosen explicitly within each query's reserved CPU set rather than by slot index.
+The harness translates CPU IDs through registered worker topology and exports the
+mapping; CPU IDs and worker IDs are different namespaces.
+
+Each pair has independent `a_only`, `b_only`, and `both` conditions in seeded order.
+Both queries are prepared in the same order up to their target task sets, including
+in solo conditions. The unused target remains paused and its query state resident.
+On release, only selected targets run. Successors remain held until the measurement
+window has ended; both queries then drain sequentially for result fingerprint checks.
+When one selected target finishes first, the other continues alone. Reports retain
+the actual simultaneous-activity fraction and the solo tail.
+
+With `--profile-execution-gate on`, warmup uses `pair_trial_ready` / `G` and
+`pair_trial_finished` / `C`. A measured condition uses `phase_targets_ready` / `G`,
+`phase_window_finished` / `C`, then `pair_trial_finished` / `C` after draining.
+Completion notifications originate inside the last task; the harness therefore
+waits for in-flight PMU segments to close before publishing the window end or
+releasing successor work. Execution durations use first/last target dispatches,
+excluding gate waiting and preparation; whole-query latency includes deliberate
+pauses and is not a workload-performance result for this experiment.
+
+The Python SF300 runner configures Q6 on CPUs 0,1,8,9 and Q13 on 2,3,10,11,
+with Q13 lifecycle work fixed to CPU 2. Targets are Q6 P2 versus Q13 P6 join
+finalization, then Q6 P2 versus Q13 P4. A 600-second total budget includes warmup,
+preparation, measurements, draining, restoration, and reporting. Completed conditions
+are marked only after correctness and hardware audits; interrupted work remains on
+disk but is excluded from comparisons. A cutoff is never reported as a completed
+matrix. One repetition per condition is a mechanics pilot, not statistical confidence.
+
+`phase_control.csv` and `worker_assignments.csv` preserve native control decisions.
+The Python outputs `phase_measurements.csv`, `phase_pair_comparisons.csv`,
+`phase_pair_windows.csv`, `phase_target_tasks.csv`, and a timeline PDF. Phase energy
+and IMC traffic are coincident system measurements. Total energy sums both packages
+without idle subtraction and is counted once over the common pair window. Work
+comparability is separate from PMU validity; chunk counts are retained as annotations.
+The conservative equal-work gate also compares internal native-unit totals. For
+`hash_join_finalize`, those units are hash-table chunks, not rows. A chunk-count
+difference flags strict comparison compatibility while preserving measured timings
+and valid PMU counters; it must not be described as a counter failure.
+Existing query-pair results are analyzed using their acquisition manifests.
 
 ```bash
 build/scheduler-workload/tools/scheduler_workload/scheduler_workload_tests

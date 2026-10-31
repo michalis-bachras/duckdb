@@ -1,4 +1,5 @@
 #include "scheduler_workload.hpp"
+#include "phase_pair_controller.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/pipeline_dvfs_profiler.hpp"
@@ -6,6 +7,7 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/database.hpp"
 #include <cstdlib>
 
 #include <cmath>
@@ -23,8 +25,83 @@ static void Require(bool condition, const string &message) {
 	}
 }
 
+// Re-enter read/installation APIs from notifications. This would deadlock if a
+// future change accidentally moved callbacks under the registration mutex.
+class BoundaryProbe final : public QueryStrideTaskSetControl {
+public:
+	explicit BoundaryProbe(QueryStrideScheduler &scheduler_p) : scheduler(scheduler_p) {}
+	void OnReady(const QueryStrideTaskSetInfo &) override {
+		(void)scheduler.GetSnapshot();
+		try {scheduler.SetTaskSetControl(nullptr);}
+		catch (InvalidInputException &) {rejected_install++;}
+		ready++;
+	}
+	void OnFinished(const QueryStrideTaskSetInfo &) override {(void)scheduler.GetSnapshot();finished++;}
+	void OnUnregistered(uint64_t,uint64_t) noexcept override {(void)scheduler.GetSnapshot();unregistered++;}
+	bool IsWorkerEligible(uint64_t,uint64_t,uint64_t,idx_t worker,bool serial) const noexcept override {
+		return !serial || worker==0;
+	}
+	QueryStrideScheduler &scheduler;
+	atomic<idx_t> ready {0},finished {0},unregistered {0},rejected_install {0};
+};
+
 int main() {
 	try {
+		{
+			DuckDB database(nullptr);Connection connection(database);
+			Require(!connection.Query("SET threads=4")->HasError(),"probe workers");
+			Require(!connection.Query("SET external_threads=0")->HasError(),"probe worker-only mode");
+			Require(!connection.Query("SET query_worker_only_execution_enable=true")->HasError(),"probe worker-only mode");
+			Require(!connection.Query("SET query_activation_scheduler_enable=true")->HasError(),"probe event identities");
+			Require(!connection.Query("SET query_request_profiling_enable=true")->HasError(),"probe typed profiling");
+			Require(!connection.Query("SET query_admission_max_active=128")->HasError(),"probe STRIDE admission capacity");
+			Require(!connection.Query("SET scheduler_policy='stride'")->HasError(),"probe STRIDE policy");
+			auto &scheduler=database.instance->GetQueryStrideScheduler();
+			auto probe=std::make_shared<BoundaryProbe>(scheduler);scheduler.SetTaskSetControl(probe);
+			PendingQueryParameters parameters;parameters.has_request_metadata=true;
+			parameters.query_parameters.output_type=QueryResultOutputType::FORCE_MATERIALIZED;
+			parameters.request_metadata.valid=true;parameters.request_metadata.parse_status="typed";
+			parameters.request_metadata.request_id=77;parameters.request_metadata.template_id=1;
+			parameters.request_metadata.scale_factor=1;
+			parameters.request_metadata.deadline_ns=PipelineDVFSProfiler::TimestampNs()+10000000000ULL;
+			auto pending=connection.PendingQuery("SELECT sum(i) FROM range(10000) t(i)",std::move(parameters));
+			Require(!pending->HasError(),"probe pending query: "+(pending->HasError() ? pending->GetError() : ""));
+			auto result=pending->Execute();Require(!result->HasError(),"probe controlled query");
+			Require(probe->ready>0 && probe->finished==probe->ready && probe->unregistered==1,
+			        "task boundaries and unregistration notified: "+std::to_string(probe->ready.load())+"/"+
+			        std::to_string(probe->finished.load())+"/"+std::to_string(probe->unregistered.load()));
+			Require(probe->rejected_install==probe->ready,"live control replacement rejected");
+			scheduler.SetTaskSetControl(nullptr);
+			Require(!connection.Query("SELECT 42")->HasError(),"normal execution after detaching control");
+		}
+		{
+			PhasePairController control({{10,2,"pipeline",{0,2},0},{20,6,"hash_join_finalize",{1,3},1}});
+			QueryStrideTaskSetInfo info;info.request_id=10;info.query_generation=7;
+			info.task_set_generation=1;info.pipeline_id=1;info.kind=QueryActivationEventKind::INITIALIZE;
+			control.OnReady(info);
+			Require(!control.IsWorkerEligible(10,7,1,0,true),"preparation starts paused");
+			control.Prepare(0);
+			Require(control.IsWorkerEligible(10,7,1,0,true),"selected preparation worker");
+			Require(!control.IsWorkerEligible(10,7,1,2,true),"stable single lifecycle worker");
+			Require(!control.IsWorkerEligible(10,6,1,0,true),"stale query generation cannot run");
+			info.task_set_generation=2;info.pipeline_id=2;info.kind=QueryActivationEventKind::PIPELINE;
+			control.OnReady(info);control.WaitReady(0);
+			Require(!control.IsWorkerEligible(10,7,2,0,false),"target is held at boundary");
+			control.Release({0});
+			Require(control.IsWorkerEligible(10,7,2,2,false),"released target uses its own worker set");
+			Require(!control.IsWorkerEligible(10,7,2,1,false),"other query workers cannot be borrowed");
+			control.OnFinished(info);control.WaitFinished({0});
+			Require(!control.IsWorkerEligible(10,7,3,0,true),"successor held until drain");
+			control.Drain(0);Require(control.IsWorkerEligible(10,7,3,0,true),"drain releases successor");
+			control.OnUnregistered(10,7);control.WaitUnregistered(0);
+			control.Cancel();bool cancelled=false;
+			try {control.WaitReady(1);} catch (InvalidInputException &) {cancelled=true;}
+			Require(cancelled,"cancellation wakes phase waiters");
+			bool overlap=false;
+			try {PhasePairController bad({{1,2,"pipeline",{0},0},{2,2,"pipeline",{0},0}});}
+			catch (InvalidInputException &) {overlap=true;}
+			Require(overlap,"overlapping worker assignments rejected");
+		}
         PipelineTaskPMUSnapshot pmu_a,pmu_b;
         pmu_a.valid=pmu_b.valid=true;pmu_a.group=pmu_b.group="A";
         pmu_a.time_enabled=100;pmu_a.time_running=100;pmu_a.values={10,20};
@@ -76,8 +153,41 @@ int main() {
             else setenv("OLAP_PIPELINE_PMU_GROUP",saved.c_str(),1);
         }
 		WorkloadConfig config;
+		{
+			const char *args[]={"scheduler_workload_pairs","pair-profiles","--database","1=:memory:",
+			    "--queries-dir","/tmp/queries","--queries","6,13","--threads","8","--admission-cap","2",
+			    "--warmup-repetitions","1","--profile-timing-export","on","--output-dir","/tmp/pairs",
+			    "--scheduler-process-partial","on","--scheduler","default"};
+			for (auto policy : {"default","stride"}) {
+				args[21]=policy;
+				args[11]=string(policy)=="stride" ? "128" : "2";
+				auto parsed=ParseConfig(sizeof(args)/sizeof(args[0]),const_cast<char **>(args));
+				Require(parsed.command==WorkloadCommand::PAIR_PROFILES && parsed.threads==8,"shared pair mode parses");
+				Require(SchedulerName(parsed.scheduler_policy)==policy &&
+				        parsed.admission_cap==(string(policy)=="stride" ? 128 : 2),"pair policy uses the required admission capacity");
+				Require(parsed.scheduler_process_partial,"pair partial processing parses");
+			}
+			args[7]="6";
+			bool rejected=false;
+			try { (void)ParseConfig(sizeof(args)/sizeof(args[0]),const_cast<char **>(args)); }
+			catch (InvalidInputException &) {rejected=true;}
+			Require(rejected,"pair mode requires exactly two templates");
+			args[7]="6,13";args[21]="sla";rejected=false;
+			try { (void)ParseConfig(sizeof(args)/sizeof(args[0]),const_cast<char **>(args)); }
+			catch (InvalidInputException &) {rejected=true;}
+			Require(rejected,"SLA pair mode requires a separate deadline and profile protocol");
+		}
+		{
+			const char *args[]={"scheduler_workload","run","--database","1=:memory:","--queries-dir","/tmp/queries",
+			    "--schedule","/tmp/schedule.csv","--output-dir","/tmp/run","--scheduler","stride","--admission-cap","2"};
+			bool rejected=false;
+			try { (void)ParseConfig(sizeof(args)/sizeof(args[0]),const_cast<char **>(args)); }
+			catch (InvalidInputException &) {rejected=true;}
+			Require(rejected,"normal STRIDE runs retain the admission-cap requirement");
+		}
 		Require(config.admission_policy == QueryAdmissionPolicy::FIFO && config.admission_cap == 128,
 		        "FIFO admission and 128 active queries remain the defaults");
+		Require(!config.scheduler_process_partial,"partial processing remains disabled by default");
 		for (auto scheduler : {"default", "sla", "stride"}) {
 			for (auto admission : {"fifo", "edf"}) {
 				const char *args[] = {"scheduler_workload", "run", "--database", "10=/tmp/db", "--queries-dir", "/tmp/q",
