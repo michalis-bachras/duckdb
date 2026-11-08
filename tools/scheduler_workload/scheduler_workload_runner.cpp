@@ -1,6 +1,7 @@
 #include "scheduler_workload.hpp"
 #include "package_energy.hpp"
 #include "phase_pair_controller.hpp"
+#include "live_sla_observer.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/energy_attribution/energy_attribution.hpp"
@@ -189,9 +190,9 @@ static void ConfigureDatabase(Connection &root, const WorkloadConfig &config, Qu
 	ExecuteSetting(root, "SET query_worker_only_execution_enable=true");
 	ExecuteSetting(root, string("SET query_sla_residual_policy=") +
 	                         QuoteSQLString(config.sla_residual_workers_enabled ? "work_conserving" : "park"));
-	if (IsQuerySLAPolicy(policy)) {
-		ExecuteSetting(root, "SET query_sla_scheduler_epoch_ms=" + std::to_string(config.sla_epoch_ms));
-	}
+	// Warmup configures DEFAULT and later switches only the scheduler policy.
+	// Set the requested global interval now, even while DEFAULT is active.
+	ExecuteSetting(root, "SET query_sla_scheduler_epoch_ms=" + std::to_string(config.sla_epoch_ms));
 	auto pin_threads =
 	    policy == QuerySchedulerPolicy::SLA_ENERGY || config.energy_attribution_enabled ? "on" : config.pin_threads;
 	ExecuteSetting(root, "SET pin_threads=" + QuoteSQLString(pin_threads));
@@ -770,6 +771,11 @@ void TrainProfiles(const WorkloadConfig &config) {
    auto result = ExecutePrepared(*prepared, metadata);
    auto timing_end=TimestampNs();
    if (!result || result->HasError()) { throw InvalidInputException("Profile training failed: %s", result ? result->GetError() : "no result"); }
+   if (config.profile_terminal_gate) {
+       std::cout << "profile_terminal_result Q" << template_id << std::endl;
+       string command;
+       if (!(std::cin >> command) || command!="T") throw InvalidInputException("Expected T at terminal result gate");
+   }
    if (config.profile_timing_export) {
        auto fingerprint=ResultFingerprint(*result);
        bool correct=!reference.empty() && ResultFingerprintsMatch(reference,fingerprint);
@@ -829,6 +835,23 @@ static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const Worklo
     const vector<ScheduleEntry> &schedule, vector<RequestResult> &results, bool sequential=false,
     std::map<uint64_t,unique_ptr<Connection>> *retained=nullptr,
     std::shared_ptr<PhasePairController> phase_control=nullptr) {
+	if (IsQuerySLAPolicy(config.scheduler_policy)) {
+		const auto effective_epoch_ms = db.instance->GetQuerySLAScheduler().EpochMs();
+		if (effective_epoch_ms != config.sla_epoch_ms ||
+		    db.instance->GetQuerySchedulerPolicy() != config.scheduler_policy) {
+			throw InvalidInputException("Effective SLA scheduler configuration differs from requested configuration");
+		}
+		if (!config.output_dir.empty()) {
+			db.instance->GetFileSystem().CreateDirectoriesRecursive(config.output_dir);
+			std::ofstream settings(config.output_dir + "/effective_configuration.json");
+			if (!settings) {
+				throw IOException("Could not export effective SLA scheduler configuration");
+			}
+			settings << "{\"scheduler\":\"" << SchedulerName(config.scheduler_policy)
+			         << "\",\"requested_epoch_ms\":" << config.sla_epoch_ms
+			         << ",\"effective_epoch_ms\":" << effective_epoch_ms << "}\n";
+		}
+	}
 	auto effective_schedule=schedule;
 	std::unordered_map<uint64_t, string> query_sql;
 	for (const auto template_id : config.query_templates) {
@@ -872,6 +895,11 @@ static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const Worklo
 		if (!(std::cin>>command) || command!="G") throw InvalidInputException("Expected G before pair trial");
 	}
 	// Keep database setup and request preparation outside the measured workload.
+	if (config.workload_execution_gate) {
+		std::cout << "workload_execution_ready" << std::endl;
+		string command;
+		if (!(std::cin >> command) || command != "G") throw InvalidInputException("Expected G before workload");
+	}
 	ConfigureEnergyAttribution(root, config);
 
 	BlockingQueue<idx_t> submissions;
@@ -882,6 +910,7 @@ static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const Worklo
 	std::condition_variable done_cv;
 	PackageEnergyMeter package_meter(config.package_energy);
 	auto run_start_ns = TimestampNs() + 100000000ULL;
+	LiveSLAObserver live_observer(*db.instance, config.scheduler_live_output, config.scheduler_observer_cpu);
 
 	vector<std::thread> submitters;
 	for (idx_t thread_idx = 0; thread_idx < config.submitter_threads; thread_idx++) {
@@ -898,6 +927,7 @@ static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const Worklo
 				    request.schedule.request_id, request.schedule.template_id, request.schedule.scale_factor,
 				    request.schedule.sla_tag, request.schedule.sla_penalty_per_s,
 				    run_start_ns + request.schedule.deadline_offset_ns);
+				parameters.request_metadata.estimated_service_ns = request.schedule.estimated_service_ns;
 				parameters.has_request_metadata = true;
 				if (phase_control) parameters.request_metadata.stride_static_priority=1;
 				parameters.notification = request.notification;
@@ -1083,9 +1113,21 @@ static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const Worklo
 		while (done_count.load() < requests.size()) {
 			done_cv.wait(guard);
 		}
+		// The condition-variable predicate must change under its mutex. An
+		// unlocked stop could notify between predicate testing and sleeping,
+		// leaving the diagnostic thread asleep for its full timeout.
+		watchdog_stop.store(true);
 	}
-	watchdog_stop.store(true);
 	done_cv.notify_all();
+	live_observer.Stop();
+	// The measurement boundary is the terminal workload state. Joining
+	// diagnostic/driver threads and verifying results happen after the gate.
+	bool terminal_gate_valid = true;
+	if (config.workload_execution_gate) {
+		std::cout << "workload_terminal_result" << std::endl;
+		string command;
+		if (!(std::cin >> command) || command != "T") terminal_gate_valid = false;
+	}
 	if (watchdog.joinable()) {
 		watchdog.join();
 	}
@@ -1099,6 +1141,8 @@ static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const Worklo
 	}
 	if (phase_coordinator.joinable()) phase_coordinator.join();
 	if (phase_error) std::rethrow_exception(phase_error);
+	if (!terminal_gate_valid) throw InvalidInputException("Expected T after workload");
+	if (!live_observer.Error().empty()) throw IOException("Live observer failed: %s", live_observer.Error());
 
 	results.clear();
 	results.reserve(requests.size());
@@ -1169,6 +1213,13 @@ static RunSummary ExecuteRequestBatch(DuckDB &db, Connection &root, const Worklo
 		auto trace_path = config.output_dir + "/query_sla_scheduler_epochs.csv";
 		ExportRelation(root, "SELECT * FROM duckdb_debug_query_sla_scheduler_epochs()", trace_path,
 		               "export SLA scheduler epoch trace");
+	}
+	const auto service_trace = std::getenv("OLAP_SERVICE_TRACE");
+	if (service_trace && string(service_trace) == "1") {
+		ExportRelation(root, "SELECT * FROM duckdb_debug_query_request_pipeline_instances()",
+		               config.output_dir + "/pipeline_service_instances.csv", "export service completion labels");
+		ExportRelation(root, "SELECT * FROM duckdb_debug_query_request_internal_event_instances()",
+		               config.output_dir + "/internal_service_instances.csv", "export internal service completion labels");
 	}
 	if (config.scheduler_policy == QuerySchedulerPolicy::SLA_ENERGY) {
 		ExportRelation(root, "SELECT * FROM duckdb_debug_query_request_pipeline_hardware_profiles()",

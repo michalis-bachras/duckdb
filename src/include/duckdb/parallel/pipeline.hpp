@@ -90,6 +90,11 @@ public:
 
 public:
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override;
+	//! Uses one duration per yielded task, never a clock read per tuple or chunk.
+	static idx_t NextAdaptiveChunkCount(idx_t current, uint64_t duration_ns, uint64_t target_ns);
+
+private:
+	idx_t adaptive_chunk_count = PARTIAL_CHUNK_COUNT;
 };
 
 class PipelineBuildState {
@@ -174,6 +179,7 @@ public:
 	shared_ptr<EnergyAttributionQueryHandle> GetEnergyAttributionQueryHandle() const;
 	idx_t GetEnergyAttributionPipelineId() const;
 	idx_t RecordProfilerTaskStart(uint64_t thread_id, int start_cpu);
+	void RecordLightServiceTask(uint64_t duration_ns);
 	void RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                           idx_t pipeline_input_tuples, idx_t pipeline_input_chunks);
 	bool SourceWorkTrackingEnabled() const;
@@ -255,6 +261,8 @@ private:
 	atomic<idx_t> source_work_completed_native_units {0};
 	atomic<idx_t> source_work_throughput_completed_chunks_equiv {0};
 	atomic<uint64_t> source_work_throughput_worker_time_ns {0};
+	atomic<uint64_t> light_service_worker_time_ns {0};
+	atomic<idx_t> light_service_task_count {0};
 	atomic<bool> source_work_debug_sampling_enabled {false};
 	atomic<idx_t> source_work_debug_sample_step_chunks_equiv {0};
 	atomic<idx_t> source_work_debug_next_sample_chunks_equiv {0};

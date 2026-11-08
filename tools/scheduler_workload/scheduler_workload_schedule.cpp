@@ -4,6 +4,8 @@
 #include "mbedtls_wrapper.hpp"
 
 #include <cmath>
+#include <algorithm>
+#include <cerrno>
 #include <fstream>
 #include <iomanip>
 #include <random>
@@ -29,8 +31,9 @@ static vector<string> SplitCSV(const string &line) {
 
 static uint64_t ParseUint(const string &value, const char *field) {
 	char *end = nullptr;
+	errno = 0;
 	auto result = std::strtoull(value.c_str(), &end, 10);
-	if (!end || *end != '\0') {
+	if (errno || value.empty() || value[0] == '-' || end == value.c_str() || !end || *end != '\0') {
 		throw InvalidInputException("Invalid %s in CSV: %s", field, value);
 	}
 	return result;
@@ -61,11 +64,15 @@ static std::map<CalibrationKey, CalibrationEntry> CalibrationMap(const vector<Ca
 
 static string CanonicalSchedule(const vector<ScheduleEntry> &schedule) {
 	std::ostringstream out;
-	out << "scheduler_workload_schedule_v1\n";
+	const bool sizes = std::any_of(schedule.begin(), schedule.end(),
+	                              [](const ScheduleEntry &e) { return e.estimated_service_ns != 0; });
+	out << (sizes ? "scheduler_workload_schedule_v2\n" : "scheduler_workload_schedule_v1\n");
 	for (const auto &entry : schedule) {
 		out << entry.request_id << ',' << entry.template_id << ',' << entry.scale_factor << ','
 		    << entry.scheduled_offset_ns << ',' << entry.deadline_offset_ns << ',' << std::setprecision(17)
-		    << entry.sla_tag << ',' << entry.sla_penalty_per_s << '\n';
+		    << entry.sla_tag << ',' << entry.sla_penalty_per_s;
+		if (sizes) out << ',' << entry.estimated_service_ns;
+		out << '\n';
 	}
 	return out.str();
 }
@@ -172,6 +179,8 @@ vector<ScheduleEntry> GenerateSchedule(const WorkloadConfig &config,
 		                           static_cast<uint64_t>(std::llround(deadline_duration_s * 1000000000.0));
 		entry.sla_tag = config.sla_tag;
 		entry.sla_penalty_per_s = config.sla_penalty_per_s;
+		entry.estimated_service_ns = static_cast<uint64_t>(
+		    std::llround(calibration_entry->second.mean_runtime_s * 1000000000.0));
 		result.push_back(entry);
 		scheduled_s += interarrival(random);
 	}
@@ -183,13 +192,19 @@ void WriteSchedule(const string &path, const vector<ScheduleEntry> &schedule) {
 	if (!output) {
 		throw IOException("Could not create schedule file: %s", path);
 	}
+	const bool sizes = std::any_of(schedule.begin(), schedule.end(),
+	                              [](const ScheduleEntry &e) { return e.estimated_service_ns != 0; });
 	output << "request_id,template_id,scale_factor,scheduled_offset_ns,deadline_offset_ns,sla_tag,"
-	          "sla_penalty_per_s\n";
+	          "sla_penalty_per_s";
+	if (sizes) output << ",estimated_service_ns";
+	output << '\n';
 	output << std::setprecision(17);
 	for (const auto &entry : schedule) {
 		output << entry.request_id << ',' << entry.template_id << ',' << entry.scale_factor << ','
 		       << entry.scheduled_offset_ns << ',' << entry.deadline_offset_ns << ',' << entry.sla_tag << ','
-		       << entry.sla_penalty_per_s << '\n';
+		       << entry.sla_penalty_per_s;
+		if (sizes) output << ',' << entry.estimated_service_ns;
+		output << '\n';
 	}
 }
 
@@ -201,9 +216,10 @@ vector<ScheduleEntry> ReadSchedule(const string &path) {
 	string line;
 	if (!std::getline(input, line)) throw InvalidInputException("Missing schedule CSV header");
 	if (!line.empty() && line.back()=='\r') line.pop_back();
-	if (
-	    line != "request_id,template_id,scale_factor,scheduled_offset_ns,deadline_offset_ns,sla_tag,"
-	            "sla_penalty_per_s") {
+	const string header = "request_id,template_id,scale_factor,scheduled_offset_ns,deadline_offset_ns,sla_tag,"
+	                      "sla_penalty_per_s";
+	const bool sizes = line == header + ",estimated_service_ns";
+	if (line != header && !sizes) {
 		throw InvalidInputException("Unsupported schedule CSV header in %s", path);
 	}
 	vector<ScheduleEntry> result;
@@ -215,7 +231,7 @@ vector<ScheduleEntry> ReadSchedule(const string &path) {
 			continue;
 		}
 		auto fields = SplitCSV(line);
-		if (fields.size() != 7) {
+		if (fields.size() != (sizes ? 8 : 7)) {
 			throw InvalidInputException("Malformed schedule CSV row: %s", line);
 		}
 		ScheduleEntry entry;
@@ -226,6 +242,12 @@ vector<ScheduleEntry> ReadSchedule(const string &path) {
 		entry.deadline_offset_ns = ParseUint(fields[4], "deadline_offset_ns");
 		entry.sla_tag = ParseDouble(fields[5], "sla_tag");
 		entry.sla_penalty_per_s = ParseDouble(fields[6], "sla_penalty_per_s");
+		if (sizes) {
+			if (fields[7].empty() || fields[7][0] == '-') {
+				throw InvalidInputException("Invalid estimated_service_ns: %s", fields[7]);
+			}
+			entry.estimated_service_ns = ParseUint(fields[7], "estimated_service_ns");
+		}
 		if (entry.template_id < 1 || entry.template_id > 22 || entry.scale_factor == 0 ||
 		    entry.deadline_offset_ns <= entry.scheduled_offset_ns || entry.sla_tag <= 0 ||
 		    entry.sla_penalty_per_s < 0 ||

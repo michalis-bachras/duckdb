@@ -324,6 +324,7 @@ public:
 	DUCKDB_API void RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,
 	                                      idx_t pipeline_input_tuples, idx_t pipeline_input_chunks);
 	DUCKDB_API vector<PipelineProfilingInfo> GetPipelineProfilesSnapshot() const;
+	DUCKDB_API void RecordPipelineAggregateService(idx_t pipeline_id, idx_t tasks, uint64_t worker_time_ns);
 	DUCKDB_API vector<PipelineTaskProfilingInfo> GetPipelineTaskProfilesSnapshot() const;
 	DUCKDB_API bool BeginPipelinePMUSegment(idx_t pipeline_id);
 	DUCKDB_API void FinishPipelinePMUSegment(PipelineTaskProfilingInfo segment);

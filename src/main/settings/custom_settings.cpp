@@ -1690,8 +1690,10 @@ void QueryAdmissionPolicySetting::SetGlobal(DatabaseInstance *db, DBConfig &conf
 		policy = QueryAdmissionPolicy::FIFO;
 	} else if (value == "edf") {
 		policy = QueryAdmissionPolicy::EDF;
+	} else if (value == "sjf") {
+		policy = QueryAdmissionPolicy::SJF;
 	} else {
-		throw InvalidInputException("query_admission_policy must be one of: fifo, edf");
+		throw InvalidInputException("query_admission_policy must be one of: fifo, edf, sjf");
 	}
 	if (db) {
 		db->GetQueryAdmissionController().SetPolicy(policy);

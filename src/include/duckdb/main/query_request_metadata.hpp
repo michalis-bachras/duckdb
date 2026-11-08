@@ -26,6 +26,8 @@ struct QueryRequestMetadata {
 	//! Optional non-decaying STRIDE priority. Zero selects adaptive priority decay.
 	double stride_static_priority = 0;
 	uint64_t deadline_ns = 0;
+	//! Optional prior isolated service estimate for size-aware admission; zero is unknown.
+	uint64_t estimated_service_ns = 0;
 	uint64_t query_start_ns = 0;
 };
 

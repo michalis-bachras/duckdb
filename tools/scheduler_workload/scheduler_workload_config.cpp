@@ -124,6 +124,19 @@ static void ValidateConfig(WorkloadConfig &config) {
 	if (config.threads == 0 || config.submitter_threads == 0 || config.completion_threads == 0) {
 		throw InvalidInputException("Worker, submitter, and completion thread counts must be positive");
 	}
+	if (config.profile_terminal_gate &&
+	    (!config.profile_execution_gate || config.command != WorkloadCommand::TRAIN_PROFILES)) {
+		throw InvalidInputException("Terminal gate requires train-profiles and --profile-execution-gate on");
+	}
+	if (config.workload_execution_gate && (config.command != WorkloadCommand::RUN || config.package_energy)) {
+		throw InvalidInputException("Workload execution gate requires run and external energy sampling");
+	}
+	if (!config.scheduler_live_output.empty() &&
+	    (config.command != WorkloadCommand::RUN ||
+	     (config.scheduler_policy != QuerySchedulerPolicy::SLA && config.scheduler_policy != QuerySchedulerPolicy::DEFAULT) ||
+	     (config.scheduler_policy == QuerySchedulerPolicy::SLA && config.scheduler_trace_templates.empty()))) {
+		throw InvalidInputException("Live observer requires SLA with epoch tracing, or DEFAULT admission activity");
+	}
 	if (config.admission_cap == 0) {
 		throw InvalidInputException("--admission-cap must be positive");
 	}
@@ -274,7 +287,7 @@ Core options:
   --queries all|Q1,Q2,...     Query templates (default: all).
   --threads N                 DuckDB hardware worker threads (default: hardware concurrency).
   --admission-cap N           Database admission cap (default: 128).
-  --admission-policy POLICY   Waiting-query ordering: fifo (default) or edf; independent of scheduler.
+  --admission-policy POLICY   Waiting-query ordering: fifo (default), edf, sjf; independent of scheduler.
   --repetitions N             Calibration/training repetitions (default: 3).
 
 Schedule options:
@@ -301,6 +314,10 @@ Run options:
   --profile-timing-export on|off  Export per-execution query and pipeline timings during train-profiles.
   --profile-query-warmups N   Warm each query immediately before its measured profile execution.
   --profile-execution-gate on|off  Wait for G before execution and C after timing export (train-profiles only).
+  --profile-terminal-gate on|off   Also wait for T at terminal result, before fingerprinting/export.
+  --workload-execution-gate on|off Wait for G after preparation and T after last result, before verification.
+  --scheduler-live-output PATH    Publish active pipeline forecasts atomically every 100 ms (SLA run).
+  --scheduler-observer-cpu N      Pin the optional live observer outside SQL worker CPUs.
   --memory-limit SIZE        Optional DuckDB memory limit, e.g. 160GiB.
   --pair-driver-cpu N        Move pair-mode control threads after creating the pinned worker pool.
   --phase-pair NAME:PIPELINE_A:PHASE_A:PIPELINE_B:PHASE_B  Repeat for each controlled phase pair.
@@ -435,6 +452,14 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 			config.profile_query_warmups = ParseUint(value,name);
 		} else if (name == "profile-execution-gate") {
 			config.profile_execution_gate = ParseBool(value,name);
+		} else if (name == "profile-terminal-gate") {
+			config.profile_terminal_gate = ParseBool(value,name);
+		} else if (name == "workload-execution-gate") {
+			config.workload_execution_gate = ParseBool(value,name);
+		} else if (name == "scheduler-live-output") {
+			config.scheduler_live_output = value;
+		} else if (name == "scheduler-observer-cpu") {
+			config.scheduler_observer_cpu = static_cast<int>(ParseUint(value,name));
 		} else if (name == "memory-limit") {
 			config.memory_limit = value;
 		} else if (name == "pair-driver-cpu") {
@@ -491,8 +516,10 @@ WorkloadConfig ParseConfig(int argc, char **argv) {
 				config.admission_policy = QueryAdmissionPolicy::FIFO;
 			} else if (policy == "edf") {
 				config.admission_policy = QueryAdmissionPolicy::EDF;
+			} else if (policy == "sjf") {
+				config.admission_policy = QueryAdmissionPolicy::SJF;
 			} else {
-				throw InvalidInputException("--admission-policy must be fifo or edf");
+				throw InvalidInputException("--admission-policy must be fifo, edf or sjf");
 			}
 		} else if (name == "repetitions") {
 			config.repetitions = ParseUint(value, name);

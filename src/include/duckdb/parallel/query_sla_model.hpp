@@ -29,10 +29,17 @@ struct QuerySLAModelInput {
 };
 
 struct QuerySLAModel {
+	uint64_t query_start_ns = 0;
+	uint64_t prior_service_ns = 0;
+	idx_t previous_workers = 0;
 	bool total_package = false;
 	bool valid = false;
 	string error;
 	uint64_t db_query_id = 0;
+	uint64_t deadline_ns = 0;
+	uint64_t model_now_ns = 0;
+	double lifecycle_tail_p90_ns = 0;
+	double suffix_p90_ns = 0;
 	uint64_t generation = 0;
 	idx_t pipeline_id = 0;
 	QueryActivationEventKind event_kind = QueryActivationEventKind::UNREGISTERED;
@@ -79,13 +86,26 @@ double QuerySLACurrentPipelineFinishNs(const PipelineWorkSnapshot &work, QueryAc
 double QuerySLAExpectedTardiness(const DownstreamSuffixEstimate &suffix, double downstream_budget_ns);
 double QuerySLAExpectedFragility(const DownstreamSuffixEstimate &suffix, double downstream_budget_ns,
 	                             double epoch_ns);
-DownstreamSuffixEstimate QuerySLALifecycleSuffixPointMass();
+DownstreamSuffixEstimate QuerySLALifecycleSuffixPointMass(uint64_t remaining_ns = 0);
+//! Short serial events need execution even when their SLA marginal gain is zero.
+bool QuerySLARequiresLifecycleWorker(const QuerySLAModel &model);
+//! Initialization priors support allocation, not a trained completion forecast for hardware downshifts.
+bool QuerySLAHasCompletionForecast(const QuerySLAModel &model);
 QuerySLAServiceEvaluation QuerySLAEvaluateServiceRate(const QuerySLAModelInput &input,
 	                                                  double aggregate_service_rate, idx_t workers);
 
 QuerySLAModel BuildProvisionalQuerySLAModel(const QuerySLAModelInput &input);
 QuerySLAModel BuildQuerySLAModel(const QuerySLAModelInput &input);
+enum class QuerySLABackfillPriority : uint8_t { EDF, TRIAGE, SRPT, PSJF, STABLE_SRPT, MOORE, BOUNDED_DP };
+QuerySLAAllocation AllocatePriorityBackfillWorkers(const vector<QuerySLAModel> &models, idx_t worker_budget,
+                                                  QuerySLABackfillPriority priority, uint64_t epoch_ns = 100000000);
+//! Retain the primary query until its caller clears the id; lend only spare pipeline capacity.
+QuerySLAAllocation AllocateCommittedSJFWorkers(const vector<QuerySLAModel> &models, idx_t worker_budget,
+                                             uint64_t &committed_query_id);
+//! Experimental execution EDF/backfill; optional infeasibility triage is not a hard schedulability test.
+QuerySLAAllocation AllocateDeadlineBackfillWorkers(const vector<QuerySLAModel> &models, idx_t worker_budget,
+                                                 bool triage, bool shortest_remaining = false);
 QuerySLAAllocation AllocateQuerySLAWorkers(const vector<QuerySLAModel> &models, idx_t worker_budget,
-	                                       bool work_conserving);
+	                                       bool work_conserving, bool ensure_lifecycle_progress = false);
 
 } // namespace duckdb

@@ -22,6 +22,8 @@
 #include "duckdb/main/settings.hpp"
 
 #include <functional>
+#include <cstdlib>
+#include <cerrno>
 #include <thread>
 
 #ifdef __linux__
@@ -55,6 +57,17 @@ static bool PipelineTaskProfilingRequested(Pipeline &pipeline) {
 	const auto &settings = ClientConfig::GetConfig(pipeline.GetClientContext()).pipeline_profiling;
 	return settings.task_trace || settings.throughput ||
 	       QueryRequestMetadataManager::HasActiveMetadata(pipeline.GetClientContext());
+}
+
+static bool UseLightPipelineTaskProfiling(Pipeline &pipeline) {
+	static const bool enabled = [] {
+		const auto value = std::getenv("OLAP_PIPELINE_LIGHT_PROFILE");
+		return value && string(value) == "1";
+	}();
+	if (!enabled || !pipeline.GetProfilerPipelineId() || pipeline.GetEnergyAttributionQueryState()) return false;
+	const auto &s = ClientConfig::GetConfig(pipeline.GetClientContext()).pipeline_profiling;
+	// Explicit detailed/PMU profiling retains the complete existing records.
+	return !s.task_trace && !s.throughput && !s.dvfs_metrics && !s.per_cpu;
 }
 
 static idx_t SourceInputChunksEquiv(const SourceInputVolume &source_input_volume) {
@@ -136,11 +149,32 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 	return *pipeline_executor;
 }
 
+idx_t PipelineTask::NextAdaptiveChunkCount(idx_t current, uint64_t duration_ns, uint64_t target_ns) {
+	if (!duration_ns || !target_ns) return current;
+	const double desired = static_cast<double>(current) * static_cast<double>(target_ns) / duration_ns;
+	const auto lower = MaxValue<idx_t>(1, current / 2);
+	const auto upper = MinValue<idx_t>(8192, MaxValue<idx_t>(1, current * 2));
+	const double smoothed = 0.5 * current + 0.5 * desired;
+	return static_cast<idx_t>(MaxValue<double>(lower, MinValue<double>(upper, smoothed)));
+}
+
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
+	static const uint64_t configured_target_ns = []() -> uint64_t {
+		const auto value = std::getenv("OLAP_TASK_TARGET_US");
+		if (!value) return 0;
+		char *end = nullptr; errno = 0;
+		const auto us = std::strtoull(value, &end, 10);
+		if (errno || value == end || *end || value[0] == '-' || (us && (us < 100 || us > 100000)))
+			throw InvalidInputException("OLAP_TASK_TARGET_US must be 0 or 100..100000");
+		return us * 1000;
+	}();
+	const auto target_ns = mode == TaskExecutionMode::PROCESS_PARTIAL ? configured_target_ns : 0;
+	uint64_t task_duration_ns = 0;
 	const bool energy_attribution_active = pipeline.GetEnergyAttributionQueryState() != nullptr;
-	const bool profiler_task_requested = PipelineTaskProfilingRequested(pipeline);
+	const bool light_profile_requested = UseLightPipelineTaskProfiling(pipeline);
+	const bool profiler_task_requested = !light_profile_requested && PipelineTaskProfilingRequested(pipeline);
 	const bool live_throughput_requested = pipeline.SourceWorkTrackingEnabled();
-	const bool task_timing_requested = profiler_task_requested || live_throughput_requested;
+	const bool task_timing_requested = profiler_task_requested || live_throughput_requested || target_ns || light_profile_requested;
 	uint64_t task_start_ns = 0;
 	if (task_timing_requested) {
 		task_start_ns = PipelineDVFSProfiler::TimestampNs();
@@ -179,8 +213,10 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		if (energy_attribution_active) {
 			energy_scope.SetEndCPUHint(end_cpu);
 		}
-		if (profiler_task_id || live_throughput_requested) {
+		if (profiler_task_id || live_throughput_requested || target_ns || light_profile_requested) {
 			auto task_end_ns = PipelineDVFSProfiler::TimestampNs();
+			task_duration_ns = task_end_ns > task_start_ns ? task_end_ns - task_start_ns : 0;
+			if (light_profile_requested) pipeline.RecordLightServiceTask(task_duration_ns);
 			if (pipeline_executor) {
 				pipeline_executor->FinishThroughputTask(task_end_ns);
 			}
@@ -206,11 +242,13 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		    QuerySchedulerPolicy::STRIDE) {
 			chunk_count = QUERY_STRIDE_QUANTUM_CHUNKS;
 		}
+		if (target_ns) chunk_count = adaptive_chunk_count;
 		auto res = pipeline_executor->Execute(chunk_count);
 
 		switch (res) {
 		case PipelineExecuteResult::NOT_FINISHED:
 			finish_profiler_task();
+			if (target_ns) adaptive_chunk_count = NextAdaptiveChunkCount(chunk_count, task_duration_ns, target_ns);
 			return TaskExecutionResult::TASK_NOT_FINISHED;
 		case PipelineExecuteResult::INTERRUPTED:
 			finish_profiler_task();
@@ -265,6 +303,8 @@ bool Pipeline::GetProgress(ProgressData &progress) {
 }
 
 void Pipeline::ResetSourceWorkTracking() {
+	light_service_worker_time_ns.store(0);
+	light_service_task_count.store(0);
 	source_work_tracking_enabled.store(false);
 	source_work_debug_sampling_enabled.store(false);
 	lock_guard<mutex> guard(source_work_lock);
@@ -697,6 +737,10 @@ void Pipeline::RecordProfilerStart(idx_t task_count, idx_t source_max_threads,
 
 void Pipeline::RecordProfilerTasksDone() {
 	if (profiler_pipeline_id) {
+		auto task_count = light_service_task_count.exchange(0);
+		auto worker_ns = light_service_worker_time_ns.exchange(0);
+		if (task_count) QueryProfiler::Get(GetClientContext()).RecordPipelineAggregateService(
+		    profiler_pipeline_id, task_count, worker_ns);
 		QueryProfiler::Get(GetClientContext()).RecordPipelineProfileTasksDone(profiler_pipeline_id);
 	}
 }
@@ -733,6 +777,11 @@ idx_t Pipeline::RecordProfilerTaskStart(uint64_t thread_id, int start_cpu) {
 		return 0;
 	}
 	return QueryProfiler::Get(GetClientContext()).RecordPipelineTaskStart(profiler_pipeline_id, thread_id, start_cpu);
+}
+
+void Pipeline::RecordLightServiceTask(uint64_t duration_ns) {
+	light_service_worker_time_ns.fetch_add(duration_ns, std::memory_order_relaxed);
+	light_service_task_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Pipeline::RecordProfilerTaskEnd(idx_t task_id, int end_cpu, const SourceThroughputCounters &source_throughput,

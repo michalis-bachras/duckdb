@@ -113,6 +113,13 @@ static QueryRequestMetadata ParseQueryRequestMetadata(const string &query) {
 		return result;
 	}
 	auto static_priority = fields.find("stride_static_priority");
+	auto service = fields.find("estimated_service_ns");
+	if (service != fields.end() &&
+	    (service->second.empty() || service->second[0] == '-' ||
+	     !ParseUint64Strict(service->second, result.estimated_service_ns))) {
+		result.parse_status = "invalid_estimated_service_ns";
+		return result;
+	}
 	if (static_priority != fields.end() &&
 	    (!ParseDoubleStrict(static_priority->second, result.stride_static_priority) ||
 	     result.stride_static_priority <= 0)) {

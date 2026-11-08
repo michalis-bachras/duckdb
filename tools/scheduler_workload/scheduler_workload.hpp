@@ -40,6 +40,7 @@ struct ScheduleEntry {
 	uint64_t deadline_offset_ns = 0;
 	double sla_tag = 0;
 	double sla_penalty_per_s = 0;
+	uint64_t estimated_service_ns = 0;
 };
 
 struct WorkloadConfig {
@@ -86,6 +87,10 @@ struct WorkloadConfig {
 	idx_t warmup_repetitions = 0;
 	bool profile_timing_export = false;
 	bool profile_execution_gate = false;
+	bool profile_terminal_gate = false;
+	bool workload_execution_gate = false;
+	string scheduler_live_output;
+	int scheduler_observer_cpu = -1;
 	idx_t profile_query_warmups = 0;
 	string memory_limit;
 	int pair_driver_cpu = -1;

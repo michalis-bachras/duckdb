@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -1901,7 +1902,14 @@ void QueryRequestProfileStore::RecordQueryCompletion(const QueryRequestMetadata 
    issued_key.query_id = metadata.db_query_id;
    issued_key.pipeline = BuildSuffixProfileKey(metadata, profile);
    auto issued = state->issued_suffix.find(issued_key);
-   bool update = suffix_update_mode != QuerySLASuffixUpdateMode::NONE;
+   // Resolve every issued forecast normally. Freezing changes learning only;
+   // it must not turn successful completions into discarded/unresolved feedback.
+   static const bool freeze_suffix = [] {
+    const auto value = std::getenv("OLAP_SLA_FREEZE_SUFFIX");
+    return value && string(value) == "1";
+   }();
+   bool update = suffix_update_mode != QuerySLASuffixUpdateMode::NONE &&
+                 (!freeze_suffix || suffix_update_mode == QuerySLASuffixUpdateMode::BOOTSTRAP_ALL);
    if (suffix_update_mode != QuerySLASuffixUpdateMode::BOOTSTRAP_ALL) {
     if (state->resolved_suffix.count(issued_key)) {
      state->suffix_runtime.duplicate_feedback_count++;

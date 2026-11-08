@@ -70,6 +70,9 @@ QueryAdmissionController::WaiterKey QueryAdmissionController::WaitingKey(const Q
 	uint64_t deadline = 0;
 	if (policy == QueryAdmissionPolicy::EDF) {
 		deadline = request.metadata.deadline_ns ? request.metadata.deadline_ns : std::numeric_limits<uint64_t>::max();
+	} else if (policy == QueryAdmissionPolicy::SJF) {
+		deadline = request.metadata.estimated_service_ns ? request.metadata.estimated_service_ns
+		                                                 : std::numeric_limits<uint64_t>::max();
 	}
 	return {deadline, request.ticket};
 }

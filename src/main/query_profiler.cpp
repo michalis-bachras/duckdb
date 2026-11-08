@@ -432,6 +432,15 @@ void QueryProfiler::RecordPipelineTaskEnd(idx_t task_id, int end_cpu, const Sour
 	}
 }
 
+void QueryProfiler::RecordPipelineAggregateService(idx_t pipeline_id, idx_t tasks, uint64_t worker_time_ns) {
+	if (!tasks) return;
+	lock_guard<std::mutex> guard(lock);
+	auto profile = GetPipelineProfile(pipeline_id);
+	if (!profile) return;
+	profile->worker_task_count += tasks;
+	profile->worker_task_duration_ns += worker_time_ns;
+}
+
 void QueryProfiler::StartQuery(const string &query, bool is_explain_analyze_p, bool start_at_optimizer) {
 	lock_guard<std::mutex> guard(lock);
 	if (is_explain_analyze_p) {

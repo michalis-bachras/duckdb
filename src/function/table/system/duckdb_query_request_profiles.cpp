@@ -1318,6 +1318,11 @@ static unique_ptr<FunctionData> DuckDBQuerySLASchedulerEpochsBind(ClientContext 
 	SLA_EPOCH_COLUMN("predicted_query_finish_p90_ns", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("predicted_sla_cost", LogicalType::DOUBLE);
 	SLA_EPOCH_COLUMN("trace_dropped_count", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("total_work_units", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("throughput_completed_work_units", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("throughput_worker_time_ns", LogicalType::UBIGINT);
+	SLA_EPOCH_COLUMN("historical_service_rate", LogicalType::DOUBLE);
+	SLA_EPOCH_COLUMN("committed_query_id", LogicalType::UBIGINT);
 #undef SLA_EPOCH_COLUMN
 	return nullptr;
 }
@@ -1545,6 +1550,11 @@ static void DuckDBQuerySLASchedulerEpochsFunction(ClientContext &context, TableF
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_query_finish_p90_ns));
 		output.SetValue(col++, count, Value::DOUBLE(snapshot.predicted_sla_cost));
 		output.SetValue(col++, count, Value::UBIGINT(data.dropped_count));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.total_work_units));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.throughput_completed_work_units));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.throughput_worker_time_ns));
+		output.SetValue(col++, count, Value::DOUBLE(snapshot.historical_service_rate));
+		output.SetValue(col++, count, Value::UBIGINT(snapshot.committed_query_id));
 		count++;
 	}
 	output.SetCardinality(count);

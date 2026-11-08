@@ -1,5 +1,7 @@
 #include "scheduler_workload.hpp"
+#include "duckdb/parallel/query_sla_model.hpp"
 #include "phase_pair_controller.hpp"
+#include "live_sla_observer.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/pipeline_dvfs_profiler.hpp"
@@ -8,7 +10,14 @@
 #include "duckdb/main/query_request_metadata.hpp"
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/query_admission_controller.hpp"
+#include "duckdb/execution/executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parallel/query_sla_scheduler.hpp"
 #include <cstdlib>
+#include <chrono>
+#include <algorithm>
+#include <tuple>
 
 #include <cmath>
 #include <cstdio>
@@ -24,6 +33,106 @@ static void Require(bool condition, const string &message) {
 		throw InternalException("scheduler_workload test failed: %s", message);
 	}
 }
+
+static void TestInitializationProgress() {
+	QuerySLAModelInput input;
+	input.metadata.valid = true;
+	input.metadata.db_query_id = 1;
+	input.metadata.deadline_ns = 2500000000ULL;
+	input.metadata.sla_penalty_per_s = 1;
+	input.metadata.estimated_service_ns = 5000000000ULL;
+	input.metadata.query_start_ns = input.now_ns = 1000000000ULL;
+	input.epoch_ns = 100000000;
+	input.event_kind = QueryActivationEventKind::INITIALIZE;
+	input.work.parallelism_valid = true;
+	input.work.preferred_parallelism = 1;
+	input.suffix = QuerySLALifecycleSuffixPointMass(input.metadata.estimated_service_ns);
+	auto before = BuildQuerySLAModel(input);
+	Require(before.valid && !QuerySLAHasCompletionForecast(before),
+	        "initialization priors support dispatch but cannot certify a hardware downshift");
+	Require(before.suffix_p90_ns == 5000000000.0, "initialization retains pending query service");
+	input.now_ns += 14000000000ULL;
+	auto queued = BuildQuerySLAModel(input);
+	Require(queued.suffix_p90_ns == before.suffix_p90_ns && queued.mandatory_cost[0] > before.mandatory_cost[0],
+	        "waiting does not consume unexecuted query service");
+	input.suffix = QuerySLALifecycleSuffixPointMass();
+	auto unknown = BuildQuerySLAModel(input);
+	Require(unknown.valid && !QuerySLAHasCompletionForecast(unknown),
+	        "unknown initialization remains dispatchable without advertising imminent completion");
+
+	input.metadata.sla_penalty_per_s = 0;
+	input.metadata.deadline_ns = input.now_ns + 1000000000000ULL;
+	auto initialize = BuildQuerySLAModel(input);
+	Require(initialize.valid && initialize.mandatory_gain[0] == 0 && initialize.optional_gain[0] == 0,
+	        "required progress does not invent a positive SLA marginal gain");
+	QuerySLAModel data;
+	data.valid = true;
+	data.db_query_id = 99;
+	data.event_kind = QueryActivationEventKind::PIPELINE;
+	data.demand_cap = 4;
+	data.mandatory_gain = {100, 90, 80, 70};
+	data.optional_gain = {0, 0, 0, 0};
+	auto allocation = AllocateQuerySLAWorkers({data, initialize}, 4, false, true);
+	Require(allocation.mandatory[1] == 1 && allocation.mandatory[0] == 3 &&
+	        allocation.tokens.size() == 4 && allocation.unassigned_workers == 0,
+	        "initialization progresses while data pipelines share the remaining worker budget");
+	Require(AllocateQuerySLAWorkers({initialize}, 0, false, true).mandatory[0] == 0,
+	        "required progress cannot exceed a zero worker budget");
+	for (auto kind : {QueryActivationEventKind::PREPARE_FINISH, QueryActivationEventKind::FINISH,
+	                  QueryActivationEventKind::COMPLETE}) {
+		initialize.event_kind = kind;
+		Require(AllocateQuerySLAWorkers({data, initialize}, 1, false, true).mandatory[1] == 1,
+		        "serial lifecycle transitions progress despite competing positive data gains");
+	}
+
+	auto oldest = BuildQuerySLAModel(input);
+	oldest.db_query_id = 1;
+	oldest.query_start_ns = 10;
+	auto newer = oldest;
+	newer.db_query_id = 2;
+	newer.query_start_ns = 20;
+	auto newest = newer;
+	newest.db_query_id = 3;
+	newest.query_start_ns = 30;
+	auto first = AllocateQuerySLAWorkers({newest, oldest, newer}, 2, false, true);
+	Require(first.mandatory == vector<idx_t> {0, 1, 1},
+	        "lifecycle contention serves older queries independent of unordered capture order");
+	auto second = AllocateQuerySLAWorkers({newest, newer}, 1, false, true);
+	Require(second.mandatory == vector<idx_t> {0, 1} &&
+	        AllocateQuerySLAWorkers({newest}, 1, false, true).mandatory[0] == 1,
+	        "later lifecycle queries progress as earlier serial stages complete");
+}
+
+class ResidualDispatchEvent final : public Event {
+public:
+	explicit ResidualDispatchEvent(Executor &executor, QueryActivationEventKind kind) : Event(executor) {
+		SetQueryActivationInfo(1, kind, 1);
+		total_tasks = 1;
+		work.valid = true;
+		work.pipeline_id = 1;
+		work.profile_identity.valid = true;
+		work.profile_identity.pipeline_id = 1;
+		work.profile_identity.pipeline_signature_hash = 101;
+		work.profile_identity.pipeline_structure_hash = 201;
+		work.parallelism_valid = true;
+		work.preferred_parallelism = 1;
+		work.scheduled_tasks = work.remaining_tasks = 1;
+		work.lifecycle_tail_estimate.valid = true;
+		work.lifecycle_tail_estimate.p90_ns = 1000000;
+	}
+	void Schedule() override {}
+	bool GetPipelineWorkSnapshot(PipelineWorkSnapshot &result) const override {
+		result = work;
+		return true;
+	}
+private:
+	PipelineWorkSnapshot work;
+};
+
+class ResidualDispatchTask final : public Task {
+public:
+	TaskExecutionResult Execute(TaskExecutionMode) override { return TaskExecutionResult::TASK_FINISHED; }
+};
 
 // Re-enter read/installation APIs from notifications. This would deadlock if a
 // future change accidentally moved callbacks under the registration mutex.
@@ -47,6 +156,43 @@ public:
 
 int main() {
 	try {
+		TestInitializationProgress();
+		{
+			DuckDB database(nullptr); Connection connection(database);
+			auto &admission = database.instance->GetQueryAdmissionController();
+			admission.SetPolicy(QueryAdmissionPolicy::SJF);
+			QueryRequestMetadata m; m.valid = true; m.template_id = m.scale_factor = 1;
+			m.deadline_ns = 100; m.db_query_id = 1;
+			auto active = admission.EnqueueOrAcquire(*connection.context, m, 1);
+			m.db_query_id = 2; m.estimated_service_ns = 30;
+			auto longer = admission.EnqueueOrAcquire(*connection.context, m, 1);
+			m.db_query_id = 3; m.estimated_service_ns = 10;
+			auto shorter = admission.EnqueueOrAcquire(*connection.context, m, 1);
+			m.db_query_id = 4; m.estimated_service_ns = 0;
+			auto unknown = admission.EnqueueOrAcquire(*connection.context, m, 1);
+			m.db_query_id = 5; m.estimated_service_ns = 10;
+			auto cancelled = admission.EnqueueOrAcquire(*connection.context, m, 1);
+			cancelled.reset();
+			const string activity_path="/tmp/duckdb_admission_activity_test.json";
+			LiveSLAObserver activity_observer(*database.instance,activity_path,-1);
+			string activity_json;
+			for (idx_t attempt=0;attempt<100;attempt++) {
+				std::ifstream input(activity_path);std::ostringstream contents;contents<<input.rdbuf();activity_json=contents.str();
+				if (activity_json.find("\"registered_queries\":4")!=string::npos) break;
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			}
+			activity_observer.Stop();std::remove(activity_path.c_str());std::remove((activity_path+".tmp").c_str());
+			Require(activity_observer.Error().empty() && activity_json.find("\"registered_queries\":4")!=string::npos &&
+			        activity_json.find("admission_sjf")!=string::npos,
+			        "admission activity includes the active request and waiting requests without SLA forecasts");
+			Require(active->IsAdmitted() && !shorter->IsAdmitted(), "SJF respects admission cap");
+			active.reset();
+			Require(shorter->IsAdmitted() && !longer->IsAdmitted(), "SJF admits prior shorter service first");
+			shorter.reset();
+			Require(longer->IsAdmitted() && !unknown->IsAdmitted(), "unknown service follows known estimates");
+			longer.reset();
+			Require(unknown->IsAdmitted(), "SJF drains unknown jobs after known work");
+		}
 		{
 			DuckDB database(nullptr);Connection connection(database);
 			Require(!connection.Query("SET threads=4")->HasError(),"probe workers");
@@ -189,7 +335,7 @@ int main() {
 		        "FIFO admission and 128 active queries remain the defaults");
 		Require(!config.scheduler_process_partial,"partial processing remains disabled by default");
 		for (auto scheduler : {"default", "sla", "stride"}) {
-			for (auto admission : {"fifo", "edf"}) {
+			for (auto admission : {"fifo", "edf", "sjf"}) {
 				const char *args[] = {"scheduler_workload", "run", "--database", "10=/tmp/db", "--queries-dir", "/tmp/q",
 				                      "--schedule", "/tmp/schedule.csv", "--output-dir", "/tmp/out", "--scheduler", scheduler,
 				                      "--admission-policy", admission};
@@ -255,6 +401,10 @@ int main() {
 		WriteSchedule(path, first);
 		auto round_trip = ReadSchedule(path);
 		Require(ScheduleHash(first) == ScheduleHash(round_trip), "schedule CSV round trip");
+		Require(round_trip[0].estimated_service_ns > 0, "prior calibration survives schedule round trip");
+		auto changed_hint = round_trip;
+		changed_hint[0].estimated_service_ns++;
+		Require(ScheduleHash(changed_hint) != ScheduleHash(round_trip), "schedule hash protects size hints");
 		std::ifstream input(path);
 		std::ostringstream crlf;
 		string line;
@@ -459,6 +609,239 @@ int main() {
                 "a changed non-floating row hash fails correctness");
         Require(!ResultFingerprintsMatch("v2:2:123:2:100:20:30:5000", "v2:2:123:2:100:21:30:5000"),
                 "changed keyed numeric probes fail correctness");
+
+        // Keep residual dispatch coverage and separately test required initialization
+        // with known and unknown remaining query work, even with zero SLA gains.
+        for (idx_t scenario = 0; scenario < 3; scenario++) {
+            const bool initialization = scenario != 0;
+            DBConfig config;
+            config.options.maximum_threads = 1;
+            config.options.query_sla_residual_workers_enabled = true;
+            config.options.query_sla_energy_hardware_control_enabled = false;
+            DuckDB db(nullptr, &config);
+            Connection con(db);
+            Executor executor(*con.context);
+            auto producer = db.instance->GetScheduler().CreateProducer();
+            db.instance->SetQuerySchedulerPolicy(QuerySchedulerPolicy::SLA);
+            auto &scheduler = db.instance->GetQuerySLAScheduler();
+            QueryRequestMetadata metadata;
+            metadata.valid = true;
+            metadata.db_query_id = metadata.request_id = 1;
+            metadata.template_id = metadata.scale_factor = 1;
+            metadata.query_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            metadata.deadline_ns = metadata.query_start_ns + 60000000000ULL;
+            metadata.estimated_service_ns = scenario == 1 ? 5000000000ULL : 0;
+            // A zero-weight request has zero SLA marginal gains but must still run
+            // under the work-conserving policy.
+            metadata.sla_penalty_per_s = 0;
+            if (!initialization) {
+                auto &store = db.instance->GetQueryRequestProfileStore();
+                store.SetSuffixBootstrapMode(true, 15);
+                PipelineProfilingInfo profile;
+                profile.pipeline_id = 1;
+                profile.pipeline_signature_hash = 101;
+                profile.pipeline_structure_hash = 201;
+                profile.start_ns = 10;
+                profile.tasks_done_ns = 20;
+                profile.finish_done_ns = 30;
+                profile.planned_input_chunks_equiv = 1;
+                profile.planned_input_native_unit = "row";
+                profile.task_count = profile.worker_task_count = 1;
+                profile.worker_task_duration_ns = 10;
+                for (idx_t sample = 0; sample < 15; sample++) {
+                    auto training = metadata;
+                    training.db_query_id = 1000 + sample;
+                    training.query_start_ns = 10;
+                    store.RecordQueryCompletion(training, 31, {profile}, {}, QuerySLASuffixUpdateMode::BOOTSTRAP_ALL);
+                }
+                Require(store.SuffixBootstrapComplete(), "residual test suffix bootstrap");
+                store.SetSuffixBootstrapMode(false);
+            }
+            scheduler.RegisterQuery(metadata, *producer, true);
+            // Registered requests between events must not look like an empty workload.
+            auto live_path = string("/tmp/scheduler_workload_observer_") + std::to_string(metadata.query_start_ns);
+            LiveSLAObserver observer(*db.instance, live_path, -1);
+            string observed;
+            for (idx_t attempt = 0; attempt < 50; attempt++) {
+                std::ifstream input(live_path);
+                std::stringstream contents;
+                contents << input.rdbuf();
+                observed = contents.str();
+                if (observed.find("\"registered_queries\":1") != string::npos) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            observer.Stop();
+            std::remove(live_path.c_str());
+            std::remove((live_path + ".tmp").c_str());
+            Require(observer.Error().empty() && observed.find("\"registered_queries\":1") != string::npos &&
+                    observed.find("\"active\":[]") != string::npos,
+                    "live observation distinguishes an unmodeled registered request from no requests");
+            auto event = make_shared_ptr<ResidualDispatchEvent>(executor, initialization
+                ? QueryActivationEventKind::INITIALIZE : QueryActivationEventKind::PIPELINE);
+            scheduler.OnEventScheduled(metadata.db_query_id, event, 1);
+            db.instance->GetScheduler().ScheduleTask(*producer, make_shared_ptr<ResidualDispatchTask>());
+            scheduler.RequestInitialEpoch();
+            shared_ptr<Task> task;
+            QuerySLAWorkerSelection selection;
+            Require(scheduler.TryDequeueTask(0, task, &selection) == QuerySLADequeueResult::TASK_FOUND,
+                    "a published zero-gain residual slot dispatches its queued task");
+            auto snapshot = scheduler.GetSnapshot();
+            Require(snapshot.size() == 1 && snapshot[0].assigned_workers == 1 &&
+                    (initialization ? snapshot[0].mandatory_workers : snapshot[0].residual_workers) == 1,
+                    "dispatch consumes one published lifecycle/residual slot within the budget");
+            auto trace = scheduler.GetEpochTrace();
+            Require(!trace.empty() && trace.back().assigned_workers == 0 &&
+                    (initialization ? trace.back().mandatory_workers : trace.back().residual_workers) == 1,
+                    "the lifecycle/residual grant was published before task assignment");
+            if (initialization) {
+                Require(!snapshot[0].model_valid && !trace.back().model_valid,
+                        "initialization priors cannot advertise a trained completion forecast");
+                Require(trace.back().suffix_p90_ns == metadata.estimated_service_ns,
+                        "activation and periodic epochs retain the pending query service prior");
+                Require(trace.back().predicted_query_finish_p90_ns == 0,
+                        "initialization does not certify imminent completion to the hardware guard");
+                Require(trace.back().suffix_primary_level == (scenario == 1 ? "query_service_prior" : "unknown"),
+                        "an initialization prior is distinguished from a trained suffix");
+            }
+            scheduler.ReleaseTaskAssignment(0, selection);
+            scheduler.OnEventFinished(metadata.db_query_id, *event);
+            scheduler.UnregisterQuery(metadata.db_query_id);
+        }
+        // Execution priority grants respect pipeline capacity and backfill a serial phase.
+        QuerySLAModel serial, parallel;
+        serial.valid = parallel.valid = true;
+        serial.db_query_id = 1; parallel.db_query_id = 2;
+        serial.deadline_ns = 2000000000ULL; parallel.deadline_ns = 3000000000ULL;
+        serial.demand_cap = 1; parallel.demand_cap = 4;
+        serial.event_kind = QueryActivationEventKind::FINISH;
+        parallel.event_kind = QueryActivationEventKind::PIPELINE;
+        parallel.remaining_work_units = 4;
+        parallel.service_rates = {0, 1, 2, 3, 4};
+        auto backfill = AllocateDeadlineBackfillWorkers({parallel, serial}, 4, false);
+        Require(backfill.residual[0] == 3 && backfill.residual[1] == 1 && backfill.unassigned_workers == 0,
+                "execution EDF backfills pipeline capacity without oversubscription");
+        auto expired = parallel;
+        expired.db_query_id = 3; expired.deadline_ns = 500000000ULL;
+        auto edf = AllocateDeadlineBackfillWorkers({expired, parallel}, 4, false);
+        auto triage = AllocateDeadlineBackfillWorkers({expired, parallel}, 4, true);
+        Require(edf.residual[0] == 4 && triage.residual[1] == 4,
+                "triage distinguishes individually infeasible work from still recoverable work");
+        auto late_long = expired;
+        late_long.remaining_work_units = 8;
+        auto late_drain = AllocateDeadlineBackfillWorkers({late_long, expired}, 4, true);
+        Require(late_drain.residual[1] == 4, "late work drains in remaining-service order");
+        QuerySLAModel invalid;
+        auto bounded = AllocateDeadlineBackfillWorkers({invalid, serial}, 8, true);
+        Require(bounded.residual[0] == 0 && bounded.residual[1] == 1 && bounded.unassigned_workers == 7,
+                "invalid models receive no fabricated capacity and no grant exceeds demand");
+
+
+        auto almost_done = expired;
+        almost_done.remaining_work_units = 1;
+        almost_done.deadline_ns = 100000000ULL;
+        auto srpt = AllocateDeadlineBackfillWorkers({parallel, almost_done}, 4, false, true);
+        auto deadline_triage = AllocateDeadlineBackfillWorkers({parallel, almost_done}, 4, true);
+        Require(srpt.residual[1] == 4 && deadline_triage.residual[0] == 4,
+                "remaining-service priority can finish an almost-complete late job before a larger on-time job");
+        auto serial_srpt = AllocateDeadlineBackfillWorkers({parallel, serial}, 4, false, true);
+        Require(serial_srpt.residual[1] == 1 && serial_srpt.residual[0] == 3,
+                "SRPT backfill preserves pipeline demand caps and uses spare capacity");
+
+        auto incumbent = parallel;
+        Require(PipelineTask::NextAdaptiveChunkCount(50,2000000,2000000) == 50,
+                "adaptive quantum holds an on-target task budget");
+        Require(PipelineTask::NextAdaptiveChunkCount(50,20000,2000000) == 100 &&
+                PipelineTask::NextAdaptiveChunkCount(50,200000000,2000000) == 25,
+                "adaptive quantum bounds one-step growth and shrinkage");
+        Require(PipelineTask::NextAdaptiveChunkCount(1,200000000,2000000) == 1 &&
+                PipelineTask::NextAdaptiveChunkCount(8192,20000,2000000) == 8192,
+                "adaptive quantum preserves positive bounded chunk budgets");
+        incumbent.db_query_id = 1; incumbent.deadline_ns = 10000000000ULL;
+        incumbent.service_rates = {0,10,20,30,40}; incumbent.remaining_work_units = 10;
+        incumbent.previous_workers = 4; incumbent.prior_service_ns = 1000000000ULL;
+        auto challenger = incumbent;
+        challenger.db_query_id = 2; challenger.previous_workers = 0; challenger.remaining_work_units = 9;
+        auto held = AllocatePriorityBackfillWorkers({incumbent,challenger},4,QuerySLABackfillPriority::STABLE_SRPT);
+        Require(held.residual[0] == 4, "small forecast changes do not displace the incumbent");
+        challenger.remaining_work_units = 7;
+        auto moved = AllocatePriorityBackfillWorkers({incumbent,challenger},4,QuerySLABackfillPriority::STABLE_SRPT);
+        Require(moved.residual[1] == 4, "a material service improvement can displace the incumbent");
+        challenger.deadline_ns = 300000000ULL;
+        auto urgent = AllocatePriorityBackfillWorkers({incumbent,challenger},4,QuerySLABackfillPriority::STABLE_SRPT);
+        Require(urgent.residual[1] == 4, "deadline urgency overrides incumbency");
+        challenger.deadline_ns = 20000000000ULL;
+        challenger.model_now_ns = incumbent.model_now_ns = 5000000000ULL;
+        challenger.query_start_ns = 1; incumbent.query_start_ns = 4900000000ULL;
+        challenger.remaining_work_units = 100;
+        auto aged = AllocatePriorityBackfillWorkers({incumbent,challenger},4,QuerySLABackfillPriority::STABLE_SRPT);
+        Require(aged.residual[1] == 4, "aging lets deferred large work regain priority");
+        challenger.prior_service_ns = 100000000ULL;
+        auto psjf = AllocatePriorityBackfillWorkers({incumbent,challenger},4,QuerySLABackfillPriority::PSJF);
+        Require(psjf.residual[1] == 4, "PSJF uses prior size rather than an underestimated remaining size");
+        auto early_long = parallel;
+        early_long.db_query_id = 1; early_long.deadline_ns = 3000000000ULL;
+        early_long.remaining_work_units = 12; early_long.model_now_ns = 0;
+        auto early_short = early_long;
+        early_short.db_query_id = 2; early_short.remaining_work_units = 4;
+        auto second_short = early_short; second_short.db_query_id = 3;
+        auto subset = AllocatePriorityBackfillWorkers({early_long,early_short,second_short},4,
+                                                      QuerySLABackfillPriority::MOORE);
+        Require(subset.residual[1] == 4 && subset.residual[0] == 0,
+                "collective feasibility defers one long job to keep two shorter jobs on time");
+        // Independent exhaustive oracle: all 24 orders of four jobs, for 32
+        // different sizes/deadlines. Check the chosen first job, not DP internals.
+        for (idx_t sample = 0; sample < 32; sample++) {
+            vector<QuerySLAModel> jobs;
+            for (idx_t j = 0; j < 4; j++) {
+                auto job = parallel;
+                job.db_query_id = j+1; job.model_now_ns = 0;
+                job.remaining_work_units = (sample+j*7)%12+1;
+                job.deadline_ns = ((sample*3+j*5)%20+1)*250000000ULL;
+                jobs.push_back(job);
+            }
+            vector<idx_t> permutation {0,1,2,3};
+            std::tuple<idx_t,uint64_t,uint64_t> best;
+            idx_t first_job = 0; bool found = false;
+            do {
+                uint64_t completion = 0, tardiness = 0, flow = 0; idx_t misses = 0;
+                for (auto j:permutation) {
+                    completion += jobs[j].remaining_work_units*250000000ULL;
+                    if (completion > jobs[j].deadline_ns) {
+                        misses++; tardiness += completion-jobs[j].deadline_ns;
+                    }
+                    flow += completion;
+                }
+                auto objective = std::make_tuple(misses,tardiness,flow);
+                if (!found || objective < best) {found = true;best = objective;first_job = permutation[0];}
+            } while (std::next_permutation(permutation.begin(),permutation.end()));
+            auto exact = AllocatePriorityBackfillWorkers(jobs,4,QuerySLABackfillPriority::BOUNDED_DP);
+            Require(exact.residual[first_job] == 4,"bounded queue DP matches exhaustive scheduling oracle");
+        }
+        vector<QuerySLAModel> larger;
+        for (idx_t j = 0; j < 9; j++) {auto job=early_short;job.db_query_id=j+1;larger.push_back(job);}
+        auto fallback = AllocatePriorityBackfillWorkers(larger,4,QuerySLABackfillPriority::BOUNDED_DP);
+        auto moore_fallback = AllocatePriorityBackfillWorkers(larger,4,QuerySLABackfillPriority::MOORE);
+        Require(fallback.residual == moore_fallback.residual,"queue DP uses bounded fallback above eight jobs");
+        auto primary = parallel;primary.db_query_id=1;primary.prior_service_ns=2000000000ULL;
+        auto next = parallel;next.db_query_id=2;next.prior_service_ns=1000000000ULL;
+        uint64_t committed=0;
+        auto initial_primary=AllocateCommittedSJFWorkers({primary,next},4,committed);
+        Require(committed==2 && initial_primary.residual[1]==4,"primary starts in prior-size order");
+        auto newcomer=next;newcomer.db_query_id=3;newcomer.prior_service_ns=100000000ULL;
+        auto retained=AllocateCommittedSJFWorkers({next,newcomer},4,committed);
+        Require(committed==2 && retained.residual[0]==4 && retained.residual[1]==0,
+                "a shorter arrival does not displace the committed query");
+        auto serial_primary=next;serial_primary.demand_cap=1;
+        auto lent=AllocateCommittedSJFWorkers({serial_primary,newcomer},4,committed);
+        Require(lent.residual[0]==1 && lent.residual[1]==3,"only spare serial-phase capacity is lent");
+        auto boundary=AllocateCommittedSJFWorkers({newcomer},4,committed);
+        Require(committed==2 && boundary.residual[0]==4,"a pipeline gap preserves query commitment");
+        auto returned=AllocateCommittedSJFWorkers({next,newcomer},4,committed);
+        Require(returned.residual[0]==4 && returned.residual[1]==0,"primary regains its parallel capacity");
+        committed=0;
+        auto replacement=AllocateCommittedSJFWorkers({primary,newcomer},4,committed);
+        Require(committed==3 && replacement.residual[1]==4,"completion permits selecting the next shortest query");
 		std::cout << "scheduler_workload tests passed\n";
 		return 0;
 	} catch (std::exception &ex) {

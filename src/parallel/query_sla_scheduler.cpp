@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/parallel/query_sla_scheduler.hpp"
+#include <cstdlib>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/database.hpp"
@@ -129,6 +130,7 @@ static const char *SLAEventKindName(QueryActivationEventKind kind) {
 }
 
 struct QueryCapture {
+	idx_t previous_workers = 0;
 	DownstreamSuffixEstimate activation_suffix;
 	QueryRequestMetadata metadata;
 	shared_ptr<Event> event;
@@ -210,6 +212,7 @@ struct SLAEpochTimings {
 };
 
 struct SLACapturedEpoch {
+	uint64_t committed_query_id = 0;
 	vector<QueryCapture> queries;
 	idx_t epochs_without_optional_only_socket = 0;
 };
@@ -225,6 +228,7 @@ struct SLAPreparedEpoch {
 };
 
 struct SLAEpochAllocation {
+	uint64_t proposed_committed_query_id = 0;
 	QuerySLAAllocation logical;
 	QuerySLAEnergyEpochPlan energy;
 	vector<QueryHardwareWorkerTopology> topology;
@@ -238,6 +242,7 @@ struct SLAEpochAllocation {
 };
 
 struct SLAEpochPublication {
+	uint64_t committed_query_id = 0;
 	vector<EpochTraceInput> trace_inputs;
 	vector<idx_t> trace_indexes;
 	QuerySLAExplorationDiagnosticsSnapshot exploration;
@@ -346,7 +351,10 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
    suffix = store.PrepareDownstreamSuffixActivation(capture.metadata.db_query_id, request, model);
   }
 	} else {
-		suffix = QuerySLALifecycleSuffixPointMass();
+		// Do not spend queued time out of this service prior: no downstream
+		// work has run merely because initialization has been waiting.
+		suffix = QuerySLALifecycleSuffixPointMass(
+		    event_kind == QueryActivationEventKind::INITIALIZE ? capture.metadata.estimated_service_ns : 0);
 	}
 
 	QuerySLAModelInput model_input;
@@ -367,7 +375,7 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 			                            static_cast<unsigned long long>(capture.metadata.db_query_id),
 			                            static_cast<unsigned long long>(work.pipeline_id), result.model.error);
 		}
-		result.claimable =
+		result.claimable = QuerySLARequiresLifecycleWorker(result.model) ||
 		    (!result.model.mandatory_gain.empty() && result.model.mandatory_gain[0] > 0) ||
 		    (!result.model.optional_gain.empty() && result.model.optional_gain[0] > 0);
 		return result;
@@ -442,6 +450,9 @@ static ActivatedPipelinePlan BuildActivatedPipelinePlan(DatabaseInstance &db, Qu
 } // namespace
 
 struct QuerySLASchedulerState {
+	bool committed_backfill = false;
+	bool event_epoch_trigger = false;
+	uint64_t committed_query_id = 0; // protected by lock; survives pipeline boundaries
 	static constexpr idx_t MAX_EPOCH_TRACE_ROWS = 250000;
 	static constexpr idx_t MAX_ENERGY_WORKER_EPOCH_TRACE_ROWS = 500000;
 
@@ -503,6 +514,7 @@ struct QuerySLASchedulerState {
 	uint64_t next_lease_generation = 0;
 	std::priority_queue<QuerySLADispatchEntry> primary_mandatory;
 	std::priority_queue<QuerySLADispatchEntry> primary_optional;
+	std::priority_queue<QuerySLAResidualDispatchEntry> primary_residual;
 	std::priority_queue<QuerySLADispatchEntry> dynamic_mandatory;
 	std::priority_queue<QuerySLADispatchEntry> dynamic_optional;
 	std::priority_queue<QuerySLAResidualDispatchEntry> dynamic_residual;
@@ -739,6 +751,11 @@ static void RefreshDispatchEntries(QuerySLASchedulerState &state, QuerySLASchedu
 			if (gain > 0) {
 				state.primary_optional.emplace(gain, query.metadata.db_query_id, query.dispatch_version, workers);
 			}
+		} else if (query.assigned_residual_workers < query.residual_workers) {
+			auto mandatory_gain = workers < query.model.mandatory_gain.size() ? query.model.mandatory_gain[workers] : 0;
+			auto optional_gain = workers < query.model.optional_gain.size() ? query.model.optional_gain[workers] : 0;
+			state.primary_residual.emplace(mandatory_gain, optional_gain, query.metadata.db_query_id,
+			                               query.dispatch_version, workers);
 		}
 	}
 	if (query.fixed_epoch_grants || planned >= query.model.demand_cap) {
@@ -766,6 +783,7 @@ static void RefreshDispatchEntries(QuerySLASchedulerState &state, QuerySLASchedu
 static void ResetDispatchEntries(QuerySLASchedulerState &state) {
 	state.primary_mandatory = std::priority_queue<QuerySLADispatchEntry>();
 	state.primary_optional = std::priority_queue<QuerySLADispatchEntry>();
+	state.primary_residual = std::priority_queue<QuerySLAResidualDispatchEntry>();
 	state.dynamic_mandatory = std::priority_queue<QuerySLADispatchEntry>();
 	state.dynamic_optional = std::priority_queue<QuerySLADispatchEntry>();
 	state.dynamic_residual = std::priority_queue<QuerySLAResidualDispatchEntry>();
@@ -777,6 +795,10 @@ static void ResetDispatchEntries(QuerySLASchedulerState &state) {
 QuerySLAScheduler::QuerySLAScheduler(DatabaseInstance &db_p)
     : db(db_p), state(make_uniq<QuerySLASchedulerState>()) {
 	state->hardware_manager = make_uniq<QueryHardwareManager>(db);
+	const auto mode=std::getenv("OLAP_SLA_ALLOCATION");
+	state->committed_backfill=mode && string(mode)=="sjf_backfill";
+	const auto event_epochs=std::getenv("OLAP_SLA_EPOCH_ON_EVENT");
+	state->event_epoch_trigger=state->committed_backfill || (event_epochs && string(event_epochs)=="1");
 }
 
 QuerySLAScheduler::~QuerySLAScheduler() {
@@ -833,6 +855,12 @@ void QuerySLAScheduler::UnregisterQuery(uint64_t db_query_id) {
 		}
 		state->queries.erase(entry);
 		wake_workers = db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY;
+		if (state->committed_query_id == db_query_id) {
+			state->committed_query_id = 0;
+			state->next_epoch_ns.store(0);
+			wake_workers = true;
+		}
+		if (state->event_epoch_trigger) {state->next_epoch_ns.store(0);wake_workers=true;}
 	}
 	if (wake_workers) {
 		db.GetScheduler().Signal(NumericCast<idx_t>(db.GetScheduler().NumberOfThreads()));
@@ -926,6 +954,10 @@ void QuerySLAScheduler::OnEventScheduled(uint64_t db_query_id, shared_ptr<Event>
 		    !query.energy_limited_plan && db.config.options.query_sla_residual_workers_enabled;
 		RefreshDispatchEntries(*state, query);
 		signal_worker = activated.claimable;
+		if (state->event_epoch_trigger) {
+			state->next_epoch_ns.store(0);
+			signal_worker = true;
+		}
 	}
 	if (db.GetQuerySchedulerPolicy() == QuerySchedulerPolicy::SLA_ENERGY) {
 		db.GetScheduler().Signal(NumericCast<idx_t>(db.GetScheduler().NumberOfThreads()));
@@ -1087,8 +1119,13 @@ static void PrepareEpochTraceInputs(const SLACapturedEpoch &captured, const SLAP
 			EpochTraceInput input;
 			input.capture_index = i;
 			input.event_kind = prepared.models[i].event_kind;
-			input.model_valid = prepared.models[i].valid;
+			input.model_valid = QuerySLAHasCompletionForecast(prepared.models[i]);
 			input.model_error = prepared.models[i].error;
+			if (prepared.models[i].valid && !input.model_valid) {
+				input.model_error = prepared.models[i].prior_service_ns > 0
+				    ? "initialization uses a query-service prior, not a trained completion forecast"
+				    : "initialization remaining query work is unknown";
+			}
 			input.demand_cap = prepared.models[i].demand_cap;
 			input.remaining_work_units = prepared.models[i].remaining_work_units;
 			input.selected_throughput = prepared.models[i].throughput;
@@ -1210,6 +1247,7 @@ static vector<QuerySLASchedulerEpochSnapshot> BuildQueryEpochTrace(
 		trace.scheduler_policy = energy_policy ? "sla_energy" : "sla";
 		trace.epoch_generation = allocation.generation;
 		trace.epoch_timestamp_ns = now_ns;
+		trace.committed_query_id = publication.committed_query_id;
 		trace.epoch_compute_ns = timings.epoch_compute_ns;
 		trace.epoch_wall_ns = timings.epoch_wall_ns;
 		trace.epoch_thread_cpu_ns = timings.epoch_thread_cpu_ns;
@@ -1235,6 +1273,10 @@ static vector<QuerySLASchedulerEpochSnapshot> BuildQueryEpochTrace(
 		trace.model_error = input.model_error;
 		trace.demand_cap = input.demand_cap;
 		trace.remaining_work_units = input.remaining_work_units;
+		trace.total_work_units = prepared.work[i].total_chunks_equiv;
+		trace.throughput_completed_work_units = prepared.work[i].throughput_completed_chunks_equiv;
+		trace.throughput_worker_time_ns = prepared.work[i].throughput_worker_time_ns;
+		trace.historical_service_rate = prepared.work[i].historical_throughput_estimate.ewma_work_units_per_s;
 		trace.selected_throughput = input.selected_throughput;
 		trace.throughput_is_live = input.throughput_is_live;
 		trace.historical_throughput_level =
@@ -1245,6 +1287,10 @@ static vector<QuerySLASchedulerEpochSnapshot> BuildQueryEpochTrace(
 		trace.continuation_sample_count = prepared.work[i].continuation_estimate.sample_count;
 		trace.continuation_p90 = prepared.work[i].continuation_estimate.p90;
 		trace.suffix_primary_level = SLASuffixLevelName(suffix.primary_level);
+		if (input.event_kind == QueryActivationEventKind::INITIALIZE) {
+			trace.suffix_primary_level = captured.queries[i].metadata.estimated_service_ns > 0
+			    ? "query_service_prior" : "unknown";
+		}
 		trace.suffix_model = QuerySLASuffixModelName(suffix.model);
 		trace.suffix_generation = suffix.generation;
 		trace.suffix_exact_sample_count = suffix.exact_sample_count;
@@ -1364,12 +1410,14 @@ static SLACapturedEpoch CaptureEpochState(QuerySLASchedulerState &state, SLAEpoc
 		timings.capture_lock_wait_ns = SLADurationNs(capture_lock_acquired_ns, capture_wait_start_ns);
 		captured.queries.reserve(state.queries.size());
 		captured.epochs_without_optional_only_socket = state.epochs_without_optional_only_socket;
+		captured.committed_query_id = state.committed_query_id;
 		for (const auto &entry : state.queries) {
 			if (!entry.second.event) {
 				continue;
 			}
 			QueryCapture capture;
 			capture.metadata = entry.second.metadata;
+			capture.previous_workers = PlannedWorkers(entry.second);
 			capture.event = entry.second.event;
 			capture.generation = entry.second.pipeline_generation;
 			capture.remaining_suffix_stages = entry.second.remaining_suffix_stages;
@@ -1442,7 +1490,8 @@ static SLAPreparedEpoch PrepareEpochModels(DatabaseInstance &db, QueryHardwareMa
 				suffix = suffix_estimates[suffix_indexes[i]];
 			}
 		} else {
-			suffix = QuerySLALifecycleSuffixPointMass();
+			suffix = QuerySLALifecycleSuffixPointMass(event_kind == QueryActivationEventKind::INITIALIZE
+			    ? captured.queries[i].metadata.estimated_service_ns : 0);
 		}
 		prepared.suffixes[i] = suffix;
 		QuerySLAModelInput model_input;
@@ -1462,6 +1511,7 @@ static SLAPreparedEpoch PrepareEpochModels(DatabaseInstance &db, QueryHardwareMa
 		} else {
 			prepared.models.push_back(BuildQuerySLAModel(model_input));
 		}
+		prepared.models.back().previous_workers = captured.queries[i].previous_workers;
 		prepared.inputs.push_back(model_input);
 	}
 	timings.model_build_ns = timings.enabled ? SLADurationNs(SLATimestampNs(), model_build_start_ns) : 0;
@@ -1476,9 +1526,32 @@ static SLAEpochAllocation AllocateEpochWorkers(DatabaseInstance &db, QuerySLASch
 	const auto energy_policy = prepared.energy_policy;
 	const auto allocation_start_ns = timings.enabled ? SLATimestampNs() : 0;
 	auto worker_budget = NumericCast<idx_t>(db.GetScheduler().NumberOfThreads());
-	allocation.logical =
-	    AllocateQuerySLAWorkers(prepared.models, worker_budget,
-	                            !energy_policy && db.config.options.query_sla_residual_workers_enabled);
+	const auto allocation_env = std::getenv("OLAP_SLA_ALLOCATION");
+	const string allocation_name = allocation_env ? allocation_env : "legacy";
+	if (allocation_name == "edf_backfill" || allocation_name == "triage_backfill" || allocation_name == "srpt_backfill" ||
+	    allocation_name == "psjf_backfill" || allocation_name == "stable_srpt_backfill" ||
+	    allocation_name == "moore_backfill" || allocation_name == "bounded_dp_backfill" ||
+	    allocation_name == "sjf_backfill") {
+		if (energy_policy) throw InvalidInputException("Backfill candidates require the performance SLA scheduler");
+		if (!db.config.options.query_sla_residual_workers_enabled)
+			throw InvalidInputException("Backfill candidates require --sla-residual-policy work_conserving");
+		auto priority = allocation_name == "bounded_dp_backfill" ? QuerySLABackfillPriority::BOUNDED_DP :
+		                allocation_name == "moore_backfill" ? QuerySLABackfillPriority::MOORE :
+		                allocation_name == "stable_srpt_backfill" ? QuerySLABackfillPriority::STABLE_SRPT :
+		                allocation_name == "psjf_backfill" ? QuerySLABackfillPriority::PSJF :
+		                allocation_name == "srpt_backfill" ? QuerySLABackfillPriority::SRPT :
+		                allocation_name == "triage_backfill" ? QuerySLABackfillPriority::TRIAGE : QuerySLABackfillPriority::EDF;
+		if (allocation_name=="sjf_backfill") {
+			allocation.proposed_committed_query_id=captured.committed_query_id;
+			allocation.logical=AllocateCommittedSJFWorkers(prepared.models,worker_budget,allocation.proposed_committed_query_id);
+		} else {
+			allocation.logical = AllocatePriorityBackfillWorkers(prepared.models, worker_budget, priority, epoch_ns);
+		}
+	} else {
+		if (allocation_name != "legacy") throw InvalidInputException("Unknown OLAP_SLA_ALLOCATION");
+		allocation.logical = AllocateQuerySLAWorkers(prepared.models, worker_budget,
+		    !energy_policy && db.config.options.query_sla_residual_workers_enabled, !energy_policy);
+	}
 	allocation.mandatory.resize(captured.queries.size(), 0);
 	allocation.optional.resize(captured.queries.size(), 0);
 	allocation.residual.resize(captured.queries.size(), 0);
@@ -1596,6 +1669,11 @@ static void PublishEpochAllocation(DatabaseInstance &db, QuerySLASchedulerState 
 	unique_lock<mutex> guard(state.lock);
 	const auto publish_lock_acquired_ns = timings.enabled ? SLATimestampNs() : 0;
 	timings.publish_lock_wait_ns = SLADurationNs(publish_lock_acquired_ns, publish_wait_start_ns);
+	if (state.committed_backfill && !state.committed_query_id && allocation.proposed_committed_query_id &&
+	    state.queries.count(allocation.proposed_committed_query_id)) {
+		state.committed_query_id=allocation.proposed_committed_query_id;
+	}
+	publication.committed_query_id=state.committed_query_id;
 	state.worker_hints.clear();
 	if (energy_policy) {
 		for (const auto &topology : allocation.topology) {
@@ -1951,11 +2029,11 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 		}
 		return false;
 	};
-	auto try_residual_dispatch = [&]() {
+	auto try_residual_dispatch = [&](std::priority_queue<QuerySLAResidualDispatchEntry> &heap, bool primary) {
 		vector<QuerySLAResidualDispatchEntry> unavailable;
-		while (!state->dynamic_residual.empty()) {
-			auto candidate = state->dynamic_residual.top();
-			state->dynamic_residual.pop();
+		while (!heap.empty()) {
+			auto candidate = heap.top();
+			heap.pop();
 			auto entry = state->queries.find(candidate.db_query_id);
 			if (entry == state->queries.end()) {
 				continue;
@@ -1966,16 +2044,23 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 			                      query.assigned_optional_workers >= query.optional_workers &&
 			                      query.assigned_residual_workers >= query.residual_workers;
 			if (candidate.version != query.dispatch_version || !query.event || !query.model.valid ||
-			    !primary_filled || query.assigned_workers != planned || planned >= query.model.demand_cap ||
-			    candidate.workers != planned || planned >= query.model.mandatory_gain.size() ||
-			    planned >= query.model.optional_gain.size()) {
+			    candidate.workers != (primary ? query.assigned_workers : planned)) {
+				continue;
+			}
+			if (primary) {
+				if (query.assigned_mandatory_workers < query.mandatory_workers ||
+				    query.assigned_optional_workers < query.optional_workers ||
+				    query.assigned_residual_workers >= query.residual_workers || query.assigned_workers >= planned)
+					continue;
+			} else if (!primary_filled || query.assigned_workers != planned || planned >= query.model.demand_cap ||
+			           planned >= query.model.mandatory_gain.size() || planned >= query.model.optional_gain.size()) {
 				continue;
 			}
 			if (!query.producer || !db.GetScheduler().GetTaskFromProducer(*query.producer, task)) {
 				unavailable.push_back(candidate);
 				continue;
 			}
-			query.residual_workers++;
+			if (!primary) query.residual_workers++;
 			auto worker_ordinal = query.assigned_workers;
 			auto class_ordinal = NextClassOrdinal(*state, query, false, false);
 			query.assigned_workers++;
@@ -1983,19 +2068,20 @@ QuerySLADequeueResult QuerySLAScheduler::TryDequeueTask(idx_t worker_id, shared_
 			assign_worker(query, false, false, worker_ordinal, class_ordinal);
 			RefreshDispatchEntries(*state, query);
 			for (auto &skipped : unavailable) {
-				state->dynamic_residual.push(std::move(skipped));
+				heap.push(std::move(skipped));
 			}
 			return true;
 		}
 		for (auto &skipped : unavailable) {
-			state->dynamic_residual.push(std::move(skipped));
+			heap.push(std::move(skipped));
 		}
 		return false;
 	};
 	if (try_dispatch(state->primary_mandatory, true, true) ||
+	    try_residual_dispatch(state->primary_residual, true) ||
 	    try_dispatch(state->dynamic_mandatory, false, true) ||
 	    try_dispatch(state->primary_optional, true, false) ||
-	    try_dispatch(state->dynamic_optional, false, false) || try_residual_dispatch()) {
+	    try_dispatch(state->dynamic_optional, false, false) || try_residual_dispatch(state->dynamic_residual, false)) {
 		return QuerySLADequeueResult::TASK_FOUND;
 	}
 	return QuerySLADequeueResult::NO_TASK;
@@ -2112,6 +2198,7 @@ bool QuerySLAScheduler::GetWorkerHardwareReservation(idx_t worker_id, QuerySLAWo
 }
 
 vector<QuerySLASchedulerSnapshot> QuerySLAScheduler::GetSnapshot() const {
+	const auto pool_capacity = NumericCast<idx_t>(db.GetScheduler().NumberOfThreads());
 	lock_guard<mutex> guard(state->lock);
 	vector<QuerySLASchedulerSnapshot> result;
 	result.reserve(state->queries.size());
@@ -2131,6 +2218,8 @@ vector<QuerySLASchedulerSnapshot> QuerySLAScheduler::GetSnapshot() const {
 		snapshot.epoch_leader_active = epoch_leader_active;
 		snapshot.epoch_sentinel_active = epoch_sentinel_active;
 		snapshot.db_query_id = query.metadata.db_query_id;
+		snapshot.is_committed_primary = state->committed_query_id && state->committed_query_id == query.metadata.db_query_id;
+		snapshot.prior_service_ns = query.metadata.estimated_service_ns;
 		snapshot.request_id = query.metadata.request_id;
 		snapshot.deadline_ns = query.metadata.deadline_ns;
 		snapshot.deadline_slack_ms =
@@ -2159,12 +2248,30 @@ vector<QuerySLASchedulerSnapshot> QuerySLAScheduler::GetSnapshot() const {
 		if (query.producer) {
 			snapshot.producer_queued_tasks = db.GetScheduler().GetTaskCountForProducer(*query.producer);
 		}
-		snapshot.model_valid = query.model.valid;
+		snapshot.model_valid = QuerySLAHasCompletionForecast(query.model);
 		snapshot.model_error = query.model.error;
+		if (query.model.valid && !snapshot.model_valid) {
+			snapshot.model_error = query.model.prior_service_ns > 0
+			    ? "initialization uses a query-service prior, not a trained completion forecast"
+			    : "initialization remaining query work is unknown";
+		}
 		snapshot.demand_cap = query.model.demand_cap;
 		snapshot.remaining_work_units = query.model.remaining_work_units;
 		snapshot.selected_throughput = query.model.throughput;
 		snapshot.throughput_is_live = query.model.throughput_is_live;
+		snapshot.full_capacity_workers = MinValue(pool_capacity, query.model.demand_cap);
+		auto full_remaining_ns = query.model.lifecycle_tail_p90_ns + query.model.suffix_p90_ns;
+		bool full_known = query.model.valid && UsesPipelineSuffix(query.model.event_kind) &&
+		                  snapshot.full_capacity_workers > 0 && std::isfinite(full_remaining_ns) && full_remaining_ns >= 0;
+		if ((query.model.event_kind == QueryActivationEventKind::PIPELINE ||
+		     query.model.event_kind == QueryActivationEventKind::INTERNAL) && query.model.remaining_work_units > 0) {
+			auto cap = snapshot.full_capacity_workers;
+			auto rate = cap < query.model.service_rates.size() ? query.model.service_rates[cap] : 0;
+			if (rate <= 0 || !std::isfinite(rate)) full_known = false;
+			else full_remaining_ns += static_cast<double>(query.model.remaining_work_units) * 1e9 / rate;
+		}
+		snapshot.full_capacity_remaining_valid = full_known && std::isfinite(full_remaining_ns);
+		snapshot.full_capacity_remaining_ns = snapshot.full_capacity_remaining_valid ? full_remaining_ns : 0;
 		snapshot.mandatory_workers = query.mandatory_workers;
 		snapshot.optional_workers = query.optional_workers;
 		snapshot.residual_workers = query.residual_workers;
@@ -2200,6 +2307,16 @@ vector<QuerySLASchedulerSnapshot> QuerySLAScheduler::GetSnapshot() const {
 vector<QuerySLASchedulerEpochSnapshot> QuerySLAScheduler::GetEpochTrace() const {
 	lock_guard<mutex> guard(state->epoch_trace_lock);
 	return vector<QuerySLASchedulerEpochSnapshot>(state->epoch_trace.begin(), state->epoch_trace.end());
+}
+
+vector<QuerySLASchedulerEpochSnapshot> QuerySLAScheduler::GetLatestEpochTrace() const {
+	lock_guard<mutex> guard(state->epoch_trace_lock);
+	vector<QuerySLASchedulerEpochSnapshot> result;
+	if (state->epoch_trace.empty()) return result;
+	auto generation = state->epoch_trace.back().epoch_generation;
+	for (auto it = state->epoch_trace.rbegin(); it != state->epoch_trace.rend() &&
+	     it->epoch_generation == generation; ++it) result.push_back(*it);
+	return result;
 }
 
 vector<QuerySLAEnergyWorkerEpochSnapshot> QuerySLAScheduler::GetEnergyWorkerEpochTrace() const {

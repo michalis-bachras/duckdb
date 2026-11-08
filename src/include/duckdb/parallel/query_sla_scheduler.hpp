@@ -68,6 +68,8 @@ struct QuerySLASchedulerSnapshot {
 	idx_t preferred_parallelism = 0;
 	idx_t event_remaining_work_units = 0;
 	bool producer_present = false;
+	bool is_committed_primary = false;
+	uint64_t prior_service_ns = 0;
 	idx_t producer_queued_tasks = 0;
 	bool model_valid = false;
 	string model_error;
@@ -75,6 +77,10 @@ struct QuerySLASchedulerSnapshot {
 	idx_t remaining_work_units = 0;
 	double selected_throughput = 0;
 	bool throughput_is_live = false;
+	//! Whole remaining query at this pool's full pipeline capacity, including its trained suffix.
+	bool full_capacity_remaining_valid = false;
+	double full_capacity_remaining_ns = 0;
+	idx_t full_capacity_workers = 0;
 	idx_t mandatory_workers = 0;
 	idx_t optional_workers = 0;
 	idx_t residual_workers = 0;
@@ -183,6 +189,11 @@ struct QuerySLASchedulerEpochSnapshot {
 	double predicted_query_finish_mean_ns = 0;
 	double predicted_query_finish_p90_ns = 0;
 	double predicted_sla_cost = 0;
+	idx_t total_work_units = 0;
+	idx_t throughput_completed_work_units = 0;
+	uint64_t throughput_worker_time_ns = 0;
+	double historical_service_rate = 0;
+	uint64_t committed_query_id = 0;
 };
 
 struct QuerySLAEnergyWorkerEpochSnapshot {
@@ -265,6 +276,8 @@ public:
 	vector<TotalPackageCandidateTrace> GetTotalPackageTrace() const;
 	vector<QuerySLASchedulerSnapshot> GetSnapshot() const;
 	vector<QuerySLASchedulerEpochSnapshot> GetEpochTrace() const;
+	//! Bounded live observation: copy only rows from the newest published trace epoch.
+	vector<QuerySLASchedulerEpochSnapshot> GetLatestEpochTrace() const;
 	vector<QuerySLAEnergyWorkerEpochSnapshot> GetEnergyWorkerEpochTrace() const;
 	QuerySLAExplorationDiagnosticsSnapshot GetExplorationDiagnostics() const;
 	uint64_t EpochTraceDroppedCount() const;
